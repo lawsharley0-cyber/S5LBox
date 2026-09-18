@@ -102,6 +102,7 @@ void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
     if (off == S5L_I2S_TX_FIFO_OFF) {
         i2s->tx_words++;
         if (i2s->tx_fn) i2s->tx_fn(i2s->tx_ctx, val);
+        return;
     }
     i2s->unknown_writes++;
     note_unknown(i2s, off);
