@@ -49,7 +49,7 @@
 #import <string.h>
 
 static void vm_i2s_host_tx(void *ctx, uint32_t word) {
-    [(VMAudioOutput *)ctx pushWord:word];
+    [(__bridge VMAudioOutput *)ctx pushWord:word];
 }
 
 // How many instructions to interpret between checks of the stop/pause flags.
