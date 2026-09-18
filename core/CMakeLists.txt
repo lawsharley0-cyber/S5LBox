@@ -381,6 +381,34 @@ add_executable(test_vmframetelemetry
 target_include_directories(test_vmframetelemetry PRIVATE ../app/Sources)
 add_test(NAME app_frame_telemetry COMMAND test_vmframetelemetry)
 
+add_executable(test_vmphonelayout
+    ../app/Tests/test_vmphonelayout.c
+    ../app/Sources/VMPhoneLayout.c
+)
+target_include_directories(test_vmphonelayout PRIVATE ../app/Sources)
+if(NOT MSVC)
+    target_link_libraries(test_vmphonelayout PRIVATE m)
+endif()
+add_test(NAME app_phone_layout COMMAND test_vmphonelayout)
+
+add_executable(test_vmframepublication
+    ../app/Tests/test_vmframepublication.c
+    ../app/Sources/VMFramePublication.c
+)
+target_include_directories(test_vmframepublication PRIVATE ../app/Sources)
+add_test(NAME app_frame_publication COMMAND test_vmframepublication)
+
+add_executable(test_vmuserapp
+    ../app/Tests/test_vmuserapp.c
+    ../app/Sources/VMUserApp.c
+    ../app/Sources/VMFirmwareZip.c
+    ../app/Sources/VMFirmwareInflate.c
+    ../app/Sources/VMFirmwarePlist.c
+    ../tools/sha256.c
+)
+target_include_directories(test_vmuserapp PRIVATE ../app/Sources ../app/Tests ../tools include)
+add_test(NAME app_user_ipa COMMAND test_vmuserapp)
+
 # The app's user interface is built by a macOS CI runner and can only be run on
 # a phone, so none of its Objective-C is reachable from this suite.  The pieces
 # that are pure arithmetic, pure data and pure bookkeeping are therefore
@@ -575,6 +603,8 @@ set_tests_properties(app_guest_rootfs_plan PROPERTIES
 
 add_executable(test_vmguestinstallbuild
     ../app/Tests/test_vmguestinstallbuild.c
+    ../app/Sources/VMUserAppInstall.c
+    ../app/Sources/VMUserApp.c
     ../app/Sources/VMGuestInstallBuild.c
     ../app/Sources/VMGuestInstall.c
     ../app/Sources/VMGuestRootfsPlan.c
@@ -822,6 +852,17 @@ add_executable(test_vmbuttonqueue
 target_include_directories(test_vmbuttonqueue PRIVATE ../app/Sources include)
 add_test(NAME app_button_queue COMMAND test_vmbuttonqueue)
 
+add_executable(test_vmaudiobuffer
+    ../app/Tests/test_vmaudiobuffer.c
+    ../app/Sources/VMAudioBuffer.c
+)
+target_include_directories(test_vmaudiobuffer PRIVATE ../app/Sources include)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_vmaudiobuffer PRIVATE Threads::Threads)
+endif()
+add_test(NAME app_audio_buffer COMMAND test_vmaudiobuffer)
+
 # The machine list. Links VMOptions too, because the one bound that protects
 # every saved machine -- that an instance can still store a value for every
 # option row -- is a fact about both tables at once.
@@ -1052,6 +1093,10 @@ target_compile_definitions(test_audio_capture PRIVATE
 add_test(NAME guest_audio_capture COMMAND test_audio_capture)
 set_tests_properties(guest_audio_capture PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+add_executable(test_audio_dma tests/test_audio_dma.c)
+target_link_libraries(test_audio_dma PRIVATE emucore)
+add_test(NAME audio_dma_flow_control COMMAND test_audio_dma)
 
 # The exact kernel and rootfs policies authenticate caller-selected bytes with
 # the same small, allocation-free implementation.  Keep that primitive in a

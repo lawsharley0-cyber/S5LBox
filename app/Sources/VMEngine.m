@@ -38,6 +38,8 @@
 #import "VMInstancePaths.h"
 #import "VMInstanceStore.h"
 #import "VMSettings.h"
+#import "VMFramePublication.h"
+#import "VMAudioOutput.h"
 
 #import <mach/mach.h>
 #import <pthread.h>
@@ -131,6 +133,7 @@ static uint64_t vm_now_ns(void) {
 - (void)provisionRootFilesystem:(id)unused;
 - (BOOL)resolveFilesInto:(vm_instance_paths_t *)paths note:(NSString **)note;
 - (NSUInteger)copyOptionValuesInto:(bool *)values capacity:(NSUInteger)capacity;
+- (void)pushAudioWord_emulatorThread:(uint32_t)word;
 @end
 
 /*
@@ -161,6 +164,11 @@ static double vm_engine_now_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void vm_audio_tx_callback(void *ctx, uint32_t word) {
+    VMEngine *engine = (__bridge VMEngine *)ctx;
+    [engine pushAudioWord_emulatorThread:word];
 }
 
 @implementation VMEngine {
@@ -275,6 +283,7 @@ static double vm_engine_now_seconds(void) {
     vm_button_power_hold_t _powerHold;
     vm_button_momentary_holds_t _momentaryHolds;
     BOOL              _droppedButtonLogged;
+    VMAudioOutput    *_audioOutput;
 }
 
 + (uint64_t)physFootprintBytes {
@@ -308,8 +317,16 @@ static double vm_engine_now_seconds(void) {
     // Safe without any handshake: NSThread holds a strong reference to its
     // target for as long as the thread is alive, so -dealloc cannot possibly
     // run while -threadMain is still using the snapshot buffer or the lock.
+    [_audioOutput stop];
+    _audioOutput = nil;
     free(_snapshot);
     if (_lockReady) pthread_mutex_destroy(&_lock);
+}
+
+- (void)pushAudioWord_emulatorThread:(uint32_t)word {
+    if (_audioOutput) {
+        [_audioOutput pushSampleWord:word];
+    }
 }
 
 #pragma mark - Choosing a guest
@@ -903,6 +920,13 @@ static double vm_engine_now_seconds(void) {
         return NO;
     }
 
+    VMAudioOutput *audioOutput = [[VMAudioOutput alloc] init];
+    [audioOutput start];
+    pthread_mutex_lock(&_lock);
+    _audioOutput = audioOutput;
+    pthread_mutex_unlock(&_lock);
+    s5l8900_set_audio_sink(&_machine, vm_audio_tx_callback, NULL, (__bridge void *)self);
+
     [thread start];
     return YES;
 }
@@ -1001,7 +1025,13 @@ static double vm_engine_now_seconds(void) {
         }
     }
     _paused = paused;
+    VMAudioOutput *audioOutput = _audioOutput;
     pthread_mutex_unlock(&_lock);
+    if (paused) {
+        [audioOutput pause];
+    } else {
+        [audioOutput resume];
+    }
     if (event.length) [self appendConsole:event];
 }
 
@@ -1832,6 +1862,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
             (unsigned long long)retired]];
 
     if (_machineReady) {
+        s5l8900_set_audio_sink(&_machine, NULL, NULL, NULL);
         s5l8900_free(&_machine);
     }
     /* AFTER the machine, never before: the memory-disk bridges hold a borrowed
@@ -1843,6 +1874,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
      * particular, clear _thread here so a later start really creates a fresh
      * machine instead of returning a false success for a dead worker. */
     pthread_mutex_lock(&_lock);
+    VMAudioOutput *audioToStop = _audioOutput;
+    _audioOutput = nil;
     VMEngineCheckpointCompletion checkpointCompletion = _checkpointCompletion;
     VMEngineStopCompletion stopCompletion = _stopCompletion;
     _checkpointCompletion = nil;
@@ -1863,6 +1896,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _paused = NO;
     _pauseReason = nil;
     pthread_mutex_unlock(&_lock);
+
+    [audioToStop stop];
 
     if (checkpointCompletion) {
         BOOL saved = checkpointSaved;
@@ -1924,12 +1959,21 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 
     pthread_mutex_lock(&_lock);
     if (fb && _snapshot) {
-        /* A future guest mode may use less than the fixed publication buffer.
-         * Clear the unused tail so a geometry change cannot expose pixels from
-         * the previous frame. */
-        if (fbBytes < VM_FB_BYTES)
-            memset(_snapshot + fbBytes, 0, VM_FB_BYTES - fbBytes);
-        memcpy(_snapshot, fb, fbBytes);
+        /* Re-upload only exact changes, including geometry and pixel order.
+         * The sampled FPS signature below is a measurement, never permission
+         * to discard a small pixel edit. Preserve an unread publication when
+         * another identical scanout arrives before the UI consumes it. */
+        vm_frame_publication_layout_t published = {
+            _snapshotWidth, _snapshotHeight, _snapshotStride,
+            _snapshotARGB, _snapshotBlank
+        };
+        const vm_frame_publication_layout_t next = {
+            fbW, fbH, fbStride, order == VM_ORDER_ARGB, false
+        };
+        bool pending = _snapshotFresh;
+        vm_frame_publication_result_t publication =
+            vm_frame_publication_update(_snapshot, VM_FB_BYTES, &published,
+                                        &pending, fb, &next);
         /* Counted here, where a frame actually becomes visible, and only when
          * its contents differ from the one before it. */
         uint64_t sig = vm_engine_fb_signature(fb, fbBytes);
@@ -1948,15 +1992,15 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
             _fpsWindowFrames = 0;
             _fpsWindowStart = nowSec;
         }
-        _snapshotARGB = (order == VM_ORDER_ARGB);
-        /* Published with the pixels. The reader must not assume 320x480: this
-         * geometry came out of whichever CLCD window the guest enabled, and it
-         * is the only description of what the bytes above mean. */
-        _snapshotWidth  = fbW;
-        _snapshotHeight = fbH;
-        _snapshotStride = fbStride;
-        _snapshotFresh = YES;
-        _snapshotBlank = NO;
+        if (publication == VM_FRAME_PUBLICATION_CHANGED) {
+            /* The geometry and order travel with the exact pixels above. */
+            _snapshotARGB = published.argb;
+            _snapshotWidth = published.width;
+            _snapshotHeight = published.height;
+            _snapshotStride = published.stride;
+            _snapshotBlank = published.blank;
+        }
+        _snapshotFresh = pending;
     } else if (_snapshot && !_snapshotBlank) {
         /* A stopped or invalid controller is a black panel, not permission to
          * leave the last good frame on screen forever. Publish that transition
@@ -2039,6 +2083,25 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     }
     pthread_mutex_unlock(&_lock);
     return out;
+}
+
+- (NSString *)audioStatusDescription {
+    pthread_mutex_lock(&_lock);
+    VMAudioOutput *output = _audioOutput;
+    pthread_mutex_unlock(&_lock);
+    if (output) {
+        return [output statusDescription];
+    }
+    return @"Audio output idle";
+}
+
+- (void)playAudioTestTone {
+    pthread_mutex_lock(&_lock);
+    VMAudioOutput *output = _audioOutput;
+    pthread_mutex_unlock(&_lock);
+    if (output) {
+        [output playTestTone];
+    }
 }
 
 - (NSString *)statusLine {

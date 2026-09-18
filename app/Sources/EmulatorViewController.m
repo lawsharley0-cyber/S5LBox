@@ -1,6 +1,9 @@
 //
 //  S5LBox — root view controller.
 //
+//  The real guest screen is presented inside original host phone chrome.
+//  Diagnostics remain optional; guest pixels and input stay in the core.
+//
 //  The screen is now the point. The top of the view is the guest's 320x480
 //  framebuffer; underneath it is the guest's UART, which is where an operating
 //  system announces itself. Between them is a status line showing that the
@@ -37,6 +40,8 @@
 #import "VMSettingsViewController.h"
 #import "VMSnapshotListViewController.h"
 #import "VMInstanceStore.h"
+#import "VMPhoneShellView.h"
+#import "VMFrameTelemetry.h"
 #include "VMSnapshotStore.h"
 #import "VMTouchMap.h"
 
@@ -84,7 +89,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 // Declared up front so every call below is checked against a prototype.
 @interface EmulatorViewController () <VMButtonBarDelegate,
                                       VMFramebufferViewTouchDelegate,
-                                      VMSnapshotListDelegate>
+                                      VMSnapshotListDelegate,
+                                      VMPhoneShellDelegate>
 - (NSString *)snapshotsDirectory;
 - (void)startEmulator;
 - (void)launchEngine;
@@ -116,6 +122,10 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 - (void)settingsTapped:(id)sender;
 - (void)consoleTapped:(id)sender;
 - (void)backTapped:(id)sender;
+- (void)showControls;
+- (void)showPerformanceReport;
+- (void)setPerformanceVisible:(BOOL)visible;
+- (void)confirmRestart;
 @end
 
 @implementation VMDisplayLinkProxy {
@@ -138,6 +148,10 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 @implementation EmulatorViewController {
     VMFramebufferView *_screen;
+    VMPhoneShellView *_phoneShell;
+    BOOL _showPerformance;
+    BOOL _ownsTelemetry;
+    BOOL _navigationWasHidden;
     /*
      * THE PREPARING OVERLAY. Shown over the guest screen while the one slow
      * first-boot step runs, because "Preparing iPhone OS -- close and reopen it
@@ -207,7 +221,15 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    _navigationWasHidden = self.navigationController.navigationBarHidden;
+    [self.navigationController setNavigationBarHidden:YES animated:animated];
     [self blockSystemPopGestures];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [_phoneShell releaseButtons];
+    [self.navigationController setNavigationBarHidden:_navigationWasHidden animated:animated];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -283,21 +305,27 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
     _consoleText = [NSMutableString string];
 
+    _phoneShell = [[VMPhoneShellView alloc] initWithFrame:CGRectZero];
+    _phoneShell.delegate = self;
+    NSNumber *classic = [[NSUserDefaults standardUserDefaults] objectForKey:@"vm.presentation.classic"];
+    _phoneShell.classicAppearance = classic ? classic.boolValue : YES;
+    [self.view addSubview:_phoneShell];
+
     _screen = [[VMFramebufferView alloc] initWithFrame:CGRectZero];
-    _screen.layer.borderWidth = 1.0;
-    _screen.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:1.0].CGColor;
+    _screen.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     /* Setting the delegate is what turns the picture into a touch surface. The
      * coordinates it produces are shown on the status line and discarded; see
      * -framebufferView:touchAtGuestX:guestY:phase:. */
     _screen.touchDelegate = self;
-    [self.view addSubview:_screen];
+    [_phoneShell.guestContainer addSubview:_screen];
 
     /* Over the screen and nothing else: the toolbar stays live so a user can
      * still leave, and the console stays readable. */
     _prepareScrim = [[UIView alloc] initWithFrame:CGRectZero];
     _prepareScrim.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.72];
     _prepareScrim.hidden = YES;
-    [self.view addSubview:_prepareScrim];
+    _prepareScrim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [_phoneShell.guestContainer addSubview:_prepareScrim];
 
     _prepareLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     _prepareLabel.backgroundColor = [UIColor clearColor];
@@ -327,6 +355,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                   ?: [UIFont systemFontOfSize:10];
     _stats.numberOfLines = 3;
     _stats.text = @"starting…";
+    _stats.hidden = YES;
+    _stats.accessibilityIdentifier = @"s5lbox.performance.summary";
     [self.view addSubview:_stats];
 
     _console = [[UITextView alloc] initWithFrame:CGRectZero];
@@ -478,6 +508,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 }
 
 - (void)dealloc {
+    if (_ownsTelemetry) vm_frame_telemetry_reset(false);
     [self restoreSystemPopGestures];
     [self endCheckpointBackgroundTask];
     [[NSNotificationCenter defaultCenter] removeObserver:self];
@@ -526,6 +557,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _screen.userInteractionEnabled = !busy;
     _keys.userInteractionEnabled = !busy;
     _toolbar.userInteractionEnabled = !busy;
+    _phoneShell.controlsEnabled = !busy;
     [self refreshPrepareOverlay];
 }
 
@@ -536,6 +568,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _screen.userInteractionEnabled = !busy;
     _keys.userInteractionEnabled = !busy;
     _toolbar.userInteractionEnabled = !busy;
+    _phoneShell.controlsEnabled = !busy;
     [self refreshPrepareOverlay];
 }
 
@@ -589,6 +622,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 - (void)appDidEnterBackground:(NSNotification *)notification {
     (void)notification;
+    [_phoneShell releaseButtons];
     _inBackground = YES;
     [self applyPauseState];
 }
@@ -941,83 +975,192 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-
     CGRect b = self.view.bounds;
     UIEdgeInsets safe = self.view.safeAreaInsets;
-
-    // The run controls sit on the bottom edge, above the home indicator.
-    const CGFloat toolbarH = 44.0;
-    CGFloat toolbarY = b.size.height - safe.bottom - toolbarH;
-    if (toolbarY < 0.0) toolbarY = 0.0;
-    _toolbar.frame = CGRectMake(0.0, toolbarY, b.size.width, toolbarH);
-
-    const CGFloat top     = safe.top + 8.0;
-    const CGFloat keysH   = [VMButtonBar preferredHeight];
-    const CGFloat statsH  = 40.0;   /* three lines of 10pt: machine, touch, keys */
-    const CGFloat chrome  = 6.0 + keysH + 6.0 + statsH + 4.0;
-
-    /* The guest's screen gets ALL the space the fixed chrome does not need.
-     *
-     * It used to get 62% of it, with the guest's serial console taking the
-     * rest — so the first thing anyone saw was a wall of kernel logging under
-     * a small picture. The console moved to its own screen (VMConsole-
-     * ViewController, reachable from the toolbar in developer mode) and the
-     * picture grew into the space, which is the right split for a device whose
-     * entire point is the display.
-     *
-     * The fixed chrome still comes off the top of the calculation, so a
-     * cramped layout — a small phone, or landscape — shrinks the picture
-     * rather than pushing the buttons out through the bottom. */
-    CGFloat freeSpace = toolbarY - top - chrome;
-    if (freeSpace < 0.0) freeSpace = 0.0;
-
-    // Fit 320x480 inside the band without distortion. The layer's
-    // contentsGravity would do this anyway; doing it here too means the view's
-    // own aspect is already correct, so there is no interpretation of
-    // contentsScale that can stretch the image — and vm_touch_map() is then
-    // working against the same rectangle the picture is drawn in.
-    /* The picture takes everything unless the console is sharing the screen,
-     * in which case it takes the 62% it always did. */
     BOOL inlineConsole = [[VMSettings sharedSettings] inlineConsole] &&
                          [[VMSettings sharedSettings] developerMode];
-    CGFloat band = inlineConsole ? floor(freeSpace * 0.62) : freeSpace;
-    if (band < 60.0) band = fmin(60.0, freeSpace);
-    CGFloat scale = fmin(b.size.width / (CGFloat)VM_FB_WIDTH,
-                         band / (CGFloat)VM_FB_HEIGHT);
-    CGFloat w = floor((CGFloat)VM_FB_WIDTH  * scale);
-    CGFloat h = floor((CGFloat)VM_FB_HEIGHT * scale);
-    _screen.frame = CGRectMake(floor((b.size.width - w) * 0.5),
-                               top + floor((band - h) * 0.5), w, h);
-
-    /* Exactly over the picture, so it reads as "this machine is busy" rather
-     * than as a modal covering the whole app. */
+    CGFloat availableHeight = fmax(0, b.size.height - safe.top - safe.bottom);
+    CGFloat statsHeight = _showPerformance ? 54 : 0;
+    CGFloat consoleHeight = inlineConsole ? fmin(120, availableHeight * 0.24) : 0;
+    _phoneShell.frame = CGRectMake(safe.left, safe.top,
+        fmax(0, b.size.width - safe.left - safe.right),
+        fmax(0, availableHeight - statsHeight - consoleHeight));
+    [_phoneShell setNeedsLayout];
+    [_phoneShell layoutIfNeeded];
+    _screen.frame = _phoneShell.guestContainer.bounds;
     _prepareScrim.frame = _screen.frame;
-    CGFloat pw = floor(_screen.frame.size.width * 0.78);
-    CGFloat px = floor((_screen.frame.size.width - pw) * 0.5);
-    CGFloat pcy = floor(_screen.frame.size.height * 0.5);
-    _prepareLabel.frame = CGRectMake(px, pcy - 42.0, pw, 40.0);
-    _prepareBar.frame   = CGRectMake(px, pcy + 4.0,  pw, 4.0);
-
-    CGFloat y = top + band + 6.0;
-    _keys.frame = CGRectMake(0.0, y, b.size.width, keysH);
-    y += keysH + 6.0;
-
-    _stats.frame = CGRectMake(14.0, y, b.size.width - 28.0, statsH);
-    y += statsH + 4.0;
-
-    if (inlineConsole) {
-        CGFloat consoleH = toolbarY - y;
-        if (consoleH < 0.0) consoleH = 0.0;
-        _console.frame = CGRectMake(0.0, y, b.size.width, consoleH);
-        _console.hidden = NO;
-    } else {
-        _console.hidden = YES;
-    }
+    CGFloat pw = _screen.bounds.size.width * 0.86;
+    CGFloat px = (_screen.bounds.size.width - pw) * 0.5;
+    CGFloat cy = _screen.bounds.size.height * 0.5;
+    _prepareLabel.frame = CGRectMake(px, cy - 45, pw, 80);
+    _prepareBar.frame = CGRectMake(px, cy + 42, pw, 4);
+    _keys.hidden = YES;
+    _toolbar.hidden = YES;
+    CGFloat y = CGRectGetMaxY(_phoneShell.frame);
+    _stats.hidden = !_showPerformance;
+    _stats.frame = CGRectMake(safe.left + 14, y,
+        fmax(0, b.size.width - safe.left - safe.right - 28), statsHeight);
+    _console.hidden = !inlineConsole;
+    _console.frame = CGRectMake(safe.left, y + statsHeight,
+        fmax(0, b.size.width - safe.left - safe.right), consoleHeight);
+    [self flushConsole];
 }
 
-- (UIStatusBarStyle)preferredStatusBarStyle {
-    // The whole screen is black; the default dark clock would be invisible.
-    return UIStatusBarStyleLightContent;
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+- (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleLightContent; }
+
+#pragma mark - Phone controls
+
+- (void)phoneShell:(VMPhoneShellView *)shell button:(VMButton)button pressed:(BOOL)pressed {
+    (void)shell;
+    [_engine setButton:button pressed:pressed];
+}
+
+- (void)phoneShellShowControls:(VMPhoneShellView *)shell {
+    (void)shell;
+    [self showControls];
+}
+
+- (void)setPerformanceVisible:(BOOL)visible {
+    _showPerformance = visible;
+    if (visible && !vm_frame_telemetry_is_enabled()) {
+        vm_frame_telemetry_reset(true);
+        _ownsTelemetry = YES;
+    } else if (!visible && _ownsTelemetry) {
+        vm_frame_telemetry_reset(false);
+        _ownsTelemetry = NO;
+    }
+    [self refreshStatusLine];
+    [self.view setNeedsLayout];
+}
+
+- (void)showControls {
+    if (_savingCheckpoint || _restarting || self.presentedViewController) return;
+    __weak EmulatorViewController *weakSelf = self;
+    UIAlertController *menu = [UIAlertController
+        alertControllerWithTitle:@"iPhone Controls"
+        message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [menu addAction:[UIAlertAction actionWithTitle:
+        ([_engine isPaused] ? @"Resume" : @"Pause")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf playPauseTapped:nil];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Save & Return to Machines"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf backTapped:nil];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Add Your Own App…"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            UIAlertController *help = [UIAlertController alertControllerWithTitle:@"Add an IPA"
+                message:@"First hold the power button and slide to power off inside iPhone OS. Then return to Machines, swipe right on this machine, and choose Add App. Import needs a fully shut-down guest so its disk can be updated safely."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [help addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:help animated:YES completion:nil];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:
+        (_phoneShell.classicAppearance ? @"Display: Screen Only" : @"Display: Classic iPhone")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (!vc) return;
+            vc->_phoneShell.classicAppearance = !vc->_phoneShell.classicAppearance;
+            [[NSUserDefaults standardUserDefaults] setBool:vc->_phoneShell.classicAppearance
+                                                   forKey:@"vm.presentation.classic"];
+            [vc.view setNeedsLayout];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:
+        (_showPerformance ? @"Hide Performance" : @"Show Performance")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (vc) [vc setPerformanceVisible:!vc->_showPerformance];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Play Test Sound"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (!vc) return;
+            [vc->_engine playAudioTestTone];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Performance & Sound Details"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf showPerformanceReport];
+        }]];
+    for (NSNumber *key in @[@(VMButtonVolumeUp), @(VMButtonVolumeDown)]) {
+        [menu addAction:[UIAlertAction actionWithTitle:[VMEngine nameForButton:key.unsignedIntegerValue]
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                EmulatorViewController *vc = weakSelf;
+                if (!vc) return;
+                VMEngine *engine = vc->_engine;
+                VMButton button = (VMButton)key.unsignedIntegerValue;
+                [engine setButton:button pressed:YES];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                    dispatch_get_main_queue(), ^{ [engine setButton:button pressed:NO]; });
+            }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Settings"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf settingsTapped:nil];
+        }]];
+    if ([[VMSettings sharedSettings] developerMode]) {
+        [menu addAction:[UIAlertAction actionWithTitle:@"Console"
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                [weakSelf consoleTapped:nil];
+            }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"Restart…"
+        style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+            [weakSelf confirmRestart];
+        }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    menu.popoverPresentationController.sourceView = _phoneShell.menuButton;
+    menu.popoverPresentationController.sourceRect = _phoneShell.menuButton.bounds;
+    [self presentViewController:menu animated:YES completion:nil];
+}
+
+- (void)confirmRestart {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Restart iPhone OS?"
+        message:@"This starts a fresh boot. Unsaved work inside the guest will be lost. Use Save & Return to Machines to resume later."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak EmulatorViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Restart" style:UIAlertActionStyleDestructive
+        handler:^(__unused UIAlertAction *action) { [weakSelf resetTapped:nil]; }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showPerformanceReport {
+    [self setPerformanceVisible:YES];
+    vm_frame_telemetry_snapshot_t state;
+    vm_frame_telemetry_snapshot(&state);
+    double seconds = state.scanout_last_host_ns > state.scanout_first_host_ns
+        ? (state.scanout_last_host_ns - state.scanout_first_host_ns) / 1e9 : 0;
+    double guestSeconds = state.scanout_guest_clock_consistent && state.scanout_timebase_hz &&
+        state.scanout_last_timer_ticks >= state.scanout_first_timer_ticks
+        ? (double)(state.scanout_last_timer_ticks - state.scanout_first_timer_ticks) /
+            state.scanout_timebase_hz : 0;
+    struct utsname host;
+    uname(&host);
+    NSString *revision = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"S5LBoxSourceRevision"] ?: @"development";
+    NSString *report = [NSString stringWithFormat:
+        @"Host: %s / iOS %@\nBuild: %@\n\n%@\n\n"
+         "Measured window: %.1f s\nChanged scanouts: %llu\nLayer submissions: %llu\n"
+         "Guest time / wall time: %.2fx (approximate)\n"
+         "Longest scanout interval: %.1f ms\nScanout gaps >100 ms: %llu\n"
+         "Average image work: %.2f ms\n\n%@\n\n"
+         "Layer submissions are not measured on-screen FPS. Start Show Performance, use the guest for 60 seconds, then reopen this report. Guest time is instruction-based, not cycle accurate.",
+        host.machine, UIDevice.currentDevice.systemVersion, revision,
+        [_engine statusLine] ?: @"No machine", seconds,
+        (unsigned long long)state.scanout_changes, (unsigned long long)state.layer_accepted,
+        seconds > 0 ? guestSeconds / seconds : 0,
+        state.scanout_max_attempt_gap_ns / 1e6,
+        (unsigned long long)state.scanout_attempt_gaps_over_100ms,
+        state.layer_attempts ? (double)state.layer_total_work_ns / state.layer_attempts / 1e6 : 0,
+        [_engine audioStatusDescription] ?: @"Audio status unavailable"];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Performance & Sound"
+        message:report preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy Report" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) { UIPasteboard.generalPasteboard.string = report; }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - Presentation
@@ -1083,6 +1226,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
  * sits next to the reason it was not.
  */
 - (void)refreshStatusLine {
+    if (!_showPerformance) return;
     /* One source for the machine's state: the engine. It reports "paused"
      * itself now, so prefixing "paused" here as well would produce
      * "paused · running", which is a contradiction rather than a status. */
@@ -1189,7 +1333,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
  * when the selection is dropped. Scrollback is still bounded either way.
  */
 - (void)flushConsole {
-    if (!_consoleDirty) return;
+    if (!_consoleDirty || _console.hidden) return;
     if (_console.selectedRange.length > 0) return;
 
     // Only follow the tail if the user has not scrolled up to read something.

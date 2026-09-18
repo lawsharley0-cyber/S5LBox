@@ -132,6 +132,8 @@ typedef void (^VMEngineStopCompletion)(void);
 
 /* The exact current state word used inside -statusLine, for stop alerts. */
 - (NSString *)statusDescription;
+- (NSString *)audioStatusDescription;
+- (void)playAudioTestTone;
 
 #pragma mark - Which guest is running
 

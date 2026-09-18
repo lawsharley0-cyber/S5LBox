@@ -694,6 +694,14 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
         return false;
     }
     bool guest_install_committed = guest_install.committed;
+    vm_guest_install_probe_t user_app_policy = vm_guest_apps_policy_probe(
+        paths->work, guest_install_detail, sizeof guest_install_detail);
+    if (user_app_policy == VM_GUEST_INSTALL_PROBE_INVALID ||
+        user_app_policy == VM_GUEST_INSTALL_PROBE_IO_ERROR) {
+        set_detail(report->detail, sizeof report->detail, guest_install_detail);
+        set_detail(report->summary, sizeof report->summary, "user-app policy recovery required");
+        return false;
+    }
 
     bool forced_interpreter = false;
     bool compact_user_only = false;
@@ -1001,7 +1009,8 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
                                       ppp_provisioned);
 
     vm_boot_options_reconcile_jailbreak(
-        &report->options, &request, guest_install_committed);
+        &report->options, &request,
+        guest_install_committed || user_app_policy == VM_GUEST_INSTALL_PROBE_VALID);
 
     s5l_bringup_status_t status =
         s5l_bringup(machine, &request, boot->bridges, &report->bringup);

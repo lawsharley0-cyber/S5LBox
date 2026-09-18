@@ -99,6 +99,13 @@ void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
         i2s->regs[slot] = val;
         return;
     }
+    if (off == S5L_I2S_TX_FIFO_OFF) {
+        i2s->tx_words++;
+        if (i2s->tx_fn) i2s->tx_fn(i2s->tx_ctx, val);
+        /* Preserve the existing access census below: format derivation uses
+         * writes - unknown_writes to count configuration writes. FIFO data
+         * must never be mistaken for programming the audio format. */
+    }
     i2s->unknown_writes++;
     note_unknown(i2s, off);
 }

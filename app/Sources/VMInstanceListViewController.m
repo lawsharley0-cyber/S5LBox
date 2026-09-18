@@ -8,6 +8,7 @@
 #import "EmulatorViewController.h"
 #import "VMEngine.h"
 #import "VMGuestInstallViewController.h"
+#import "VMUserAppViewController.h"
 #import "VMInstanceStore.h"
 #import "VMInstances.h"
 #import "VMSettings.h"
@@ -186,6 +187,26 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
         initWithRootViewController:settings];
     nav.navigationBar.prefersLargeTitles = YES;
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+    leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView;
+    NSDictionary *row = [[VMInstanceStore sharedStore] instanceAtIndex:(NSUInteger)indexPath.row];
+    UIContextualAction *add = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+        title:@"Add App" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+        (void)action; (void)view;
+        if (self.navigationController.topViewController == self && row) {
+            VMUserAppViewController *screen = [[VMUserAppViewController alloc]
+                initWithInstanceID:row[@"id"] machineName:row[@"name"]];
+            [self.navigationController pushViewController:screen animated:YES];
+        }
+        done(YES);
+    }];
+    add.backgroundColor = UIColor.systemIndigoColor;
+    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[add]];
+    configuration.performsFirstActionWithFullSwipe = NO;
+    return configuration;
 }
 
 - (void)renameAtIndex:(NSUInteger)index {

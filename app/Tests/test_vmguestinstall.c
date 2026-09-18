@@ -128,8 +128,17 @@ static void remove_fixture_artifacts(void) {
         VM_GUEST_PRIVILEGE_JOURNAL_TMP,
         VM_GUEST_INSTALL_RESUME_ONCE_FILE,
         VM_GUEST_INSTALL_RESUME_ONCE_TMP,
+        VM_GUEST_APPS_BACKUP_FILE,
+        VM_GUEST_APPS_MARKER_FILE,
+        VM_GUEST_APPS_MARKER_TMP,
+        VM_GUEST_APPS_JOURNAL_FILE,
+        VM_GUEST_APPS_JOURNAL_TMP,
+        VM_GUEST_APPS_POLICY_FILE,
+        VM_GUEST_APPS_POLICY_TMP,
     };
     char path[1400];
+    if (vm_guest_apps_stage_image_path(path, sizeof path, FIXTURE_DIR)) (void)remove(path);
+    if (path_for(path, sizeof path, VM_GUEST_APPS_STAGE_DIRECTORY)) (void)remove_directory(path);
     if (stage_path_for(path, sizeof path, VM_GUEST_INSTALL_NEXT_FILE))
         (void)remove(path);
     if (path_for(path, sizeof path, VM_GUEST_INSTALL_STAGE_DIRECTORY))
@@ -269,6 +278,41 @@ static void test_stage_preparation(void) {
           "prepare did not preserve an existing committed install: %s",
           detail);
     check_committed_files(digest);
+}
+
+static void test_repeated_user_apps(void) {
+    for (unsigned boundary = 0; boundary <= 4; ++boundary) {
+        remove_fixture_artifacts();
+        char live[1400], stage[1400], resume[1400], detail[256];
+        CHECK(path_for(live, sizeof live, VM_GUEST_INSTALL_LIVE_FILE), "live path");
+        CHECK(path_for(resume, sizeof resume, VM_GUEST_INSTALL_RESUME_ONCE_FILE), "resume path");
+        CHECK(write_bytes(live, "before-apps"), "seed live");
+        for (unsigned app = 1; app <= 2; ++app) {
+            uint8_t digest[32]; fill_digest(digest, app);
+            vm_guest_install_result_t result, privilege, storage;
+            CHECK(vm_guest_apps_prepare_stage(FIXTURE_DIR, &result, detail, sizeof detail) == VM_GUEST_INSTALL_OK,
+                "prepare app %u: %s", app, detail);
+            if (app == 2) CHECK(vm_guest_apps_policy_probe(FIXTURE_DIR, detail, sizeof detail) == VM_GUEST_INSTALL_PROBE_VALID,
+                "second prepare lost first app policy");
+            CHECK(vm_guest_apps_stage_image_path(stage, sizeof stage, FIXTURE_DIR), "stage path");
+            CHECK(write_bytes(stage, app == 1 ? "first-app" : "second-app"), "write app stage");
+            CHECK(write_bytes(resume, "stale RAM"), "write old resume");
+            vm_guest_install_test_interrupt_after(boundary);
+            vm_guest_install_status_t status = vm_guest_apps_publish(FIXTURE_DIR, digest, &result, detail, sizeof detail);
+            vm_guest_install_test_interrupt_after(0);
+            CHECK(status == (boundary ? VM_GUEST_INSTALL_ERR_INTERRUPTED : VM_GUEST_INSTALL_OK),
+                "app %u boundary %u status %d: %s", app, boundary, (int)status, detail);
+            CHECK(vm_guest_maintenance_recover(FIXTURE_DIR, &privilege, &storage, detail, sizeof detail) == VM_GUEST_INSTALL_OK,
+                "app recovery boundary %u: %s", boundary, detail);
+            CHECK(vm_guest_apps_recover(FIXTURE_DIR, &result, detail, sizeof detail) == VM_GUEST_INSTALL_OK &&
+                result.committed && result.cleanup_complete, "app receipt recovery: %s", detail);
+            CHECK(file_equals(live, app == 1 ? "first-app" : "second-app"), "wrong live app generation");
+            CHECK(!exists(resume), "disk replacement preserved stale RAM authority");
+            CHECK(vm_guest_apps_policy_probe(FIXTURE_DIR, detail, sizeof detail) == VM_GUEST_INSTALL_PROBE_VALID,
+                "committed app missing policy");
+        }
+    }
+    remove_fixture_artifacts();
 }
 
 static void test_normal_and_idempotent(void) {
@@ -822,6 +866,7 @@ int main(void) {
           "privilege stage-image path names the wrong file: %s", stage_image);
 
     test_stage_preparation();
+    test_repeated_user_apps();
     test_normal_and_idempotent();
     test_every_durable_boundary();
     test_missing_stage_rolls_back();
