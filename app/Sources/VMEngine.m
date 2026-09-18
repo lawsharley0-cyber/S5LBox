@@ -744,6 +744,45 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
 }
 
 /*
+ * The marker VMFirmwareBoot.c's boot() reads as `paths->work/engine.interpreter`
+ * (VM_FW_BOOT_INTERPRETER_FILE). Resolved the same way resolveFilesInto: finds
+ * this machine's own directory, since join_path() itself is private to that
+ * file and this is a small enough join not to warrant exporting it.
+ */
+- (NSString *)forcedInterpreterMarkerPath {
+    if (!_instanceID.length) return nil;
+    NSString *mine =
+        [[VMInstanceStore sharedStore] directoryForInstanceWithID:_instanceID];
+    if (!mine.length) return nil;
+    return [mine stringByAppendingPathComponent:@VM_FW_BOOT_INTERPRETER_FILE];
+}
+
+- (BOOL)isForcedInterpreterEnabled {
+    NSString *path = [self forcedInterpreterMarkerPath];
+    if (!path) return NO;
+    NSDictionary *attrs =
+        [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    /* file_size() on the C side treats "exists but empty" as OFF, so this
+     * agrees with the reader rather than merely checking existence. */
+    return ((NSNumber *)attrs[NSFileSize]).unsignedLongLongValue > 0ull;
+}
+
+- (BOOL)setForcedInterpreterEnabled:(BOOL)enabled {
+    NSString *path = [self forcedInterpreterMarkerPath];
+    if (!path) return NO;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!enabled) {
+        if (![fm fileExistsAtPath:path]) return YES;
+        return [fm removeItemAtPath:path error:NULL];
+    }
+    /* Content is never read, only the size -- one byte is enough to be
+     * non-empty and cheap enough that this can never meaningfully fail for
+     * being too large. */
+    return [[NSData dataWithBytes:"1" length:1]
+        writeToFile:path options:NSDataWritingAtomic error:NULL];
+}
+
+/*
  * The settings screen's values, in option-table order.
  *
  * READ FROM VMSettings, which is the store the settings screen writes.

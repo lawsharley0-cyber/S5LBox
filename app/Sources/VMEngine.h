@@ -135,6 +135,19 @@ typedef void (^VMEngineStopCompletion)(void);
 - (NSString *)audioStatusDescription;
 - (void)playAudioTestTone;
 
+/*
+ * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
+ * the build-time compact AArch64 engine compiled in, this forces every guest
+ * instruction through the reference interpreter instead, for exactly one
+ * machine. Read once at boot -- a change here takes effect on the next
+ * Restart, not the running machine. Diagnostic only: it exists to tell a
+ * hardware-model gap from an engine-translation bug apart when they would
+ * otherwise look identical from the guest's own console output, and doubles
+ * as an A/B tool for any future non-ARMv6 CPU backend.
+ */
+- (BOOL)isForcedInterpreterEnabled;
+- (BOOL)setForcedInterpreterEnabled:(BOOL)enabled;
+
 #pragma mark - Which guest is running
 
 /*

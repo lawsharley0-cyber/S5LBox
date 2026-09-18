@@ -1105,6 +1105,14 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
                 [weakSelf consoleTapped:nil];
             }]];
+        BOOL forcedInterpreter = [_engine isForcedInterpreterEnabled];
+        NSString *engineTitle = forcedInterpreter
+            ? @"Force Interpreter: On (tap to turn off)"
+            : @"Force Interpreter: Off (tap to force)";
+        [menu addAction:[UIAlertAction actionWithTitle:engineTitle
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                [weakSelf toggleForcedInterpreter:!forcedInterpreter];
+            }]];
     }
     [menu addAction:[UIAlertAction actionWithTitle:@"Restart…"
         style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
@@ -1114,6 +1122,40 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     menu.popoverPresentationController.sourceView = _phoneShell.menuButton;
     menu.popoverPresentationController.sourceRect = _phoneShell.menuButton.bounds;
     [self presentViewController:menu animated:YES completion:nil];
+}
+
+/*
+ * Diagnostic only: toggles VMEngine's engine.interpreter marker for this
+ * machine, then offers to restart, since VMFirmwareBoot.c reads the marker
+ * once per boot and a running machine never sees the change. Distinguishes a
+ * hardware-model gap from an engine-translation bug -- if a guest failure
+ * reproduces identically with this forced on, the compact AArch64 engine is
+ * not the cause; if it goes away, it is.
+ */
+- (void)toggleForcedInterpreter:(BOOL)enabled {
+    BOOL ok = [_engine setForcedInterpreterEnabled:enabled];
+    NSString *title = ok
+        ? (enabled ? @"Interpreter Forced" : @"Interpreter Not Forced")
+        : @"Couldn't Change Engine Setting";
+    NSString *message = ok
+        ? @"This takes effect on the next boot. Restart now to apply it?"
+        : @"This machine's files could not be updated.";
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+        message:message preferredStyle:UIAlertControllerStyleAlert];
+    if (ok) {
+        __weak EmulatorViewController *weakSelf = self;
+        [alert addAction:[UIAlertAction actionWithTitle:@"Restart Now"
+            style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *action) {
+                [weakSelf confirmRestart];
+            }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Later"
+            style:UIAlertActionStyleCancel handler:nil]];
+    } else {
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+            style:UIAlertActionStyleDefault handler:nil]];
+    }
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)confirmRestart {
