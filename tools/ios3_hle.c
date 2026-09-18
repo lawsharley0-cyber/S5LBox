@@ -331,6 +331,48 @@ static const uint32_t PROLOGUE_MBX2D_CTX_INITIALIZE[] = {
 };
 
 /*
+ * CRYPTKIT GIANT-NUMBER MULTIPLY, the largest single userspace cost measured
+ * so far and NOT a graphics site.
+ *
+ * docs/ROADMAP.md's row D already named this: the sixteen hottest PCs of
+ * r187/r194/r195 all fall in the 88-byte span 0x3145ad4c..0x3145ada4, which
+ * dscmap.py resolves to _mulg_common in Security.framework, next to
+ * _SECOID_FindOID, _DEREncodeSequence, _modg_via_recipSmall and
+ * _ginverseMod -- CryptKit bignum arithmetic beside ASN.1 DER/OID lookup.
+ * This session's own --sequence-profile run, restored from a checkpoint
+ * just before the r181-style unlock drag, reproduced it independently: the
+ * single hottest instruction head at 0x3145ad4c alone covers 20.9% of every
+ * dynamic instruction in that window; the top 10 heads (all in or adjacent
+ * to this same function) cover 61.9%. With _SHA1Init separately measured at
+ * 17.8% of a whole-boot profile, the dominant cost as of this session is
+ * verifying Apple's own code signatures during activation/lockdownd's RSA
+ * keygen, not drawing.
+ *
+ * The function entry and this prologue were located directly from this
+ * session's own extracted, byte-verified dyld_shared_cache_armv6 (pulled out
+ * of a real booted work image with tools/hfsx_extract.py, resolved with
+ * tools/dscmap.py) -- not copied from a prior log -- so the address and
+ * bytes below are freshly re-derived evidence, not a transcription.
+ *
+ * THIS SITE STAYS IOS3_HLE_OBSERVE, on purpose, per the header's order-of-
+ * work rule. A correct native giant-multiply is real cryptographic work: it
+ * has to match CryptKit's exact "giant" struct layout (this prologue's
+ * `ldrh r0,[r0]` / `ldrh r1,[r1]` / cmp-against-zero sequence shows a 16-bit
+ * length/sign field read from both operands before anything else happens,
+ * which is already more than was known before this session, but not enough
+ * to trust a REPLACE against RSA correctness). Arming this site as OBSERVE
+ * turns "a profiler bucket says 20.9%" into a call count and cost measured
+ * at the exact site, which is the evidence the order-of-work rule requires
+ * before a TRACE-mode argument capture -- let alone a REPLACE -- is next.
+ */
+static const uint32_t PROLOGUE_MULG_COMMON[] = {
+    0xe92d40f0u,   /* push {r4, r5, r6, r7, lr}    */
+    0xe28d700cu,   /* add  r7, sp, #0xc            */
+    0xe92d0d00u,   /* push {r8, sl, fp}            */
+    0xe24dd024u,   /* sub  sp, sp, #0x24           */
+};
+
+/*
  * Native nearest-32-bit samplers, transcribed from the decode above.
  *
  * Every guest access goes through mem->read / mem->write, which translate
@@ -2233,6 +2275,10 @@ static ios3_hle_site_t g_sites[] = {
       (unsigned)(sizeof PROLOGUE_MBX2D_CTX_BLIT_COPY /
                  sizeof PROLOGUE_MBX2D_CTX_BLIT_COPY[0]),
       hle_trace_blit_copy, IOS3_HLE_TRACE, false, false, 0, 0, 0, 0 },
+    { "_mulg_common",       0x3145ac70u, PROLOGUE_MULG_COMMON,
+      (unsigned)(sizeof PROLOGUE_MULG_COMMON /
+                 sizeof PROLOGUE_MULG_COMMON[0]),
+      NULL, IOS3_HLE_OBSERVE, false, false, 0, 0, 0, 0 },
 };
 
 #define SITE_N ((unsigned)(sizeof g_sites / sizeof g_sites[0]))
