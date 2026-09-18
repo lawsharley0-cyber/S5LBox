@@ -134,7 +134,6 @@ static uint64_t vm_now_ns(void) {
 - (BOOL)resolveFilesInto:(vm_instance_paths_t *)paths note:(NSString **)note;
 - (NSUInteger)copyOptionValuesInto:(bool *)values capacity:(NSUInteger)capacity;
 - (void)pushAudioWord_emulatorThread:(uint32_t)word;
-- (BOOL)audioReadyForMore_emulatorThread;
 @end
 
 /*
@@ -170,11 +169,6 @@ static double vm_engine_now_seconds(void) {
 static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     VMEngine *engine = (__bridge VMEngine *)ctx;
     [engine pushAudioWord_emulatorThread:word];
-}
-
-static bool vm_audio_ready_callback(void *ctx) {
-    VMEngine *engine = (__bridge VMEngine *)ctx;
-    return [engine audioReadyForMore_emulatorThread];
 }
 
 @implementation VMEngine {
@@ -333,10 +327,6 @@ static bool vm_audio_ready_callback(void *ctx) {
     if (_audioOutput) {
         [_audioOutput pushSampleWord:word];
     }
-}
-
-- (BOOL)audioReadyForMore_emulatorThread {
-    return _audioOutput ? [_audioOutput isReadyForMore] : YES;
 }
 
 #pragma mark - Choosing a guest
@@ -935,7 +925,7 @@ static bool vm_audio_ready_callback(void *ctx) {
     pthread_mutex_lock(&_lock);
     _audioOutput = audioOutput;
     pthread_mutex_unlock(&_lock);
-    s5l8900_set_audio_sink(&_machine, vm_audio_tx_callback, vm_audio_ready_callback, (__bridge void *)self);
+    s5l8900_set_audio_sink(&_machine, vm_audio_tx_callback, NULL, (__bridge void *)self);
 
     [thread start];
     return YES;

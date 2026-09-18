@@ -10,7 +10,7 @@
 #import <AVFoundation/AVFoundation.h>
 
 static const uint32_t kFramesPerBuffer = 1024u;
-static const uint32_t kBufferCount = 3u;
+static const uint32_t kBufferCount = 4u;
 static const Float64  kSampleRate = 44100.0;
 
 @implementation VMAudioOutput {
@@ -128,7 +128,6 @@ static void vm_audio_queue_output_callback(void *userData,
 
     _running = YES;
     _paused = NO;
-    [self playTestTone];
     return YES;
 }
 
