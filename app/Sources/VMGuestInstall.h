@@ -47,6 +47,17 @@ extern "C" {
 #define VM_GUEST_PRIVILEGE_MARKER_TMP      "guest.cydia-privileges-v1.partial"
 #define VM_GUEST_PRIVILEGE_JOURNAL_FILE    "guest.cydia-privileges-v1.transaction"
 #define VM_GUEST_PRIVILEGE_JOURNAL_TMP     "guest.cydia-privileges-v1.transaction.partial"
+/* Repeatable user app imports use their own transient commit record. The
+ * permanent policy record survives preparation of the next import, so a
+ * failed second import cannot disable already-installed applications. */
+#define VM_GUEST_APPS_BACKUP_FILE     "rootfs-work.pre-user-app-v1"
+#define VM_GUEST_APPS_STAGE_DIRECTORY "guest.user-app-v1.stage"
+#define VM_GUEST_APPS_MARKER_FILE     "guest.user-app-v1"
+#define VM_GUEST_APPS_MARKER_TMP      "guest.user-app-v1.partial"
+#define VM_GUEST_APPS_JOURNAL_FILE    "guest.user-app-v1.transaction"
+#define VM_GUEST_APPS_JOURNAL_TMP     "guest.user-app-v1.transaction.partial"
+#define VM_GUEST_APPS_POLICY_FILE    "guest.user-app-policy-v1"
+#define VM_GUEST_APPS_POLICY_TMP     "guest.user-app-policy-v1.partial"
 /* A filesystem replacement can never resume a CPU/RAM image captured against
  * the old disk. The transaction removes only this one-shot authority; inert
  * checkpoint payloads are harmless and can be replaced by the next save. */
@@ -88,6 +99,17 @@ typedef struct {
 } vm_guest_install_result_t;
 
 const char *vm_guest_install_status_text(vm_guest_install_status_t status);
+
+bool vm_guest_apps_stage_image_path(char *out, size_t capacity, const char *work_directory);
+vm_guest_install_status_t vm_guest_apps_prepare_stage(const char *work_directory,
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity);
+vm_guest_install_status_t vm_guest_apps_recover(const char *work_directory,
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity);
+vm_guest_install_status_t vm_guest_apps_publish(const char *work_directory,
+    const uint8_t digest[VM_GUEST_INSTALL_SHA256_SIZE],
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity);
+vm_guest_install_probe_t vm_guest_apps_policy_probe(const char *work_directory,
+    char *detail, size_t detail_capacity);
 
 /* Parse the exact committed-record format. An empty or malformed file is not
  * presence: it is INVALID, so boot cannot silently enable or disable only one

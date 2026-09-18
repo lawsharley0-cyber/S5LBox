@@ -398,6 +398,16 @@ add_executable(test_vmframepublication
 target_include_directories(test_vmframepublication PRIVATE ../app/Sources)
 add_test(NAME app_frame_publication COMMAND test_vmframepublication)
 
+add_executable(test_vmuserapp
+    ../app/Tests/test_vmuserapp.c
+    ../app/Sources/VMUserApp.c
+    ../app/Sources/VMFirmwareZip.c
+    ../app/Sources/VMFirmwareInflate.c
+    ../app/Sources/VMFirmwarePlist.c
+    ../tools/sha256.c
+)
+target_include_directories(test_vmuserapp PRIVATE ../app/Sources ../app/Tests ../tools include)
+add_test(NAME app_user_ipa COMMAND test_vmuserapp)
 
 # The app's user interface is built by a macOS CI runner and can only be run on
 # a phone, so none of its Objective-C is reachable from this suite.  The pieces
@@ -593,6 +603,8 @@ set_tests_properties(app_guest_rootfs_plan PROPERTIES
 
 add_executable(test_vmguestinstallbuild
     ../app/Tests/test_vmguestinstallbuild.c
+    ../app/Sources/VMUserAppInstall.c
+    ../app/Sources/VMUserApp.c
     ../app/Sources/VMGuestInstallBuild.c
     ../app/Sources/VMGuestInstall.c
     ../app/Sources/VMGuestRootfsPlan.c

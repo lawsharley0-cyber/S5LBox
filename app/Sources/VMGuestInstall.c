@@ -86,6 +86,16 @@ static const guest_transaction_spec_t VM_GUEST_PRIVILEGE_SPEC = {
     "guest-cydia-privileges"
 };
 
+static const guest_transaction_spec_t VM_GUEST_APPS_SPEC = {
+    VM_GUEST_APPS_BACKUP_FILE, VM_GUEST_APPS_STAGE_DIRECTORY,
+    VM_GUEST_APPS_MARKER_FILE, VM_GUEST_APPS_MARKER_TMP,
+    VM_GUEST_APPS_JOURNAL_FILE, VM_GUEST_APPS_JOURNAL_TMP,
+    "s5lbox-user-app 1\nmanifest-sha256 ",
+    "s5lbox-user-app-transaction 1\nmanifest-sha256 ", "user-app"
+};
+static const char VM_GUEST_APPS_POLICY_PREFIX[] =
+    "s5lbox-user-app-policy 1\nfirst-app-sha256 ";
+
 typedef enum {
     GUEST_NODE_ABSENT = 0,
     GUEST_NODE_REGULAR,
@@ -789,6 +799,11 @@ vm_guest_maintenance_recover(const char *work_directory,
     guest_result_clear(privilege);
     guest_result_clear(storage);
     guest_detail(detail, detail_capacity, "");
+    guest_paths_t apps_paths;
+    guest_paths_t install_paths;
+    if (!guest_paths_init_for(&apps_paths, work_directory, &VM_GUEST_APPS_SPEC) ||
+        !guest_paths_init_for(&install_paths, work_directory, &VM_GUEST_INSTALL_SPEC))
+        return VM_GUEST_INSTALL_ERR_PATH;
     if (!guest_paths_init_for(&privilege_paths, work_directory,
                               &VM_GUEST_PRIVILEGE_SPEC) ||
         !guest_paths_init_for(&storage_paths, work_directory,
@@ -801,6 +816,35 @@ vm_guest_maintenance_recover(const char *work_directory,
         guest_node(privilege_paths.journal) != GUEST_NODE_ABSENT;
     bool storage_journal =
         guest_node(storage_paths.journal) != GUEST_NODE_ABSENT;
+    bool apps_journal = guest_node(apps_paths.journal) != GUEST_NODE_ABSENT;
+    bool install_journal = guest_node(install_paths.journal) != GUEST_NODE_ABSENT;
+    if ((unsigned)privilege_journal + (unsigned)storage_journal +
+        (unsigned)apps_journal + (unsigned)install_journal > 1u) {
+        guest_detail(detail, detail_capacity,
+                     "Multiple transactions claim the guest disk; recovery did not guess an owner.");
+        return VM_GUEST_INSTALL_ERR_STATE;
+    }
+    if (guest_node(apps_paths.live) == GUEST_NODE_ABSENT &&
+        !apps_journal && !install_journal && !privilege_journal && !storage_journal) {
+        unsigned owners = (unsigned)(guest_node(apps_paths.backup) != GUEST_NODE_ABSENT) +
+            (unsigned)(guest_node(install_paths.backup) != GUEST_NODE_ABSENT) +
+            (unsigned)(guest_node(privilege_paths.backup) != GUEST_NODE_ABSENT) +
+            (unsigned)(guest_node(storage_paths.backup) != GUEST_NODE_ABSENT);
+        if (owners > 1u) return VM_GUEST_INSTALL_ERR_STATE;
+    }
+    /* A repeat import, or a later guest-package install, may currently own
+     * the absent live path. Finish that owner before inspecting older markers. */
+    bool apps_first = apps_journal || (guest_node(apps_paths.live) == GUEST_NODE_ABSENT &&
+        guest_node(apps_paths.backup) != GUEST_NODE_ABSENT);
+    bool install_first = install_journal || (guest_node(install_paths.live) == GUEST_NODE_ABSENT &&
+        guest_node(install_paths.backup) != GUEST_NODE_ABSENT);
+    vm_guest_install_result_t extra;
+    if (apps_first || install_first) {
+        vm_guest_install_status_t early = apps_first
+            ? vm_guest_apps_recover(work_directory, &extra, detail, detail_capacity)
+            : vm_guest_install_recover(work_directory, &extra, detail, detail_capacity);
+        if (early != VM_GUEST_INSTALL_OK) return early;
+    }
     if (privilege_journal && storage_journal) {
         guest_detail(detail, detail_capacity,
                      "Two guest-disk maintenance journals claim the shared live disk; neither was guessed through.");
@@ -839,8 +883,10 @@ vm_guest_maintenance_recover(const char *work_directory,
         work_directory, first_spec, first_result, detail, detail_capacity);
     if (status != VM_GUEST_INSTALL_OK)
         return status;
-    return guest_recover_for(work_directory, second_spec, second_result,
-                             detail, detail_capacity);
+    status = guest_recover_for(work_directory, second_spec, second_result,
+                               detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK) return status;
+    return vm_guest_apps_recover(work_directory, &extra, detail, detail_capacity);
 }
 
 static vm_guest_install_status_t
@@ -1119,6 +1165,82 @@ vm_guest_privilege_publish(const char *work_directory,
     return guest_publish_for(work_directory, &VM_GUEST_PRIVILEGE_SPEC,
                              manifest_sha256, result,
                              detail, detail_capacity);
+}
+
+bool vm_guest_apps_stage_image_path(char *out, size_t capacity, const char *work_directory) {
+    return guest_stage_image_path_for(out, capacity, work_directory, &VM_GUEST_APPS_SPEC);
+}
+
+vm_guest_install_probe_t vm_guest_apps_policy_probe(const char *work_directory,
+    char *detail, size_t detail_capacity) {
+    char path[VM_GUEST_INSTALL_PATH_CAPACITY];
+    uint8_t digest[VM_GUEST_INSTALL_SHA256_SIZE];
+    if (!guest_join(path, sizeof path, work_directory, VM_GUEST_APPS_POLICY_FILE))
+        return VM_GUEST_INSTALL_PROBE_IO_ERROR;
+    vm_guest_install_probe_t probe = guest_record_probe(path, VM_GUEST_APPS_POLICY_PREFIX, digest);
+    if (probe == VM_GUEST_INSTALL_PROBE_INVALID || probe == VM_GUEST_INSTALL_PROBE_IO_ERROR)
+        guest_detail(detail, detail_capacity, "The user-app policy record is invalid or unreadable.");
+    return probe;
+}
+
+vm_guest_install_status_t vm_guest_apps_recover(const char *work_directory,
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity) {
+    vm_guest_install_result_t local;
+    vm_guest_install_result_t *recovered = result ? result : &local;
+    vm_guest_install_status_t status = guest_recover_for(work_directory, &VM_GUEST_APPS_SPEC,
+        recovered, detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK) return status;
+    vm_guest_install_probe_t policy = vm_guest_apps_policy_probe(work_directory, detail, detail_capacity);
+    if (policy == VM_GUEST_INSTALL_PROBE_INVALID) return VM_GUEST_INSTALL_ERR_RECORD;
+    if (policy == VM_GUEST_INSTALL_PROBE_IO_ERROR) return VM_GUEST_INSTALL_ERR_IO;
+    if (recovered->committed && policy == VM_GUEST_INSTALL_PROBE_ABSENT) {
+        char path[VM_GUEST_INSTALL_PATH_CAPACITY], temporary[VM_GUEST_INSTALL_PATH_CAPACITY];
+        if (!guest_join(path, sizeof path, work_directory, VM_GUEST_APPS_POLICY_FILE) ||
+            !guest_join(temporary, sizeof temporary, work_directory, VM_GUEST_APPS_POLICY_TMP))
+            return VM_GUEST_INSTALL_ERR_PATH;
+        if (!guest_publish_record(temporary, path, work_directory, VM_GUEST_APPS_POLICY_PREFIX,
+                                  recovered->manifest_sha256)) {
+            guest_detail(detail, detail_capacity, "The app disk is committed but its boot policy needs recovery before starting.");
+            return VM_GUEST_INSTALL_ERR_IO;
+        }
+    }
+    return VM_GUEST_INSTALL_OK;
+}
+
+vm_guest_install_status_t vm_guest_apps_prepare_stage(const char *work_directory,
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity) {
+    vm_guest_install_result_t privilege, storage, apps;
+    vm_guest_install_status_t status = vm_guest_maintenance_recover(work_directory,
+        &privilege, &storage, detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK) return status;
+    vm_guest_install_result_t initial_install;
+    status = vm_guest_install_recover(work_directory, &initial_install, detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK || !initial_install.cleanup_complete) return status != VM_GUEST_INSTALL_OK ? status : VM_GUEST_INSTALL_ERR_STATE;
+    status = vm_guest_apps_recover(work_directory, &apps, detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK) return status;
+    if (!privilege.cleanup_complete || !storage.cleanup_complete || !apps.cleanup_complete) {
+        guest_detail(detail, detail_capacity, "Finish cleaning up the previous disk transaction before importing another app.");
+        return VM_GUEST_INSTALL_ERR_STATE;
+    }
+    if (apps.committed) {
+        guest_paths_t paths;
+        if (!guest_paths_init_for(&paths, work_directory, &VM_GUEST_APPS_SPEC))
+            return VM_GUEST_INSTALL_ERR_PATH;
+        /* Retire only the prior receipt after its permanent policy is durable. */
+        if (!guest_remove_if_present(paths.marker) || !guest_sync_directory(paths.work))
+            return VM_GUEST_INSTALL_ERR_IO;
+    }
+    return guest_prepare_stage_for(work_directory, &VM_GUEST_APPS_SPEC,
+        result, detail, detail_capacity);
+}
+
+vm_guest_install_status_t vm_guest_apps_publish(const char *work_directory,
+    const uint8_t digest[VM_GUEST_INSTALL_SHA256_SIZE],
+    vm_guest_install_result_t *result, char *detail, size_t detail_capacity) {
+    vm_guest_install_status_t status = guest_publish_for(work_directory, &VM_GUEST_APPS_SPEC,
+        digest, result, detail, detail_capacity);
+    if (status != VM_GUEST_INSTALL_OK) return status;
+    return vm_guest_apps_recover(work_directory, result, detail, detail_capacity);
 }
 
 vm_guest_install_status_t
