@@ -208,8 +208,8 @@ static inline bool in_timer(uint32_t a, unsigned bytes) {
 
 /* ------------------------------------------------------- stub windows --- */
 
-bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
-                      const char *name) {
+static bool add_stub_filled(s5l8900_t *m, uint32_t base, uint32_t size,
+                            const char *name, uint8_t fill) {
     if (!m || m->stub_count >= S5L_STUB_MAX || !size) return false;
     /* A window that extends beyond the 32-bit physical address space is only
      * partially reachable and used to make the rounded register count wrap. */
@@ -233,14 +233,37 @@ bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
     if (nregs64 > 0xffffffffu ||
         nregs64 > (uint64_t)SIZE_MAX / sizeof(uint32_t)) return false;
     uint32_t nregs = (uint32_t)nregs64;
-    uint32_t *regs = calloc((size_t)nregs, sizeof *regs);
+    uint32_t *regs = malloc((size_t)nregs * sizeof *regs);
     if (!regs) return false;
+    memset(regs, fill, (size_t)nregs * sizeof *regs);
 
     s5l_stub_t *s = &m->stubs[m->stub_count++];
     memset(s, 0, sizeof *s);
     s->base = base; s->size = size; s->name = name;
     s->regs = regs; s->nregs = nregs;
     return true;
+}
+
+bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
+                      const char *name) {
+    return add_stub_filled(m, base, size, name, 0x00u);
+}
+
+/*
+ * A stub whose reset value looks powered-up rather than zeroed, for a block
+ * whose guest driver polls a status bit and never gets past "not ready" if
+ * that bit reads 0 forever -- the same failure class documented at length in
+ * s5l_power_t's own header for AppleS5L8900XPowerController::start, one
+ * page over. This is still an HONEST STORAGE STUB, not a device model: it
+ * does not couple any write to any read the way s5l_power_t's ONCTRL/OFFCTRL
+ * do, so it will not help if the real protocol here is "write one register,
+ * poll a different one" rather than "poll the register you already own."
+ * Recorded as a stated assumption, not a verified one -- see clkrstgen's own
+ * declaration for what prompted it.
+ */
+bool s5l8900_add_stub_filled(s5l8900_t *m, uint32_t base, uint32_t size,
+                             const char *name, uint8_t fill) {
+    return add_stub_filled(m, base, size, name, fill);
 }
 
 static s5l_stub_t *find_stub(s5l8900_t *m, uint32_t a, unsigned bytes) {
@@ -1395,10 +1418,25 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
      * A failure to declare one is not fatal but must not be silent, so the
      * result is folded into a counter the caller can see.
      */
+    /*
+     * clkrstgen is declared filled rather than zeroed. AppleS5L8900XClockController
+     * gates specific domains through this block before dependent drivers (this
+     * session found AppleAMC's "lock BSU" retry among them) proceed, and a
+     * status bit that reads 0 forever is the same failure class s5l_power_t's
+     * own header documents at length for AppleS5L8900XPowerController::start.
+     * Reset-filled 0xFFFFFFFF per word is the storage-stub-only answer: no
+     * write is coupled to any read here, so this does not help if the real
+     * protocol is "write register A, poll register B" rather than "poll the
+     * register already read back as enabled." Unverified against real
+     * hardware; a stated assumption made to unblock a confirmed guest hang,
+     * not a hardware fact.
+     */
+    if (!s5l8900_add_stub_filled(m, S5L8900_CLOCK_BASE, S5L8900_DEV_SIZE,
+                                 "clkrstgen", 0xFFu))
+        m->stub_declare_failures++;
+
     {
         static const struct { uint32_t base, size; const char *name; } STUBS[] = {
-            /* AppleS5L8900XClockController _ccBaseAddress. */
-            { S5L8900_CLOCK_BASE,  S5L8900_DEV_SIZE,   "clkrstgen" },
             /* _miuBaseAddress, the clock controller's second reg range.
              * Offsets 0x008 and 0x404 are the ones actually touched. */
             { S5L8900_MIU_BASE,    S5L8900_DEV_SIZE,   "miu"       },

@@ -4136,6 +4136,18 @@ typedef struct {
 bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
                       const char *name);
 
+/*
+ * Same contract as s5l8900_add_stub(), except every byte of backing storage
+ * starts as `fill` instead of zero. Still an honest storage stub — reads
+ * return what was last written, nothing is coupled to anything else — just
+ * with a reset value that looks powered-up rather than gated-off, for a
+ * block whose guest driver never gets past "not ready" if that reads 0
+ * forever. See machine.c's add_stub_filled() for the caveat this does not
+ * cover.
+ */
+bool s5l8900_add_stub_filled(s5l8900_t *m, uint32_t base, uint32_t size,
+                             const char *name, uint8_t fill);
+
 /* ------------------------------------------------------- address routing ---
  *
  * THE ROUTING CONTRACT. There is exactly one rule, and it is enforced at
