@@ -29,10 +29,6 @@ static void vm_atomic_store_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order
     (void)order;
     (void)InterlockedExchange(p, (LONG)v);
 }
-static uint32_t vm_atomic_fetch_add_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
-    (void)order;
-    return (uint32_t)InterlockedExchangeAdd(p, (LONG)v);
-}
 static uint64_t vm_atomic_load_u64(vm_atomic_u64_t *p, vm_order_t order) {
     (void)order;
     return (uint64_t)InterlockedCompareExchange64(p, 0, 0);
@@ -58,9 +54,6 @@ static uint32_t vm_atomic_load_u32(vm_atomic_u32_t *p, vm_order_t order) {
 }
 static void vm_atomic_store_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
     atomic_store_explicit(p, v, vm_order(order));
-}
-static uint32_t vm_atomic_fetch_add_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
-    return atomic_fetch_add_explicit(p, v, vm_order(order));
 }
 static uint64_t vm_atomic_load_u64(vm_atomic_u64_t *p, vm_order_t order) {
     return atomic_load_explicit(p, vm_order(order));
