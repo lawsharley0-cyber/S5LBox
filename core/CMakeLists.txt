@@ -857,6 +857,10 @@ add_executable(test_vmaudiobuffer
     ../app/Sources/VMAudioBuffer.c
 )
 target_include_directories(test_vmaudiobuffer PRIVATE ../app/Sources include)
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_vmaudiobuffer PRIVATE Threads::Threads)
+endif()
 add_test(NAME app_audio_buffer COMMAND test_vmaudiobuffer)
 
 # The machine list. Links VMOptions too, because the one bound that protects

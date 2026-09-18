@@ -1,16 +1,8 @@
 /*
  * S5LBox — lock-free SPSC PCM audio circular ring buffer implementation.
  *
- * See VMAudioBuffer.h for the design rationale.  Short version:
- * the old design took pthread_mutex_lock/unlock on EVERY pushed sample word.
- * That was tens of thousands of mutex round-trips per second on the emulator
- * thread, cutting guest instruction throughput ~40-60% and turning a 1-minute
- * boot into a multi-minute crawl.
- *
- * This version is completely lock-free.  The hot paths (push_word and
- * read_frames) use only C11 atomic loads/stores with acquire/release ordering.
- * Telemetry counters use relaxed atomic operations — a slightly stale count is
- * fine for a diagnostic display and costs nothing on the hot path.
+ * One producer and one consumer own separate cursors. Full buffers drop new
+ * words without stalling the emulated DMA or touching consumer-owned data.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -32,7 +24,7 @@ void vm_audio_buffer_init(vm_audio_buffer_t *buf) {
 
 void vm_audio_buffer_reset(vm_audio_buffer_t *buf) {
     if (!buf || !buf->initialized) return;
-    /* Sequentially-consistent reset: drain the ring, then clear counters. */
+    /* Caller must stop both producer and consumer before resetting. */
     atomic_store(&buf->head, 0u);
     atomic_store(&buf->tail, 0u);
     atomic_store(&buf->frames_produced, 0u);
@@ -51,7 +43,7 @@ void vm_audio_buffer_destroy(vm_audio_buffer_t *buf) {
  * HOT PATH — emulator thread, called on every I2S DMA word.
  *
  * Wasted-slot convention: full when (head - tail) & MASK == CAPACITY - 1.
- * On overflow we advance tail ourselves so the producer never stalls.
+ * On overflow we drop the incoming word; only the consumer writes tail.
  *
  * Memory model:
  *   1. Write frame data with a plain (non-atomic) store — only the producer
@@ -69,10 +61,9 @@ void vm_audio_buffer_push_word(vm_audio_buffer_t *buf, uint32_t word) {
 
     uint32_t occupancy = (h - t) & VM_AUDIO_BUFFER_FRAME_MASK;
     if (occupancy >= VM_AUDIO_BUFFER_CAPACITY_FRAMES - 1u) {
-        /* Full: silently drop oldest frame. */
-        uint32_t new_tail = (t + 1u) & VM_AUDIO_BUFFER_FRAME_MASK;
-        atomic_store_explicit(&buf->tail, new_tail, memory_order_release);
+        /* Never overwrite a slot the consumer may still be reading. */
         atomic_fetch_add_explicit(&buf->overflows, 1u, memory_order_relaxed);
+        return;
     }
 
     buf->frames[h] = word;

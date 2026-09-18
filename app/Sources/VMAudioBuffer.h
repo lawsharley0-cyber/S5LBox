@@ -4,36 +4,11 @@
  * Sits between the emulator thread (sole producer: PL080 DMA / I2S TX FIFO)
  * and the host audio callback (sole consumer: iOS AudioQueue).
  *
- * WHY THIS WAS REWRITTEN
- *
- * The original design called pthread_mutex_lock/unlock on every single
- * vm_audio_buffer_push_word() call.  Because PL080 DMA delivers audio one
- * 32-bit word at a time, that meant tens of thousands of mutex round-trips
- * per second on the emulator thread — cutting guest instruction throughput
- * by ~40-60% and turning a ~1-minute boot into a many-minute crawl.
- *
- * This replacement is a textbook lock-free SPSC (single-producer,
- * single-consumer) ring buffer using C11 _Atomic indices:
- *
- *   head — written ONLY by the producer (emulator thread).
- *   tail — written ONLY by the consumer (AudioQueue callback thread).
- *
- * The producer does a plain (non-atomic) write of the frame data, then an
- * atomic release-store of head.  The consumer does an atomic acquire-load
- * of head, reads the frame, then a release-store of tail.  This acquire/
- * release pair is the only synchronisation on the hot path — no syscall,
- * no kernel involvement, no cache-line ping-pong on a shared lock word.
- *
- * The only remaining mutex (telem_lock) guards the diagnostic counters
- * (frames_produced, overflows, etc.) which are updated infrequently and
- * only read when the user opens the Performance report.
- *
- * Properties:
- *  - Interleaved 16-bit signed stereo PCM (4 bytes per frame).
- *  - Fixed power-of-two capacity (16,384 frames ~ 371 ms at 44.1 kHz).
- *  - Overflow policy: oldest frame overwritten; producer never stalls.
- *  - Underflow policy: silence padding so AudioQueue never glitches.
- *  - Telemetry counters read-only from performance report path.
+ * One producer owns head; one consumer owns tail. Release/acquire cursor
+ * updates protect the non-atomic sample storage. Capacity is 16,383 frames
+ * (one slot reserved). Overflow drops new words without blocking guest DMA;
+ * underflow pads with silence. Neither policy establishes guest audio timing.
+ * PCM interpretation is currently an experimental 16-bit stereo assumption.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -60,7 +35,7 @@ typedef struct {
      * tail — next slot the consumer reads.   Only the consumer modifies this.
      *
      * Logical occupancy = (head - tail) & FRAME_MASK (unsigned wrap-around).
-     * The buffer treats occupancy == CAPACITY as full (one wasted slot keeps
+     * The buffer treats occupancy == CAPACITY - 1 as full (one wasted slot keeps
      * full/empty distinguishable without a separate count field).
      *
      * Memory order:
@@ -84,7 +59,7 @@ typedef struct {
     bool             initialized;
 } vm_audio_buffer_t;
 
-/* Lifecycle */
+/* Lifecycle: both producer and consumer must be stopped. */
 void vm_audio_buffer_init(vm_audio_buffer_t *buf);
 void vm_audio_buffer_reset(vm_audio_buffer_t *buf);
 void vm_audio_buffer_destroy(vm_audio_buffer_t *buf);
@@ -92,7 +67,7 @@ void vm_audio_buffer_destroy(vm_audio_buffer_t *buf);
 /*
  * Producer (emulator thread only): push one 32-bit stereo word.
  * Low 16 bits = left channel, high 16 bits = right channel.
- * Lock-free.  If the buffer is full the oldest frame is silently overwritten.
+ * Lock-free.  If the buffer is full the incoming frame is dropped and counted.
  */
 void vm_audio_buffer_push_word(vm_audio_buffer_t *buf, uint32_t word);
 
