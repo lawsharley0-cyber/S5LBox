@@ -197,11 +197,12 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * state, so a restore preserves the destination process's live evidence.
  * 125704 adds eight per-framebuffer target aggregates (8 x 40), likewise
  * host-only, so a short witness ring cannot hide which completed surface later
- * became the active CLCD scanout.
+ * became the active CLCD scanout. 125720 adds the optional i2s0 host callback
+ * and context; they are live host wiring and remain outside snap_mach().
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         125704, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         125720, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -1041,8 +1042,8 @@ static void snap_nor(sn_io_t *io, s5l_nor_t *n) {
  * pointers and callback contexts — a tool may have interposed on them),
  * `ram` (host allocation), `pre_step_hook`/its context, targets and counters,
  * and the interpreter tick-batching counters, MBX work ledger, uart4 host-peer
- * callbacks/context and WFI pacing callback/context/counters (live host
- * policy/measurement),
+ * callbacks/context, i2s host callback/context and WFI pacing
+ * callback/context/counters (live host policy/measurement),
  * `nor.data` and `stubs[].regs`/`stubs[].name` (host allocations / string
  * literals). ram_base/ram_size live in GEOM.
  */

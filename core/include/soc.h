@@ -3831,6 +3831,14 @@ typedef bool (*s5l_active_host_now_fn)(void *ctx, uint64_t *nanoseconds);
 typedef void (*s5l_uart4_host_tx_fn)(void *ctx, uint8_t byte);
 typedef void (*s5l_uart4_host_service_fn)(void *ctx, unsigned retired);
 
+/*
+ * Optional host sink for the codec's I2S transmit FIFO. The callback runs on
+ * the machine-owning thread for each word accepted by i2s0's TX FIFO and must
+ * not call back into the machine. A NULL callback preserves the deterministic
+ * core-only behaviour used by the desktop harnesses.
+ */
+typedef void (*s5l_i2s_host_tx_fn)(void *ctx, uint32_t word);
+
 /* Do not hold an interactive execution slice inside WFI for longer than this.
  * Longer guest waits are advanced in real-time-sized pieces, yielding between
  * them so a frontend can drain input, stop requests and scanout. */
@@ -4102,6 +4110,10 @@ typedef struct {
     uint64_t               active_clock_failures;
     bool                   active_clock_anchor_valid;
 
+    /* Host audio wiring; neither callback nor context is guest state. */
+    s5l_i2s_host_tx_fn i2s_host_tx;
+    void              *i2s_host_tx_ctx;
+
     /*
      * uart4's optional host peer. Host wiring, never guest state: snapshot
      * visitors deliberately leave all three fields untouched, so restoring a
@@ -4335,6 +4347,7 @@ bool s5l8900_set_active_host_clock(s5l8900_t *m,
  */
 bool s5l8900_set_uart4_host(s5l8900_t *m, s5l_uart4_host_tx_fn tx,
                             s5l_uart4_host_service_fn service, void *ctx);
+bool s5l8900_set_i2s_host(s5l8900_t *m, s5l_i2s_host_tx_fn tx, void *ctx);
 
 /*
  * ram_base/ram_size define where RAM appears. Returns false on allocation

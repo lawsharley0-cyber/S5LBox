@@ -97,6 +97,7 @@ targets:
       - sdk: UIKit.framework
       - sdk: CoreGraphics.framework
       - sdk: QuartzCore.framework
+      - sdk: AVFAudio.framework
     settings:
       base:
         PRODUCT_NAME: S5LBox

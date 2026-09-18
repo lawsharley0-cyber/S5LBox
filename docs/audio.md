@@ -10,6 +10,14 @@
 
 # Audio: the codec answers and the I²S windows are decoded
 
+## Current iOS output path
+
+The iOS frontend starts an `AVAudioEngine` source node and connects it to the
+emulated i2s0 transmit FIFO. The core exposes this as an optional host callback
+(`s5l8900_set_i2s_host`); desktop harnesses leave it unset, while the app
+converts each guest stereo 16-bit FIFO word into float PCM. Control-register
+writes are never forwarded as samples.
+
 **Status: landed.** `AppleWM8991Audio: I2C register read failed (0): device
 error` is gone. The codec is modelled in `core/src/soc/wm8991.c` as an I²C slave
 at `0x1B` on i2c0, both I²S windows are decoded device models in
@@ -195,9 +203,9 @@ them until a transfer is actually configured.
 - **The other i2c0 nodes** — accelerometer `0x1d`, ALS `0x44`, tethered `0x29`.
   Nothing establishes what they must answer, and an address that NAKs is a
   driver that fails cleanly, which is what all three do today.
-- **The PL080, and any host audio sink.** Samples still need the DMAC; host
-  playback needs a portable sink that must never block the CPU thread, and
-  `core/` has no threading vocabulary. Both are separate work.
+- **The PL080.** Samples still need the DMAC. The iOS host sink is now present,
+  but remains silent until the guest enables a channel that reaches the i2s0
+  transmit FIFO.
 
 ### Tests and mutants
 
@@ -263,10 +271,10 @@ MMIO traffic the census shows on `0x3CA00000`/`0x3CD00000`, and makes the window
 > uninterruptible hang**. That is a regression, not progress. Steps 1 and 2 are
 > one unit.
 
-Two things to keep honest about scope. **Nothing makes a sound today** and
-nothing would even with a perfect stack: the activation screen is silent and
+Two things to keep honest about scope. The activation screen is silent and
 iPhone OS 3 has no boot chime, so audio output is downstream of touch exactly as
-Wi-Fi is. And **you cannot hear it live** — at 200-294× slower than the 412 MHz
+Wi-Fi is. The iOS sink is live once the guest produces FIFO words, but at
+200-294× slower than the 412 MHz
 part, the smallest UI sound costs about 6 seconds of wall clock and one guest
 second costs about 200. The right design is to clock the model off the guest
 timebase, capture PCM to a WAV, and let the host play it back afterwards.

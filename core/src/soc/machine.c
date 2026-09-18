@@ -553,7 +553,11 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     if (mmio_data(addr, bytes, S5L8900_I2S0_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
-        s5l_i2s_write(&m->i2s[0], addr - S5L8900_I2S0_BASE, val);
+        uint32_t off = addr - S5L8900_I2S0_BASE;
+        s5l_i2s_write(&m->i2s[0], off, val);
+        if (bytes == 4u && off == S5L_I2S_TX_FIFO_OFF &&
+            m->i2s_host_tx)
+            m->i2s_host_tx(m->i2s_host_tx_ctx, val);
         return;
     }
     if (mmio_data(addr, bytes, S5L8900_I2S1_BASE, S5L8900_DEV_SIZE)) {
@@ -734,6 +738,19 @@ bool s5l8900_set_uart4_host(s5l8900_t *m, s5l_uart4_host_tx_fn tx,
     m->uart4_host_ctx = ctx;
     m->uart4_host_tx = tx;
     m->uart4_host_service = service;
+    return true;
+}
+
+bool s5l8900_set_i2s_host(s5l8900_t *m, s5l_i2s_host_tx_fn tx, void *ctx) {
+    if (!m) return false;
+    if (!tx && ctx) return false;
+    if (!tx) {
+        m->i2s_host_tx = NULL;
+        m->i2s_host_tx_ctx = NULL;
+        return true;
+    }
+    m->i2s_host_tx_ctx = ctx;
+    m->i2s_host_tx = tx;
     return true;
 }
 

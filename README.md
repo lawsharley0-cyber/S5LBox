@@ -91,9 +91,9 @@ are deterministic apart from that one contact, so the tap is what dismissed it.
   simultaneous contacts do traverse the device, the driver and the normaliser.
   What has *not* been shown is an app responding to one, because a pinch on the
   home screen has nothing to zoom.
-- **No sound has been produced.** Apple's audio drivers start
-  (`AppleWM8991Audio::start`, both I²S controllers) and **zero** words have ever
-  reached the transmit FIFO.
+- **Audio output is wired on iOS.** Words reaching the emulated i2s0 transmit
+  FIFO are converted to stereo PCM by `AVAudioEngine`; the output remains
+  silent until the guest enables its DMA path.
 - **No packet has been carried.** The PPP link comes up — `IPCP Opened`,
   `10.0.2.15` — and every NAT counter is still zero.
 - **30 fps is not established.** User-reported foreground navigation can still
@@ -113,8 +113,9 @@ connected to anything. "Searching…" is the status bar correctly reporting no
 baseband, which is one of five pieces of hardware deliberately hidden from the
 guest. The default also hides the graphics chip and uses Apple's software
 renderer; an experimental MBX model now completes the measured live workload,
-but has not passed final cold-boot or 30 fps acceptance. The audio hardware is
-modelled, but nothing has ever played through it — see the table below.
+but has not passed final cold-boot or 30 fps acceptance. The audio hardware and
+iOS host output are modelled; playback still depends on the guest reaching the
+I²S DMA path — see the table below.
 
 <div align="center">
 

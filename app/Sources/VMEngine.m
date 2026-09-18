@@ -38,6 +38,7 @@
 #import "VMInstancePaths.h"
 #import "VMInstanceStore.h"
 #import "VMSettings.h"
+#import "VMAudioOutput.h"
 
 #import <mach/mach.h>
 #import <pthread.h>
@@ -46,6 +47,10 @@
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
+
+static void vm_i2s_host_tx(void *ctx, uint32_t word) {
+    [(VMAudioOutput *)ctx pushWord:word];
+}
 
 // How many instructions to interpret between checks of the stop/pause flags.
 // At a few million instructions a second this is roughly 15-30 ms, which keeps
@@ -169,6 +174,7 @@ static double vm_engine_now_seconds(void) {
     uint64_t         _prepareDone;
     uint64_t         _prepareTotal;
     BOOL             _machineReady;
+    VMAudioOutput   *_audioOutput;
 
     /*
      * WHICH GUEST IS RUNNING, and why it is not the other one.
@@ -849,6 +855,18 @@ static double vm_engine_now_seconds(void) {
         pthread_mutex_unlock(&_lock);
         [self appendConsole:@"[vm] could not install the guest payload\n"];
         return NO;
+    }
+
+    _audioOutput = [[VMAudioOutput alloc] init];
+    if ([_audioOutput start]) {
+        if (!s5l8900_set_i2s_host(&_machine, vm_i2s_host_tx,
+                                  (__bridge void *)_audioOutput)) {
+            [_audioOutput stop];
+            _audioOutput = nil;
+        }
+    } else {
+        [self appendConsole:@"[audio] host output could not be started\n"];
+        _audioOutput = nil;
     }
 
     uint64_t after = [VMEngine physFootprintBytes];
@@ -1832,8 +1850,11 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
             (unsigned long long)retired]];
 
     if (_machineReady) {
+        (void)s5l8900_set_i2s_host(&_machine, NULL, NULL);
         s5l8900_free(&_machine);
     }
+    [_audioOutput stop];
+    _audioOutput = nil;
     /* AFTER the machine, never before: the memory-disk bridges hold a borrowed
      * descriptor onto the work image and a pointer into guest DRAM, and both
      * have to stop existing before the file they write through is closed. */
