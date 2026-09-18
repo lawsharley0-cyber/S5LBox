@@ -51,6 +51,14 @@ static UIGestureRecognizer *VMNavigationContentPopGestureRecognizer(
     __weak UIGestureRecognizer *_configuredContentPopGesture;
 }
 
+- (UIViewController *)childViewControllerForStatusBarHidden {
+    return self.topViewController;
+}
+
+- (UIViewController *)childViewControllerForHomeIndicatorAutoHidden {
+    return self.topViewController;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
 

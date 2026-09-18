@@ -381,6 +381,24 @@ add_executable(test_vmframetelemetry
 target_include_directories(test_vmframetelemetry PRIVATE ../app/Sources)
 add_test(NAME app_frame_telemetry COMMAND test_vmframetelemetry)
 
+add_executable(test_vmphonelayout
+    ../app/Tests/test_vmphonelayout.c
+    ../app/Sources/VMPhoneLayout.c
+)
+target_include_directories(test_vmphonelayout PRIVATE ../app/Sources)
+if(NOT MSVC)
+    target_link_libraries(test_vmphonelayout PRIVATE m)
+endif()
+add_test(NAME app_phone_layout COMMAND test_vmphonelayout)
+
+add_executable(test_vmframepublication
+    ../app/Tests/test_vmframepublication.c
+    ../app/Sources/VMFramePublication.c
+)
+target_include_directories(test_vmframepublication PRIVATE ../app/Sources)
+add_test(NAME app_frame_publication COMMAND test_vmframepublication)
+
+
 # The app's user interface is built by a macOS CI runner and can only be run on
 # a phone, so none of its Objective-C is reachable from this suite.  The pieces
 # that are pure arithmetic, pure data and pure bookkeeping are therefore

@@ -33,7 +33,9 @@
     <key>CFBundleShortVersionString</key>
     <string>0.0.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
+    <key>S5LBoxSourceRevision</key>
+    <string>$(S5LBOX_SOURCE_REVISION)</string>
     <!-- The app's Documents folder appears in Files under "On My iPhone",
          which is how a 239 MB IPSW gets in without going through a document
          picker: copy it into S5LBox's folder and the Firmware screen finds it
