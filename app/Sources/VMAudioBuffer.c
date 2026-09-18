@@ -9,29 +9,93 @@
 #include "VMAudioBuffer.h"
 #include <string.h>
 
+/*
+ * Portable atomic helpers, parameterised by the same relaxed/acquire/release
+ * intent as the stdatomic calls this file always used. On Windows every
+ * order maps to a full-barrier Interlocked* op (stronger than requested,
+ * which is always safe, never incorrect) because MSVC does not enable C11
+ * atomics for this project's C mode — see the header and VMFrameTelemetry.c.
+ * Everywhere else the order is passed straight through to stdatomic, so the
+ * shipping (non-Windows) path's memory model is unchanged from before.
+ */
+typedef enum { VM_ORDER_RELAXED, VM_ORDER_ACQUIRE, VM_ORDER_RELEASE } vm_order_t;
+
+#if defined(_WIN32)
+static uint32_t vm_atomic_load_u32(vm_atomic_u32_t *p, vm_order_t order) {
+    (void)order;
+    return (uint32_t)InterlockedCompareExchange(p, 0, 0);
+}
+static void vm_atomic_store_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
+    (void)order;
+    (void)InterlockedExchange(p, (LONG)v);
+}
+static uint32_t vm_atomic_fetch_add_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
+    (void)order;
+    return (uint32_t)InterlockedExchangeAdd(p, (LONG)v);
+}
+static uint64_t vm_atomic_load_u64(vm_atomic_u64_t *p, vm_order_t order) {
+    (void)order;
+    return (uint64_t)InterlockedCompareExchange64(p, 0, 0);
+}
+static void vm_atomic_store_u64(vm_atomic_u64_t *p, uint64_t v, vm_order_t order) {
+    (void)order;
+    (void)InterlockedExchange64(p, (LONG64)v);
+}
+static uint64_t vm_atomic_fetch_add_u64(vm_atomic_u64_t *p, uint64_t v, vm_order_t order) {
+    (void)order;
+    return (uint64_t)InterlockedExchangeAdd64(p, (LONG64)v);
+}
+#else
+static memory_order vm_order(vm_order_t order) {
+    switch (order) {
+    case VM_ORDER_ACQUIRE: return memory_order_acquire;
+    case VM_ORDER_RELEASE: return memory_order_release;
+    default:               return memory_order_relaxed;
+    }
+}
+static uint32_t vm_atomic_load_u32(vm_atomic_u32_t *p, vm_order_t order) {
+    return atomic_load_explicit(p, vm_order(order));
+}
+static void vm_atomic_store_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
+    atomic_store_explicit(p, v, vm_order(order));
+}
+static uint32_t vm_atomic_fetch_add_u32(vm_atomic_u32_t *p, uint32_t v, vm_order_t order) {
+    return atomic_fetch_add_explicit(p, v, vm_order(order));
+}
+static uint64_t vm_atomic_load_u64(vm_atomic_u64_t *p, vm_order_t order) {
+    return atomic_load_explicit(p, vm_order(order));
+}
+static void vm_atomic_store_u64(vm_atomic_u64_t *p, uint64_t v, vm_order_t order) {
+    atomic_store_explicit(p, v, vm_order(order));
+}
+static uint64_t vm_atomic_fetch_add_u64(vm_atomic_u64_t *p, uint64_t v, vm_order_t order) {
+    return atomic_fetch_add_explicit(p, v, vm_order(order));
+}
+#endif
+
 void vm_audio_buffer_init(vm_audio_buffer_t *buf) {
     if (!buf) return;
     memset(buf, 0, sizeof *buf);
-    atomic_init(&buf->head, 0u);
-    atomic_init(&buf->tail, 0u);
-    atomic_init(&buf->frames_produced, 0u);
-    atomic_init(&buf->frames_consumed, 0u);
-    atomic_init(&buf->underflows, 0u);
-    atomic_init(&buf->overflows, 0u);
-    atomic_init(&buf->last_word, 0u);
+    vm_atomic_store_u32(&buf->head, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u32(&buf->tail, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->frames_produced, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->frames_consumed, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->underflows, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->overflows, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u32(&buf->last_word, 0u, VM_ORDER_RELAXED);
     buf->initialized = true;
 }
 
 void vm_audio_buffer_reset(vm_audio_buffer_t *buf) {
     if (!buf || !buf->initialized) return;
     /* Caller must stop both producer and consumer before resetting. */
-    atomic_store(&buf->head, 0u);
-    atomic_store(&buf->tail, 0u);
-    atomic_store(&buf->frames_produced, 0u);
-    atomic_store(&buf->frames_consumed, 0u);
-    atomic_store(&buf->underflows, 0u);
-    atomic_store(&buf->overflows, 0u);
-    atomic_store(&buf->last_word, 0u);
+    vm_atomic_store_u32(&buf->head, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u32(&buf->tail, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->frames_produced, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->frames_consumed, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->underflows, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u64(&buf->overflows, 0u, VM_ORDER_RELAXED);
+    vm_atomic_store_u32(&buf->last_word, 0u, VM_ORDER_RELAXED);
 }
 
 void vm_audio_buffer_destroy(vm_audio_buffer_t *buf) {
@@ -56,23 +120,23 @@ void vm_audio_buffer_destroy(vm_audio_buffer_t *buf) {
 void vm_audio_buffer_push_word(vm_audio_buffer_t *buf, uint32_t word) {
     if (!buf || !buf->initialized) return;
 
-    uint32_t h = atomic_load_explicit(&buf->head, memory_order_relaxed);
-    uint32_t t = atomic_load_explicit(&buf->tail, memory_order_acquire);
+    uint32_t h = vm_atomic_load_u32(&buf->head, VM_ORDER_RELAXED);
+    uint32_t t = vm_atomic_load_u32(&buf->tail, VM_ORDER_ACQUIRE);
 
     uint32_t occupancy = (h - t) & VM_AUDIO_BUFFER_FRAME_MASK;
     if (occupancy >= VM_AUDIO_BUFFER_CAPACITY_FRAMES - 1u) {
         /* Never overwrite a slot the consumer may still be reading. */
-        atomic_fetch_add_explicit(&buf->overflows, 1u, memory_order_relaxed);
+        vm_atomic_fetch_add_u64(&buf->overflows, 1u, VM_ORDER_RELAXED);
         return;
     }
 
     buf->frames[h] = word;
-    atomic_store_explicit(&buf->head,
-                          (h + 1u) & VM_AUDIO_BUFFER_FRAME_MASK,
-                          memory_order_release);
+    vm_atomic_store_u32(&buf->head,
+                        (h + 1u) & VM_AUDIO_BUFFER_FRAME_MASK,
+                        VM_ORDER_RELEASE);
 
-    atomic_fetch_add_explicit(&buf->frames_produced, 1u, memory_order_relaxed);
-    atomic_store_explicit(&buf->last_word, word, memory_order_relaxed);
+    vm_atomic_fetch_add_u64(&buf->frames_produced, 1u, VM_ORDER_RELAXED);
+    vm_atomic_store_u32(&buf->last_word, word, VM_ORDER_RELAXED);
 }
 
 /* Legacy — DMA back-pressure removed in b7d0324. Always returns true. */
@@ -94,8 +158,8 @@ uint32_t vm_audio_buffer_read_frames(vm_audio_buffer_t *buf,
                                      uint32_t max_frames) {
     if (!buf || !buf->initialized || !dst || max_frames == 0) return 0;
 
-    uint32_t h = atomic_load_explicit(&buf->head, memory_order_acquire);
-    uint32_t t = atomic_load_explicit(&buf->tail, memory_order_relaxed);
+    uint32_t h = vm_atomic_load_u32(&buf->head, VM_ORDER_ACQUIRE);
+    uint32_t t = vm_atomic_load_u32(&buf->tail, VM_ORDER_RELAXED);
 
     uint32_t available = (h - t) & VM_AUDIO_BUFFER_FRAME_MASK;
     uint32_t to_read = available < max_frames ? available : max_frames;
@@ -107,33 +171,28 @@ uint32_t vm_audio_buffer_read_frames(vm_audio_buffer_t *buf,
         dst[i * 2u + 0u] = (int16_t)(word & 0xffffu);
         dst[i * 2u + 1u] = (int16_t)((word >> 16) & 0xffffu);
     }
-    atomic_store_explicit(&buf->tail, t, memory_order_release);
+    vm_atomic_store_u32(&buf->tail, t, VM_ORDER_RELEASE);
 
     if (to_read < max_frames) {
         /* Underflow: pad remaining with silence. */
         uint32_t remaining = max_frames - to_read;
         memset(&dst[to_read * 2u], 0, remaining * sizeof(int16_t) * 2u);
-        atomic_fetch_add_explicit(&buf->underflows, 1u, memory_order_relaxed);
+        vm_atomic_fetch_add_u64(&buf->underflows, 1u, VM_ORDER_RELAXED);
     }
-    atomic_fetch_add_explicit(&buf->frames_consumed,
-                              (uint64_t)to_read, memory_order_relaxed);
+    vm_atomic_fetch_add_u64(&buf->frames_consumed,
+                            (uint64_t)to_read, VM_ORDER_RELAXED);
     return to_read;
 }
 
 /* Telemetry snapshot — safe from any thread, values may be slightly stale. */
 void vm_audio_buffer_telemetry(vm_audio_buffer_t *buf, vm_audio_telemetry_t *out) {
     if (!buf || !buf->initialized || !out) return;
-    uint32_t h = atomic_load_explicit(&buf->head, memory_order_acquire);
-    uint32_t t = atomic_load_explicit(&buf->tail, memory_order_acquire);
+    uint32_t h = vm_atomic_load_u32(&buf->head, VM_ORDER_ACQUIRE);
+    uint32_t t = vm_atomic_load_u32(&buf->tail, VM_ORDER_ACQUIRE);
     out->count      = (h - t) & VM_AUDIO_BUFFER_FRAME_MASK;
-    out->produced   = atomic_load_explicit(&buf->frames_produced,
-                                           memory_order_relaxed);
-    out->consumed   = atomic_load_explicit(&buf->frames_consumed,
-                                           memory_order_relaxed);
-    out->underflows = atomic_load_explicit(&buf->underflows,
-                                           memory_order_relaxed);
-    out->overflows  = atomic_load_explicit(&buf->overflows,
-                                           memory_order_relaxed);
-    out->last_word  = atomic_load_explicit(&buf->last_word,
-                                           memory_order_relaxed);
+    out->produced   = vm_atomic_load_u64(&buf->frames_produced, VM_ORDER_RELAXED);
+    out->consumed   = vm_atomic_load_u64(&buf->frames_consumed, VM_ORDER_RELAXED);
+    out->underflows = vm_atomic_load_u64(&buf->underflows, VM_ORDER_RELAXED);
+    out->overflows  = vm_atomic_load_u64(&buf->overflows, VM_ORDER_RELAXED);
+    out->last_word  = vm_atomic_load_u32(&buf->last_word, VM_ORDER_RELAXED);
 }

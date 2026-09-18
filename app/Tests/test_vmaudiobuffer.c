@@ -134,8 +134,10 @@ static void test_audio_buffer_wrap_around(void) {
     vm_audio_buffer_t buf;
     vm_audio_buffer_init(&buf);
 
-    /* Push and pop chunks of 500 frames across 2 full cycles of capacity */
-    const unsigned CHUNK = 500u;
+    /* Push and pop chunks of 500 frames across 2 full cycles of capacity.
+     * CHUNK must be a true compile-time constant (not just a const local) —
+     * it sizes a stack array below, and MSVC has no C99 VLA support. */
+    enum { CHUNK = 500u };
     const unsigned CYCLES = (VM_AUDIO_BUFFER_CAPACITY_FRAMES * 2u) / CHUNK;
     uint32_t sample_counter = 0;
 

@@ -15,10 +15,28 @@
 #ifndef S5LBOX_APP_VMAUDIOBUFFER_H
 #define S5LBOX_APP_VMAUDIOBUFFER_H
 
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * MSVC does not enable C11 atomics for the C mode used by this project (see
+ * VMFrameTelemetry.c). volatile LONG/LONG64 plus Interlocked* keeps the
+ * Windows desktop test build portable without weakening the stock-iOS path
+ * or requiring an experimental compiler switch.
+ */
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+typedef volatile LONG   vm_atomic_u32_t;
+typedef volatile LONG64 vm_atomic_u64_t;
+#else
+#include <stdatomic.h>
+typedef _Atomic uint32_t vm_atomic_u32_t;
+typedef _Atomic uint64_t vm_atomic_u64_t;
+#endif
 
 #define VM_AUDIO_BUFFER_CAPACITY_FRAMES 16384u
 #define VM_AUDIO_BUFFER_FRAME_MASK      (VM_AUDIO_BUFFER_CAPACITY_FRAMES - 1u)
@@ -42,20 +60,20 @@ typedef struct {
      *   Producer: write frame data (relaxed), then release-store head.
      *   Consumer: acquire-load head, read frame data, release-store tail.
      */
-    _Atomic uint32_t head;          /* producer-owned write cursor */
-    _Atomic uint32_t tail;          /* consumer-owned read cursor  */
+    vm_atomic_u32_t head;          /* producer-owned write cursor */
+    vm_atomic_u32_t tail;          /* consumer-owned read cursor  */
 
     /*
-     * Telemetry counters — _Atomic so push_word and read_frames can update
+     * Telemetry counters — atomic so push_word and read_frames can update
      * them with relaxed stores, with no mutex on the hot path at all.
      * vm_audio_buffer_telemetry() reads them with relaxed loads; a slightly
      * stale diagnostic count is perfectly fine for a UI report.
      */
-    _Atomic uint64_t frames_produced;
-    _Atomic uint64_t frames_consumed;
-    _Atomic uint64_t underflows;
-    _Atomic uint64_t overflows;
-    _Atomic uint32_t last_word;
+    vm_atomic_u64_t frames_produced;
+    vm_atomic_u64_t frames_consumed;
+    vm_atomic_u64_t underflows;
+    vm_atomic_u64_t overflows;
+    vm_atomic_u32_t last_word;
     bool             initialized;
 } vm_audio_buffer_t;
 
