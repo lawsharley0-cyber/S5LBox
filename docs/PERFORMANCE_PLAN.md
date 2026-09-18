@@ -168,3 +168,43 @@ arm64 host — a real iPhone or an Apple Silicon Mac. Until then, the
 honest state of the CPU-performance track is: bottleneck reconfirmed
 precisely, no new implementable optimization identified from this
 machine, next step is architecture-bound rather than effort-bound.
+
+## 9. Rejected: the experimental graphics-HLE build, on real hardware
+
+The `S5LBOX_IOS3_HLE_EXPERIMENT` build (`ios-build` workflow_dispatch,
+`experimental_hle: true`) arms the three existing `IOS3_HLE_REPLACE` sites --
+`sw_sample_nearest_BGRA8`, `sw_scanline`, `ogl_poly_scan` -- which is exactly
+the change `README.md`/`ROADMAP.md` call "the only single change that could
+reach 30 fps." That claim had never been tested end-to-end on a real phone;
+this session built and ran it on the user's device (a real iPhone, the same
+one used throughout this session) for the first time.
+
+**Result: subjectively and clearly slower than the armed-off baseline, not
+faster.** This is precisely the test `tools/ios3_hle.c`'s own header already
+flagged as outstanding: *"a real armed/disarmed framebuffer oracle remains
+mandatory before their pixels can be accepted... 39.8% of a profile is not
+the same number as calls-times-cost."* That question now has a real,
+on-device answer, and it is no.
+
+**Why, most likely** (not independently measured this session, but consistent
+with the code): these three functions are per-pixel/per-texel leaf routines
+called an enormous number of times per frame. Each `IOS3_HLE_REPLACE` call
+pays real per-call overhead -- every guest memory access goes through the
+guest MMU via a callback indirection (`ios3_hle_mem_t.read`/`write`), not a
+raw pointer, per contract item 4 in `tools/ios3_hle.h`. For a leaf function
+that is itself only ~10-30 ARM instructions, that safety overhead can plausibly
+exceed what skipping those instructions saves. Separately,
+`vm_firmware_hle_enable()` installing pre-step-hook targets forces
+`s5l8900_static_a64_invalidate_derived()` and constrains the build-time
+compact AArch64 engine from translating straight through any block containing
+a target PC -- fragmenting exactly the graphics-heavy hot region into smaller,
+less-efficient execution windows.
+
+**Do not re-arm these three REPLACE sites, or add new REPLACE-mode HLE sites
+for high-call-count leaf functions, without a new hypothesis for why per-call
+interception overhead would not dominate again.** This does not indict the
+HLE mechanism in general -- `_mulg_common` (§8) is called far less often per
+guest-visible unit of work (millions of instructions per call, not one call
+per pixel), so the same overhead concern does not obviously apply there, but
+that too now needs the same armed/disarmed on-device measurement before a
+REPLACE is trusted, not just an OBSERVE count.
