@@ -20,6 +20,7 @@ static const Float64  kSampleRate = 44100.0;
     BOOL                _running;
     BOOL                _paused;
     BOOL                _sessionConfigured;
+    OSStatus            _lastError;
 }
 
 static void vm_audio_queue_output_callback(void *userData,
@@ -37,6 +38,7 @@ static void vm_audio_queue_output_callback(void *userData,
         _running = NO;
         _paused = NO;
         _sessionConfigured = NO;
+        _lastError = noErr;
     }
     return self;
 }
@@ -77,6 +79,7 @@ static void vm_audio_queue_output_callback(void *userData,
 
     [self configureAudioSession];
     vm_audio_buffer_reset(&_ringBuffer);
+    _lastError = noErr;
 
     AudioStreamBasicDescription format;
     memset(&format, 0, sizeof format);
@@ -93,10 +96,11 @@ static void vm_audio_queue_output_callback(void *userData,
                                       vm_audio_queue_output_callback,
                                       (__bridge void *)self,
                                       NULL,
-                                      kCFRunLoopCommonModes,
+                                      NULL,
                                       0,
                                       &_audioQueue);
     if (st != noErr) {
+        _lastError = st;
         NSLog(@"[VMAudioOutput] AudioQueueNewOutput failed: %d", (int)st);
         return NO;
     }
@@ -105,6 +109,7 @@ static void vm_audio_queue_output_callback(void *userData,
     for (uint32_t i = 0; i < kBufferCount; i++) {
         st = AudioQueueAllocateBuffer(_audioQueue, bufferByteSize, &_buffers[i]);
         if (st != noErr) {
+            _lastError = st;
             NSLog(@"[VMAudioOutput] AudioQueueAllocateBuffer %u failed: %d", i, (int)st);
             [self stop];
             return NO;
@@ -115,6 +120,7 @@ static void vm_audio_queue_output_callback(void *userData,
 
     st = AudioQueueStart(_audioQueue, NULL);
     if (st != noErr) {
+        _lastError = st;
         NSLog(@"[VMAudioOutput] AudioQueueStart failed: %d", (int)st);
         [self stop];
         return NO;
@@ -122,6 +128,7 @@ static void vm_audio_queue_output_callback(void *userData,
 
     _running = YES;
     _paused = NO;
+    [self playTestTone];
     return YES;
 }
 
@@ -168,21 +175,41 @@ static void vm_audio_queue_output_callback(void *userData,
     return vm_audio_buffer_ready_for_more(&_ringBuffer);
 }
 
-- (NSString *)statusDescription {
-    vm_audio_telemetry_t telem;
-    vm_audio_buffer_telemetry(&_ringBuffer, &telem);
+- (void)playTestTone {
+    // Generate a gentle 0.25s two-tone chime (587.33 Hz D5 for 100ms, then 880.0 Hz A5 for 150ms)
+    const uint32_t totalFrames = (uint32_t)(0.25 * kSampleRate);
+    const uint32_t split = (uint32_t)(0.10 * kSampleRate);
+    for (uint32_t i = 0; i < totalFrames; i++) {
+        double freq = (i < split) ? 587.33 : 880.0;
+        double t = (double)i / kSampleRate;
+        double phase = 2.0 * M_PI * freq * t;
+        double partProgress = (i < split) ? ((double)i / (double)split)
+                                          : ((double)(i - split) / (double)(totalFrames - split));
+        double env = exp(-3.5 * partProgress);
+        int16_t amp = (int16_t)(sin(phase) * 14000.0 * env);
+        uint32_t word = ((uint32_t)(uint16_t)amp) | (((uint32_t)(uint16_t)amp) << 16);
+        [self pushSampleWord:word];
+    }
+}
 
+- (NSString *)statusDescription {
+    if (_lastError != noErr) {
+        return [NSString stringWithFormat:@"Audio queue error %d", (int)_lastError];
+    }
     if (!_running) {
         return @"Audio output stopped";
     }
 
+    vm_audio_telemetry_t telem;
+    vm_audio_buffer_telemetry(&_ringBuffer, &telem);
+
     if (telem.produced == 0) {
-        return @"Audio output active (44.1 kHz stereo) · idle (no guest sound playing)";
+        return @"Audio active (44.1 kHz stereo) · idle (0 guest sound samples received)";
     }
 
     double bufferedMs = (double)telem.count * 1000.0 / kSampleRate;
     return [NSString stringWithFormat:
-        @"Audio output active (44.1 kHz stereo) · %llu frames delivered, %.0f ms buffered (%llu underflow, %llu overflow)",
+        @"Audio active (44.1 kHz stereo) · %llu frames delivered, %.0f ms buffered (%llu underflow, %llu overflow)",
         (unsigned long long)telem.consumed,
         bufferedMs,
         (unsigned long long)telem.underflows,
@@ -226,6 +253,8 @@ static void vm_audio_queue_output_callback(void *userData,
 - (BOOL)isReadyForMore {
     return vm_audio_buffer_ready_for_more(&_ringBuffer);
 }
+
+- (void)playTestTone {}
 
 - (NSString *)statusDescription {
     return @"Audio output stub (non-Apple platform)";

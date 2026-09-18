@@ -1074,6 +1074,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
             EmulatorViewController *vc = weakSelf;
             if (vc) [vc setPerformanceVisible:!vc->_showPerformance];
         }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Play Test Sound"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (!vc) return;
+            [vc->_engine playAudioTestTone];
+        }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Performance & Sound Details"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf showPerformanceReport];

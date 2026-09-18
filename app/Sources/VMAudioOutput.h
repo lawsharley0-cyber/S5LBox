@@ -29,6 +29,9 @@ NS_ASSUME_NONNULL_BEGIN
 /* Flow control query for PL080 DMA pacing. */
 - (BOOL)isReadyForMore;
 
+/* Play a brief two-tone confirmation chime through the audio output. */
+- (void)playTestTone;
+
 /* Status string with live telemetry for the UI and diagnostics. */
 - (NSString *)statusDescription;
 

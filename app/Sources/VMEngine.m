@@ -2105,6 +2105,15 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     return @"Audio output idle";
 }
 
+- (void)playAudioTestTone {
+    pthread_mutex_lock(&_lock);
+    VMAudioOutput *output = _audioOutput;
+    pthread_mutex_unlock(&_lock);
+    if (output) {
+        [output playTestTone];
+    }
+}
+
 - (NSString *)statusLine {
     pthread_mutex_lock(&_lock);
     uint64_t retired = _retired;
