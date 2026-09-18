@@ -866,6 +866,7 @@ static double vm_engine_now_seconds(void) {
         }
     } else {
         [self appendConsole:@"[audio] host output could not be started\n"];
+        [_audioOutput stop];
         _audioOutput = nil;
     }
 
@@ -881,6 +882,9 @@ static double vm_engine_now_seconds(void) {
                                                selector:@selector(threadMain:)
                                                  object:nil];
     if (!thread) {
+        (void)s5l8900_set_i2s_host(&_machine, NULL, NULL);
+        [_audioOutput stop];
+        _audioOutput = nil;
         s5l8900_free(&_machine);
         vm_firmware_boot_destroy(&_firmwareBoot);
         pthread_mutex_lock(&_lock);
@@ -905,6 +909,9 @@ static double vm_engine_now_seconds(void) {
     pthread_mutex_unlock(&_lock);
 
     if (cancelled) {
+        (void)s5l8900_set_i2s_host(&_machine, NULL, NULL);
+        [_audioOutput stop];
+        _audioOutput = nil;
         s5l8900_free(&_machine);
         vm_firmware_boot_destroy(&_firmwareBoot);
         pthread_mutex_lock(&_lock);
