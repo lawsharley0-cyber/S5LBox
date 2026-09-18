@@ -852,6 +852,13 @@ add_executable(test_vmbuttonqueue
 target_include_directories(test_vmbuttonqueue PRIVATE ../app/Sources include)
 add_test(NAME app_button_queue COMMAND test_vmbuttonqueue)
 
+add_executable(test_vmaudiobuffer
+    ../app/Tests/test_vmaudiobuffer.c
+    ../app/Sources/VMAudioBuffer.c
+)
+target_include_directories(test_vmaudiobuffer PRIVATE ../app/Sources include)
+add_test(NAME app_audio_buffer COMMAND test_vmaudiobuffer)
+
 # The machine list. Links VMOptions too, because the one bound that protects
 # every saved machine -- that an instance can still store a value for every
 # option row -- is a fact about both tables at once.
@@ -1082,6 +1089,10 @@ target_compile_definitions(test_audio_capture PRIVATE
 add_test(NAME guest_audio_capture COMMAND test_audio_capture)
 set_tests_properties(guest_audio_capture PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+
+add_executable(test_audio_dma tests/test_audio_dma.c)
+target_link_libraries(test_audio_dma PRIVATE emucore)
+add_test(NAME audio_dma_flow_control COMMAND test_audio_dma)
 
 # The exact kernel and rootfs policies authenticate caller-selected bytes with
 # the same small, allocation-free implementation.  Keep that primitive in a

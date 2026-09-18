@@ -39,6 +39,7 @@
 #import "VMInstanceStore.h"
 #import "VMSettings.h"
 #import "VMFramePublication.h"
+#import "VMAudioOutput.h"
 
 #import <mach/mach.h>
 #import <pthread.h>
@@ -132,6 +133,8 @@ static uint64_t vm_now_ns(void) {
 - (void)provisionRootFilesystem:(id)unused;
 - (BOOL)resolveFilesInto:(vm_instance_paths_t *)paths note:(NSString **)note;
 - (NSUInteger)copyOptionValuesInto:(bool *)values capacity:(NSUInteger)capacity;
+- (void)pushAudioWord_emulatorThread:(uint32_t)word;
+- (BOOL)audioReadyForMore_emulatorThread;
 @end
 
 /*
@@ -162,6 +165,16 @@ static double vm_engine_now_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void vm_audio_tx_callback(void *ctx, uint32_t word) {
+    VMEngine *engine = (__bridge VMEngine *)ctx;
+    [engine pushAudioWord_emulatorThread:word];
+}
+
+static bool vm_audio_ready_callback(void *ctx) {
+    VMEngine *engine = (__bridge VMEngine *)ctx;
+    return [engine audioReadyForMore_emulatorThread];
 }
 
 @implementation VMEngine {
@@ -276,6 +289,7 @@ static double vm_engine_now_seconds(void) {
     vm_button_power_hold_t _powerHold;
     vm_button_momentary_holds_t _momentaryHolds;
     BOOL              _droppedButtonLogged;
+    VMAudioOutput    *_audioOutput;
 }
 
 + (uint64_t)physFootprintBytes {
@@ -309,8 +323,20 @@ static double vm_engine_now_seconds(void) {
     // Safe without any handshake: NSThread holds a strong reference to its
     // target for as long as the thread is alive, so -dealloc cannot possibly
     // run while -threadMain is still using the snapshot buffer or the lock.
+    [_audioOutput stop];
+    _audioOutput = nil;
     free(_snapshot);
     if (_lockReady) pthread_mutex_destroy(&_lock);
+}
+
+- (void)pushAudioWord_emulatorThread:(uint32_t)word {
+    if (_audioOutput) {
+        [_audioOutput pushSampleWord:word];
+    }
+}
+
+- (BOOL)audioReadyForMore_emulatorThread {
+    return _audioOutput ? [_audioOutput isReadyForMore] : YES;
 }
 
 #pragma mark - Choosing a guest
@@ -904,6 +930,13 @@ static double vm_engine_now_seconds(void) {
         return NO;
     }
 
+    VMAudioOutput *audioOutput = [[VMAudioOutput alloc] init];
+    [audioOutput start];
+    pthread_mutex_lock(&_lock);
+    _audioOutput = audioOutput;
+    pthread_mutex_unlock(&_lock);
+    s5l8900_set_audio_sink(&_machine, vm_audio_tx_callback, vm_audio_ready_callback, (__bridge void *)self);
+
     [thread start];
     return YES;
 }
@@ -1002,7 +1035,13 @@ static double vm_engine_now_seconds(void) {
         }
     }
     _paused = paused;
+    VMAudioOutput *audioOutput = _audioOutput;
     pthread_mutex_unlock(&_lock);
+    if (paused) {
+        [audioOutput pause];
+    } else {
+        [audioOutput resume];
+    }
     if (event.length) [self appendConsole:event];
 }
 
@@ -1833,6 +1872,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
             (unsigned long long)retired]];
 
     if (_machineReady) {
+        s5l8900_set_audio_sink(&_machine, NULL, NULL, NULL);
         s5l8900_free(&_machine);
     }
     /* AFTER the machine, never before: the memory-disk bridges hold a borrowed
@@ -1844,6 +1884,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
      * particular, clear _thread here so a later start really creates a fresh
      * machine instead of returning a false success for a dead worker. */
     pthread_mutex_lock(&_lock);
+    VMAudioOutput *audioToStop = _audioOutput;
+    _audioOutput = nil;
     VMEngineCheckpointCompletion checkpointCompletion = _checkpointCompletion;
     VMEngineStopCompletion stopCompletion = _stopCompletion;
     _checkpointCompletion = nil;
@@ -1864,6 +1906,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _paused = NO;
     _pauseReason = nil;
     pthread_mutex_unlock(&_lock);
+
+    [audioToStop stop];
 
     if (checkpointCompletion) {
         BOOL saved = checkpointSaved;
@@ -2052,7 +2096,13 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 }
 
 - (NSString *)audioStatusDescription {
-    return @"Sound playback is not implemented in this preview. The guest audio format and host speaker connection still need validation.";
+    pthread_mutex_lock(&_lock);
+    VMAudioOutput *output = _audioOutput;
+    pthread_mutex_unlock(&_lock);
+    if (output) {
+        return [output statusDescription];
+    }
+    return @"Audio output idle";
 }
 
 - (NSString *)statusLine {

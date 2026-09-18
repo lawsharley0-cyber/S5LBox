@@ -648,6 +648,9 @@ static bool dma_dst_ready(void *ctx, uint32_t dst, unsigned width) {
         if (dst == base[i] + SPI_TXDATA)
             return m->spi[i].tx_level < S5L_SPI_FIFO_DEPTH;
     }
+    if (dst == S5L8900_I2S0_BASE + S5L_I2S_TX_FIFO_OFF) {
+        if (m->audio_ready) return m->audio_ready(m->audio_ctx);
+    }
     return true;
 }
 
@@ -734,6 +737,16 @@ bool s5l8900_set_uart4_host(s5l8900_t *m, s5l_uart4_host_tx_fn tx,
     m->uart4_host_ctx = ctx;
     m->uart4_host_tx = tx;
     m->uart4_host_service = service;
+    return true;
+}
+
+bool s5l8900_set_audio_sink(s5l8900_t *m, s5l_audio_tx_fn tx,
+                            s5l_audio_ready_fn ready, void *ctx) {
+    if (!m) return false;
+    m->i2s[0].tx_fn = tx;
+    m->i2s[0].tx_ctx = ctx;
+    m->audio_ready = ready;
+    m->audio_ctx = ctx;
     return true;
 }
 

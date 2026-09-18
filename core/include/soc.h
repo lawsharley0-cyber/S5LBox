@@ -2342,6 +2342,9 @@ uint16_t s5l_wm8991_peek(const s5l_wm8991_t *codec, uint8_t reg);
 #define S5L_I2S_REGS         7u
 #define S5L_I2S_UNKNOWN_OFF  8u
 
+typedef void (*s5l_audio_tx_fn)(void *ctx, uint32_t word);
+typedef bool (*s5l_audio_ready_fn)(void *ctx);
+
 typedef struct {
     /* Storage for the seven offsets above, in the order they are listed by
      * s5l_i2s_offset(). Indexing by a small map rather than by offset/4 keeps
@@ -2351,6 +2354,9 @@ typedef struct {
     uint64_t unknown_reads, unknown_writes;
     uint32_t unknown_off[S5L_I2S_UNKNOWN_OFF];
     unsigned unknown_off_count;
+    s5l_audio_tx_fn tx_fn;
+    void           *tx_ctx;
+    uint64_t        tx_words;
 } s5l_i2s_t;
 
 void     s5l_i2s_reset(s5l_i2s_t *i2s);
@@ -4111,6 +4117,12 @@ typedef struct {
     s5l_uart4_host_tx_fn      uart4_host_tx;
     s5l_uart4_host_service_fn uart4_host_service;
     void                     *uart4_host_ctx;
+
+    /*
+     * Audio sink and DMA pacing. Host wiring, never guest state.
+     */
+    s5l_audio_ready_fn        audio_ready;
+    void                     *audio_ctx;
 } s5l8900_t;
 
 /*
@@ -4335,6 +4347,14 @@ bool s5l8900_set_active_host_clock(s5l8900_t *m,
  */
 bool s5l8900_set_uart4_host(s5l8900_t *m, s5l_uart4_host_tx_fn tx,
                             s5l_uart4_host_service_fn service, void *ctx);
+
+/*
+ * Attach or detach the audio output sink. `tx` is called on the emulator thread
+ * when the guest or DMA transfers a sample word to I2S0 TX FIFO. `ready` is queried
+ * during DMA transfers to apply hardware backpressure.
+ */
+bool s5l8900_set_audio_sink(s5l8900_t *m, s5l_audio_tx_fn tx,
+                            s5l_audio_ready_fn ready, void *ctx);
 
 /*
  * ram_base/ram_size define where RAM appears. Returns false on allocation

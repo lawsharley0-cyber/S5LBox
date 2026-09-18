@@ -129,7 +129,9 @@ SNAP_SIZE_GUARD(s5l_tvout_t,       12304, "snap_tvout");
 SNAP_SIZE_GUARD(s5l_i2c_t,         320,   "snap_i2c");
 SNAP_SIZE_GUARD(s5l_pcf50635_t,    600,   "snap_pmu");
 SNAP_SIZE_GUARD(s5l_wm8991_t,      496,   "snap_codec");
-SNAP_SIZE_GUARD(s5l_i2s_t,         104,   "snap_i2s");
+/* 128 = 104 + the audio tx callback, context, and tx_words counter (24).
+ * Host wiring, not serialized. */
+SNAP_SIZE_GUARD(s5l_i2s_t,         128,   "snap_i2s");
 SNAP_SIZE_GUARD(s5l_spi_t,         240,   "snap_spi");
 /* Four register banks, plus what the board is driving and which lines it
  * drives at all -- see the `driven` note in soc.h. */
@@ -198,10 +200,13 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 125704 adds eight per-framebuffer target aggregates (8 x 40), likewise
  * host-only, so a short witness ring cannot hide which completed surface later
  * became the active CLCD scanout.
+ * 125768 adds host-only audio sink callback/context to s5l8900_t (16) and two
+ * s5l_i2s_t host callback/counter fields (2 x 24 = 48), also live host wiring
+ * and deliberately outside snap_mach().
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         125704, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         125768, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
