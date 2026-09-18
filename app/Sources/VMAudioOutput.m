@@ -43,10 +43,12 @@ enum { kVMAudioRingFrames = 16384 };
     __weak VMAudioOutput *weakSelf = self;
     _source = [[AVAudioSourceNode alloc] initWithFormat:format
                                            renderBlock:^OSStatus(
+                                               BOOL *isSilence,
                                                const AudioTimeStamp *timestamp,
                                                AVAudioFrameCount frameCount,
                                                AudioBufferList *outputData) {
         (void)timestamp;
+        if (isSilence) *isSilence = NO;
         VMAudioOutput *self = weakSelf;
         if (!self) return noErr;
         if (!outputData || outputData->mNumberBuffers == 0u)
