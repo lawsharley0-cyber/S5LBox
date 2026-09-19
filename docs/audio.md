@@ -292,3 +292,97 @@ ran, when it runs and succeeds at instruction ~238,400,000.
 counters.** Restore is bit-exact — 20/20 heartbeats identical between cold run52
 and restored run56 across 3.0e9-4.9e9, agreeing 862 million instructions past
 the restore point, across three different binaries.
+
+# 2026-09-18 The AMC "lock BSU" freeze — real bug, root cause not yet safe to fix
+
+**User-reported, on real hardware, real firmware, reproduces every time:**
+opening Settings > Sounds and playing a sound freezes the guest. Confirmed
+via the app's own Console output that this is the **same failure that fires
+automatically during ordinary boot**, right after `launchd[N] Builtin
+profile: MobileMail (seatbelt)`, with no user interaction required — the
+Sounds-screen trigger just makes an already-present, already-silently-firing
+loop visible in the foreground.
+
+**What the guest console actually shows, every time, in a tight cycle:**
+```
+Assertion failed in ".../AppleAMCDriver_r1.cpp" at line 350/565/726
+ERROR: AMC reset [non-fatal error]: could not lock BSU!
+AppleEmbeddedAudioDevice: could not start DMA: operation was aborted
+```
+repeating forever, separated by a bounded ~1200-cycle WFI delay loop.
+
+## What is confirmed, not guessed
+
+- **This is an active busy-retry loop, not a silent/uninterruptible sleep.**
+  The host UI stays fully responsive (confirmed by the user); only the guest
+  pegs a CPU core retrying. `bootkernel`'s own `[stall]` sampler independently
+  corroborates this: "the guest is looping in N regions... 0xc0062300-0xc006233f
+  took 508 of 512 samples" — decoded (`kdisasm.py --arm 0xc00622c0 0xa0`) as a
+  standard bounded delay primitive: `mov r3,#0x4b0` (1200), a
+  `mcr p15,0,r2,c7,c10,4` (DSB) + `mcr p15,0,r2,c7,c0,4` (WFI) + decrement
+  loop. The loop itself is correct, ordinary kernel code; it is the *outer*
+  retry that never succeeds.
+- **Not the build-time compact AArch64 engine.** This session shipped a
+  "Force Interpreter" developer-mode toggle (`VMEngine.h`/`.m`,
+  `EmulatorViewController.m`, commit `164c435`) specifically to test this.
+  With the interpreter forced on (compact engine fully disabled), the freeze
+  reproduces identically. Whatever this is, it is not an AOT translation bug.
+- **Not jailbreak/Cydia state.** Reproduces on a freshly created machine with
+  no `jb-payload` baked in, exactly as it does on a jailbroken one.
+- **Traced to a real write-then-poll-readback register coupling**, the same
+  bug *class* `s5l_power_t`'s own header already documents at length for
+  `AppleS5L8900XPowerController::start`'s `STATE` register (a storage stub
+  cannot fix "write register A, poll register B" — only "poll the register
+  you already own"). Two call targets were resolved from this session's own
+  extracted `firmware/kernel.macho` (byte-verified, see
+  `PERFORMANCE_BASELINE.md`): `0xc0717838` and `0xc0717434`. The second
+  writes 0 to offset `+0x400` of some device object's mapped block, reads it
+  back, and treats nonzero as "not yet cleared" — a classic
+  write-a-request/poll-for-hardware-self-clear pattern.
+
+## What was tried and did not work
+
+`core/src/soc/machine.c`'s `clkrstgen` stub (`AppleS5L8900XClockController`,
+`0x3c500000`) was reset-filled with `0xFFFFFFFF` instead of zero on the
+hypothesis that a clock/power-gate status bit there was the one being polled
+(commit `163f955`). **Tested on the user's real device: no change, freeze is
+byte-for-byte identical.** This does not mean the fix was wrong in spirit —
+`clkrstgen` may still be worth keeping reset-filled rather than zeroed on
+general principle — but it rules out `clkrstgen` specifically as *this* bug's
+register. The device the `+0x400` register actually belongs to is still
+unidentified.
+
+## Why this session stopped here, honestly
+
+Continuing past the two resolved call targets requires reading literal-pool
+values out of `__PRELINK_TEXT` by hand (`kdisasm.py` plus manual byte-order
+math, no cross-referencing disassembler). One resolved value along that path
+(`0x101c`) does not look like a valid kernel pointer, which means a
+transcription or addressing error was made a step or two before it and not
+caught — this class of manual reverse engineering is genuinely error-prone
+past a certain depth without better tooling, and shipping a fix built on an
+untrusted trace would repeat exactly the mistake `clkrstgen` already was.
+
+This session also could not reproduce the freeze locally (Windows x86-64
+desktop, pure interpreter, four attempts with progressively closer-matched
+boot configuration including the user's exact jailbreak boot-args) — see
+`PERFORMANCE_PLAN.md` §8 for the same cross-environment gap affecting the
+CPU-performance track. Local reproduction would have made the rest of this
+tractable; without it, the only way to get further evidence is from the
+device itself.
+
+## What would actually resolve this, for whoever picks it up next
+
+1. **Xcode Instruments (Time Profiler or, better, a live `lldb` attach) on a
+   Mac, against the real device, while reproducing the freeze.** This is a
+   host-side native-code stack, not the emulated guest, so standard iOS
+   debugging tools apply directly and would show the exact call chain and
+   register/memory state in seconds, instead of the hours of static
+   disassembly this session spent getting two call targets deep.
+2. Failing that, redo the literal-pool trace from `0xc0717838`/`0xc0717434`
+   from scratch with fresh eyes (do not reuse this session's intermediate
+   arithmetic) and a proper cross-referencing disassembler if one becomes
+   available, rather than `kdisasm.py`'s manual byte math.
+3. The "Force Interpreter" toggle (Developer Mode → machine menu) now ships
+   in the app and is generally useful for any future "is this an emulator
+   bug or a translation bug" question, not just this one.

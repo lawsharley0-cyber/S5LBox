@@ -208,3 +208,17 @@ guest-visible unit of work (millions of instructions per call, not one call
 per pixel), so the same overhead concern does not obviously apply there, but
 that too now needs the same armed/disarmed on-device measurement before a
 REPLACE is trusted, not just an OBSERVE count.
+
+## 10. New: an independent CPU-correctness oracle (not a performance result)
+
+`tools/arm_diff_probe.c` + `tools/unicorn_diff.py` differentially test
+`arm_step()` against Unicorn (an independently-implemented ARM emulator with
+no shared code or assumptions with this project). First run found the bug in
+the new harness rather than the interpreter — see the tool's own commit
+message — and after fixing it, 5,800 cases across 29 common
+data-processing/multiply/load-store encodings came back with zero
+mismatches. This doesn't move any performance number; it's recorded here
+because any future CPU change (interpreter, compact engine, or the RSA/HLE
+work in §8) should be checked against this before and after, the same way
+`docs/audio.md`'s 2026-09-18 entry now needs a way to rule a CPU bug in or
+out for the AMC freeze that this session could not resolve.
