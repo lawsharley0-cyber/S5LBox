@@ -1431,3 +1431,10 @@ target_link_libraries(snapboot PRIVATE emucore)
 add_executable(insnbench ../tools/insnbench.c)
 target_link_libraries(insnbench PRIVATE emucore)
 target_compile_definitions(insnbench PRIVATE INSNBENCH_BUILD_TYPE="$<CONFIG>")
+
+# Not a product tool and not part of the CI test matrix: a single-instruction
+# arm_step() probe, one test case per stdin line, driven by an external
+# differential script (Unicorn or any other independent reference) rather
+# than by anything in this repo. See tools/arm_diff_probe.c.
+add_executable(arm_diff_probe ../tools/arm_diff_probe.c)
+target_link_libraries(arm_diff_probe PRIVATE emucore)
