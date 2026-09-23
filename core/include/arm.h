@@ -482,6 +482,13 @@ typedef struct arm_cpu {
     uint32_t fetch_blk;    /* the 1 KB-aligned VA it covers                   */
     uint32_t fetch_gen;    /* the tlb_gen it was resolved under               */
     bool     fetch_priv;   /* and the privilege, which changes permission     */
+    /* Incremented by arm_reset() and by a snapshot restore, never cleared.
+     * Both set tlb_gen back to 1, so a cache that lives OUTSIDE this struct
+     * and is keyed by tlb_gen (the cached interpreter's host TLBs) cannot
+     * tell a pre-reset generation from a post-reset one by tlb_gen alone.
+     * Host-derived and not snapshotted; it occupies padding, so the struct
+     * size is unchanged. */
+    uint32_t reset_epoch;
     /*
      * THE DATA-READ BLOCK CACHE — the same trick as the fetch cache above,
      * applied to the other half of §6.1 of docs/dynarec.md.

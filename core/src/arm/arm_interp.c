@@ -906,6 +906,7 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
      */
     memset(cpu->tlb, 0, sizeof cpu->tlb);
     cpu->tlb_gen = 1u;
+    cpu->reset_epoch++;        /* see arm.h: caches outside this struct */
     /* And the fetch-block cache, which holds a host pointer into the previous
      * machine's RAM. See the fetch_* fields in arm.h. */
     cpu->fetch_host = NULL;

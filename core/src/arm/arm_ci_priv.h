@@ -129,6 +129,21 @@ typedef struct {
     uint8_t *host;     /* host pointer to the 1 KiB block                    */
 } ci_tlb_t;
 
+/* The VA-keyed front of the block cache (Dolphin's fast_block_map idea): a
+ * hit skips the fetch translation and the physical-offset hash. An entry is
+ * valid only under the translation it was filled under -- the same rule the
+ * host TLBs follow: equal cpu->tlb_gen, equal privilege -- and its block is
+ * still checked against its region generation on every use. */
+#define CI_FAST_BITS 12u
+#define CI_FAST_SIZE (1u << CI_FAST_BITS)
+
+typedef struct {
+    uint32_t    va;
+    uint32_t    ctx;       /* CPSR.T | priv << 1                              */
+    uint32_t    gen;       /* cpu->tlb_gen when filled; 0 = empty             */
+    ci_block_t *b;
+} ci_fast_t;
+
 struct arm_ci {
     arm_ci_config_t cfg;
     uint32_t  regions;         /* ram_size / 1 KiB                            */
@@ -145,6 +160,18 @@ struct arm_ci {
 
     ci_tlb_t rtlb[CI_TLB_ENTRIES];
     ci_tlb_t wtlb[CI_TLB_ENTRIES];
+    ci_fast_t fast[CI_FAST_SIZE];
+
+    /* The translation context the entries above were filled in. They are
+     * keyed by cpu->tlb_gen, which is only comparable while it moves forward:
+     * arm_reset and snapshot restore set it back to 1 (seen through
+     * cpu->reset_epoch), the 2^32 wrap sets it back (seen as a decrease), and
+     * a host that clears SCTLR.M directly changes translation without any
+     * flush (seen through the M bit). Any of them purges every
+     * translation-derived entry. */
+    uint32_t seen_gen;
+    uint32_t seen_epoch;
+    bool     seen_mmu;
 
     arm_ci_stats_t st;
 };

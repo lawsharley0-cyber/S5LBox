@@ -816,9 +816,11 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     }
     s5l8900_set_cpu_backend(&_machine, backend);
     s5l8900_set_direct_ram_writes(&_machine, true);
-    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "interpreter" :
-                        (backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "micro-op IR" :
-                        (backend == S5L8900_CPU_BACKEND_JIT) ? "ARM64 native JIT" : "cached blocks (fastmem)";
+    /* IR_OPTIMIZED and JIT are retired names kept for saved settings; the
+     * core runs both on the cached interpreter (see soc.h). */
+    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "reference interpreter" :
+                        (backend == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached interpreter" :
+                        "cached interpreter (older setting)";
     [self appendConsole:[NSString stringWithFormat:@"[vm] CPU execution backend: %s\n", bname]];
 }
 

@@ -1024,32 +1024,34 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+/* "ir", "micro-op" and "jit" are settings saved by builds that offered tiers
+ * which no longer exist; the core runs them on the cached interpreter. */
 - (NSString *)describeCpuBackend:(NSString *)backend {
     if ([backend isEqualToString:@"cached"] || [backend isEqualToString:@"block"] || [backend isEqualToString:@"cached-block"])
-        return @"Cached Blocks (Fastmem)";
-    if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"])
-        return @"Micro-Op IR (Optimized)";
-    if ([backend isEqualToString:@"jit"])
-        return @"ARM64 Native JIT";
-    return @"Reference Interpreter (Safe)";
+        return @"Cached Interpreter";
+    if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"] ||
+        [backend isEqualToString:@"jit"])
+        return @"Cached Interpreter (from an older setting)";
+    return @"Reference Interpreter";
 }
 
 - (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView {
     NSString *current = [_settings cpuBackend];
     NSString *message =
-        @"Choose CPU execution tier for the S5L8900 ARM CPU. "
-        @"Reference Interpreter provides 100% compliant execution. "
-        @"Cached Blocks and Micro-Op IR provide substantial speedups on device.";
+        @"Both backends execute the same ARM semantics. The cached interpreter "
+        @"predecodes guest code into blocks and runs anything unusual through "
+        @"the reference interpreter's own code. It is about 2x faster on desktop "
+        @"CPU benchmarks; it has not yet been measured on a device or validated "
+        @"across a full firmware boot, so the reference interpreter stays the "
+        @"default. Applies at the next start.";
     UIAlertController *picker = [UIAlertController
         alertControllerWithTitle:@"CPU Execution Backend"
                          message:message
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSDictionary<NSString *, NSString *> *> *backends = @[
-        @{ @"id": @"interp", @"name": @"Reference Interpreter (Safe, Exact)" },
-        @{ @"id": @"cached", @"name": @"Cached Blocks (Fastmem Dispatcher)" },
-        @{ @"id": @"ir",     @"name": @"Micro-Op IR (Optimized Pipeline)" },
-        @{ @"id": @"jit",    @"name": @"ARM64 Native JIT" },
+        @{ @"id": @"interp", @"name": @"Reference Interpreter (default)" },
+        @{ @"id": @"cached", @"name": @"Cached Interpreter (experimental)" },
     ];
 
     __weak VMSettingsViewController *weakSelf = self;

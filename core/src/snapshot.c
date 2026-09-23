@@ -114,7 +114,8 @@ SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
  * -- SNAPSHOT_VERSION therefore does not move. Same exception as level_dirty
  * below, and justified the same way. Measured with the compiler's failed size
  * guard and confirmed by the successful guard below, not assumed from source
- * arithmetic; the padding is exactly why. */
+ * arithmetic; the padding is exactly why. reset_epoch (host-only, not
+ * serialised) now occupies four bytes of that padding, so the size holds. */
 SNAP_SIZE_GUARD(arm_cpu_t,         68112,   "snap_cpu");
 SNAP_SIZE_GUARD(s5l_uart_t,        8280,  "snap_uart");
 SNAP_SIZE_GUARD(s5l_vic_t,         16,    "snap_vic");
@@ -453,6 +454,7 @@ static void snap_cpu(sn_io_t *io, arm_cpu_t *c) {
         /* And generation 1, for the same reason arm_reset does: an entry at
          * generation 0 in a table whose counter is also 0 is a false hit. */
         c->tlb_gen = 1u;
+        c->reset_epoch++;      /* see arm.h: caches outside this struct */
     }
     F64(c->tlb_hits); F64(c->tlb_misses); F64(c->tlb_flushes);
     /*

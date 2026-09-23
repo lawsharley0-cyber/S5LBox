@@ -1652,6 +1652,7 @@ bool s5l8900_wake_from_standby(s5l8900_t *m) {
      * instant from any pre-sleep host-clock anchor. Lifetime evidence counters
      * remain intact, including the monotonic retired-instruction count above. */
     s5l8900_static_a64_invalidate_derived(m);
+    if (m->ci) arm_ci_flush(m->ci);
     m->wfi_pace_yield = false;
     m->active_clock_last_host_ns = 0u;
     m->active_clock_guest_ticks_since_sync = 0u;

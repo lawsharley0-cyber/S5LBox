@@ -90,8 +90,18 @@ void arm_ci_reset_stats(arm_ci_t *ci) {
 
 /* ----------------------------------------------------- code tracking --- */
 
+/* Drop everything derived from guest translations: the host TLBs and the
+ * VA-keyed block map. Blocks themselves are keyed by physical offset and
+ * survive. */
+static void purge_translations(arm_ci_t *ci) {
+    memset(ci->rtlb, 0, sizeof ci->rtlb);
+    memset(ci->wtlb, 0, sizeof ci->wtlb);
+    memset(ci->fast, 0, sizeof ci->fast);
+}
+
 void arm_ci_flush(arm_ci_t *ci) {
     if (!ci) return;
+    purge_translations(ci);
     memset(ci->table, 0, CI_HASH_SIZE * sizeof *ci->table);
     memset(ci->code_map, 0, ((ci->regions + 31u) / 32u) * sizeof *ci->code_map);
     ci->nblocks = 0;
@@ -799,6 +809,15 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
     /* Direct host mutation of the translation registers is only noticed by a
      * walk; the host TLB below must not outlive it (see tlb_stamp in arm.h). */
     arm_mmu_sync_stamp(c);
+    {
+        const bool mmu = (c->cp15.sctlr & ARM_SCTLR_M) != 0u;
+        if (c->tlb_gen < ci->seen_gen || c->reset_epoch != ci->seen_epoch ||
+            mmu != ci->seen_mmu)
+            purge_translations(ci);
+        ci->seen_gen = c->tlb_gen;
+        ci->seen_epoch = c->reset_epoch;
+        ci->seen_mmu = mmu;
+    }
 
     if (c->abort_pending || !arm_mode_is_valid(c->cpsr) ||
         (c->fiq_line && !(c->cpsr & ARM_CPSR_F)) ||
@@ -815,25 +834,39 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         const uint32_t pc = c->r[15];
         const bool thumb = (c->cpsr & ARM_CPSR_T) != 0u;
         if (pc & (thumb ? 1u : 3u)) { stop_local = ARM_CI_STOP_STEP; break; }
-        const uint8_t *h = fetch(c, pc, priv);
-        if (!h || h < ram || h >= ram_end) { stop_local = ARM_CI_STOP_STEP; break; }
-        const uint32_t pa_off = (uint32_t)(h - ram);
+        const uint32_t ctx = (thumb ? 1u : 0u) | (priv ? 2u : 0u);
 
         ci->st.lookups++;
-        ci_block_t *b = ci->table[hash_slot(pa_off, thumb)];
-        if (b && b->pa_off == pa_off && b->va == pc && b->thumb == (uint8_t)thumb) {
-            if (b->gen != ci->region_gen[pa_off >> 10]) {
-                ci->st.stale++;
-                b = build(ci, c, h, pc, pa_off, thumb);
-            } else {
-                ci->st.hits++;
-                if (ci->verify && !block_matches_ram(b, h)) {
-                    ci->st.verify_mismatch++;
-                    b = build(ci, c, h, pc, pa_off, thumb);
-                }
-            }
+        ci_fast_t *f = &ci->fast[((pc >> 1) ^ (pc >> (CI_FAST_BITS + 1u))) &
+                                 (CI_FAST_SIZE - 1u)];
+        ci_block_t *b = f->b;
+        if (CI_LIKELY(b && f->va == pc && f->ctx == ctx && f->gen == c->tlb_gen &&
+                      b->gen == ci->region_gen[b->pa_off >> 10] && !ci->verify)) {
+            ci->st.hits++;
         } else {
-            b = build(ci, c, h, pc, pa_off, thumb);
+            const uint8_t *h = fetch(c, pc, priv);
+            if (!h || h < ram || h >= ram_end) { stop_local = ARM_CI_STOP_STEP; break; }
+            const uint32_t pa_off = (uint32_t)(h - ram);
+            b = ci->table[hash_slot(pa_off, thumb)];
+            if (b && b->pa_off == pa_off && b->va == pc && b->thumb == (uint8_t)thumb) {
+                if (b->gen != ci->region_gen[pa_off >> 10]) {
+                    ci->st.stale++;
+                    b = build(ci, c, h, pc, pa_off, thumb);
+                } else {
+                    ci->st.hits++;
+                    if (ci->verify && !block_matches_ram(b, h)) {
+                        ci->st.verify_mismatch++;
+                        b = build(ci, c, h, pc, pa_off, thumb);
+                    }
+                }
+            } else {
+                b = build(ci, c, h, pc, pa_off, thumb);
+            }
+            /* build() may have flushed the whole cache, map included. */
+            f->va = pc;
+            f->ctx = ctx;
+            f->gen = c->tlb_gen;
+            f->b = b;
         }
         if (b->n == 0u) { stop_local = ARM_CI_STOP_STEP; break; }
 
