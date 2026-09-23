@@ -221,6 +221,30 @@ static void test_no_collision_rebuilds(void) {
     arm_ci_set_verify(g_m.ci, false);
 }
 
+/* The kernel's mach_absolute_time() reads the timer's tick counter; a pure
+ * read must neither dirty the machine nor end an engine run. */
+static void test_timer_read_stays_in_engine(void) {
+    const uint32_t code = RAM_BASE + 0x2000u;
+    g_m.bus.write32(g_m.bus.ctx, code + 0u, 0xe5931000u);   /* ldr r1, [r3] */
+    g_m.bus.write32(g_m.bus.ctx, code + 4u, 0xeafffffdu);   /* b code       */
+    if (!s5l8900_set_cpu_backend(&g_m, S5L8900_CPU_BACKEND_CACHED_BLOCK)) {
+        CHECK(0, "backend");
+        return;
+    }
+    g_m.cpu.r[3] = S5L8900_TIMER_BASE + TIMER_TICKSLOW;
+    g_m.cpu.r[15] = code;
+    arm_status_t st = ARM_OK;
+    (void)s5l8900_run(&g_m, 64u, &st);            /* settle: first refresh, build */
+    arm_ci_reset_stats(g_m.ci);
+    (void)s5l8900_run(&g_m, 20000u, &st);
+    arm_ci_stats_t cs;
+    arm_ci_get_stats(g_m.ci, &cs);
+    CHECK(st == ARM_OK && cs.stop[ARM_CI_STOP_EVENT] == 0u && cs.retired == 20000u,
+          "timer reads left the engine: %llu event stops, %llu retired of 20000",
+          (unsigned long long)cs.stop[ARM_CI_STOP_EVENT], (unsigned long long)cs.retired);
+    CHECK(!g_m.level_dirty, "a timer read dirtied the machine");
+}
+
 int main(void) {
     if (!s5l8900_init(&g_m, RAM_BASE, RAM_SIZE) ||
         !s5l8900_set_cpu_backend(&g_m, S5L8900_CPU_BACKEND_CACHED_BLOCK)) {
@@ -232,6 +256,7 @@ int main(void) {
     test_guest_pc();
     test_amc_storage();
     test_no_collision_rebuilds();
+    test_timer_read_stays_in_engine();
     s5l8900_free(&g_m);
     printf("ci diagnostics: %d failure(s)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -24,7 +24,7 @@
 
 void s5l_timer_reset(s5l_timer_t *t) { memset(t, 0, sizeof *t); }
 
-uint32_t s5l_timer_read(s5l_timer_t *t, uint32_t off) {
+uint32_t s5l_timer_read(const s5l_timer_t *t, uint32_t off) {
     switch (off) {
         case TIMER_TICKSLOW:   return (uint32_t)t->ticks;
         case TIMER_TICKSHIGH:  return (uint32_t)(t->ticks >> 32);

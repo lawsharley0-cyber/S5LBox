@@ -492,7 +492,21 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
      * VICADDRESS all change what a line asserts, and nine of the fifteen read
      * entry points take a non-const device pointer. Distinguishing the pure
      * ones would buy a store per MMIO read and cost the guarantee.
+     *
+     * With one exception, held by the compiler rather than by review: the
+     * timer, whose read entry point takes a CONST device pointer. The kernel
+     * reads its tick counter on every mach_absolute_time() -- hundreds of
+     * thousands of times a minute on a device -- and a dirty read costs a
+     * full device refresh and, under the cached interpreter, the end of the
+     * run. A const read cannot change a level, so skipping the flag here
+     * changes nothing the guest can observe.
      */
+    if (in_timer(addr, bytes)) {
+        uint32_t tv = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+        note_mmio(m, addr, tv, bytes, false);
+        note_device(m, addr, tv, false);
+        return tv;
+    }
     m->level_dirty = true;
     uint32_t v;
     if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
@@ -536,8 +550,6 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
                          S5L_TVOUT_BANK_SIZE)) {
         v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
                            addr - S5L8900_TVOUT_SDO_BASE, bytes);
-    } else if (in_timer(addr, bytes)) {
-        v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (in_power(addr, bytes)) {
         v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
     } else if (in_mbx(addr, bytes)) {

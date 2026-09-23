@@ -611,7 +611,9 @@ typedef struct {
 } s5l_timer_t;
 
 void s5l_timer_reset(s5l_timer_t *t);
-uint32_t s5l_timer_read(s5l_timer_t *t, uint32_t off);
+/* A pure read: const, so no read of the timer can change a level. bus_read
+ * relies on that to leave level_dirty alone for this window (machine.c). */
+uint32_t s5l_timer_read(const s5l_timer_t *t, uint32_t off);
 void s5l_timer_write(s5l_timer_t *t, uint32_t off, uint32_t val);
 /* Advance by `ticks`; returns true while an interrupt is pending. */
 bool s5l_timer_tick(s5l_timer_t *t, uint32_t ticks);
