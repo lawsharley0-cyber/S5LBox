@@ -1432,6 +1432,36 @@ add_executable(insnbench ../tools/insnbench.c)
 target_link_libraries(insnbench PRIVATE emucore)
 target_compile_definitions(insnbench PRIVATE INSNBENCH_BUILD_TYPE="$<CONFIG>")
 
+# Compiled guest workloads (bench/guest, docs/PERFORMANCE_BASELINE_PLAN.md
+# section 5). The guest images are committed as a generated header, so this
+# needs no ARM toolchain; workloads.c is ALSO compiled for the host, where it
+# computes the checksum every guest run must reproduce. Float contraction and
+# type-based aliasing are off for that host copy for the same reason they are
+# off for the guest build: the two must mean exactly the same thing.
+add_library(guest_bench STATIC ../tools/guest_bench.c ../bench/guest/workloads.c)
+target_link_libraries(guest_bench PUBLIC emucore)
+target_include_directories(guest_bench PUBLIC ../tools)
+if(NOT MSVC)
+    set_source_files_properties(../bench/guest/workloads.c PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off;-fno-strict-aliasing")
+endif()
+
+add_executable(cpubench ../tools/cpubench.c)
+target_link_libraries(cpubench PRIVATE guest_bench)
+
+add_executable(test_guest_workloads tests/test_guest_workloads.c)
+target_link_libraries(test_guest_workloads PRIVATE guest_bench)
+add_test(NAME guest_workloads COMMAND test_guest_workloads)
+
+# The committed images must match their sources. Checking needs only Python
+# (it compares input digests); regenerating needs Clang + lld.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME guest_images_current
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_guest_bench.py --check)
+endif()
+
 # Not a product tool and not part of the CI test matrix: a single-instruction
 # arm_step() probe, one test case per stdin line, driven by an external
 # differential script (Unicorn or any other independent reference) rather
