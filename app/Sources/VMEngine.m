@@ -295,7 +295,9 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     BOOL                    _diagCiActive;
     arm_ci_stats_t          _diagCiStats;
     uint64_t                _diagRetired;
-    s5l_unmodelled_access_t _diagUnmodelled[S5L_UNMODELLED_LOG];
+    s5l_access_entry_t _diagUnmodelled[S5L_ACCESS_LOG];
+    s5l_access_entry_t _diagMmio[S5L_ACCESS_LOG];
+    NSString               *_diagBackendNote;  /* why the cached interpreter is off */
 }
 
 + (uint64_t)physFootprintBytes {
@@ -817,8 +819,24 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
 - (void)configureCpuBackend {
     NSString *backendPref = [[NSUserDefaults standardUserDefaults] stringForKey:@"vm.cpu.backend"];
     s5l8900_cpu_backend_t backend = S5L8900_CPU_BACKEND_INTERPRETER;
-    if ([self isForcedInterpreterEnabled]) {
+    BOOL forced = [self isForcedInterpreterEnabled];
+    BOOL wantsCached = [backendPref isEqualToString:@"cached"] ||
+                       [backendPref isEqualToString:@"block"] ||
+                       [backendPref isEqualToString:@"cached-block"] ||
+                       [backendPref isEqualToString:@"ir"] ||
+                       [backendPref isEqualToString:@"micro-op"] ||
+                       [backendPref isEqualToString:@"jit"];
+    NSString *why;
+    if (forced) {
         backend = S5L8900_CPU_BACKEND_INTERPRETER;
+        why = wantsCached
+            ? @"Force Interpreter is ON for this machine, so the Cached Interpreter "
+              @"setting is ignored and the compact engine is off too: this is the "
+              @"slowest configuration. Turn it off from the machine menu "
+              @"(Force Interpreter) and restart."
+            : @"Force Interpreter is ON for this machine: reference interpreter only, "
+              @"compact engine off. Turn it off from the machine menu to restore speed.";
+        [self appendConsole:[NSString stringWithFormat:@"[vm] %@\n", why]];
     } else if ([backendPref isEqualToString:@"cached"] || [backendPref isEqualToString:@"block"] || [backendPref isEqualToString:@"cached-block"]) {
         backend = S5L8900_CPU_BACKEND_CACHED_BLOCK;
     } else if ([backendPref isEqualToString:@"ir"] || [backendPref isEqualToString:@"micro-op"]) {
@@ -826,8 +844,17 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     } else if ([backendPref isEqualToString:@"jit"]) {
         backend = S5L8900_CPU_BACKEND_JIT;
     }
+    if (!forced)
+        why = backend == S5L8900_CPU_BACKEND_INTERPRETER
+            ? @"Standard backend selected in Settings (reference interpreter plus "
+              @"the compact engine where built); choose Cached Interpreter in "
+              @"Settings > Diagnostics > CPU Execution Backend to try it."
+            : nil;
     s5l8900_set_cpu_backend(&_machine, backend);
     s5l8900_set_direct_ram_writes(&_machine, true);
+    pthread_mutex_lock(&_lock);
+    _diagBackendNote = why;
+    pthread_mutex_unlock(&_lock);
     /* IR_OPTIMIZED and JIT are retired names kept for saved settings; the
      * core runs both on the cached interpreter (see soc.h). */
     const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "standard (reference interpreter + compact engine where built)" :
@@ -1830,13 +1857,17 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                     /* What the loop is waiting on, when it is hardware we do
                      * not model: the most recent distinct unmodelled accesses,
                      * with their pcs and repeat counts. */
-                    char unmodelled[1024];
-                    (void)s5l_unmodelled_describe(_machine.unmodelled,
-                                                  S5L_UNMODELLED_LOG, 6u,
+                    char unmodelled[1024], devices[2048];
+                    (void)s5l_access_log_describe(_machine.mmio_recent,
+                                                  S5L_ACCESS_LOG, 16u,
+                                                  devices, sizeof devices);
+                    (void)s5l_access_log_describe(_machine.unmodelled,
+                                                  S5L_ACCESS_LOG, 6u,
                                                   unmodelled, sizeof unmodelled);
                     [self appendConsole:[NSString stringWithFormat:
+                        @"[stall] recent hardware accesses, any device:\n%s"
                         @"[stall] recent unmodelled hardware accesses:\n%s",
-                        unmodelled]];
+                        devices, unmodelled]];
                     [self appendConsole:[NSString stringWithFormat:
                         @"[stall] at %.1f M insn the guest is looping in %u "
                         @"region%@: 0x%08x-0x%08x took %u of %u samples, cpsr "
@@ -2184,30 +2215,36 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _diagCiStats = stats;
     _diagRetired = retired;
     memcpy(_diagUnmodelled, _machine.unmodelled, sizeof _diagUnmodelled);
+    memcpy(_diagMmio, _machine.mmio_recent, sizeof _diagMmio);
     pthread_mutex_unlock(&_lock);
 }
 
 - (NSString *)diagnosticsDescription {
     arm_ci_stats_t stats;
-    s5l_unmodelled_access_t accesses[S5L_UNMODELLED_LOG];
+    s5l_access_entry_t unmodelled[S5L_ACCESS_LOG], mmio[S5L_ACCESS_LOG];
     pthread_mutex_lock(&_lock);
     BOOL active = _diagCiActive;
     uint64_t retired = _diagRetired;
+    NSString *note = _diagBackendNote;
     stats = _diagCiStats;
-    memcpy(accesses, _diagUnmodelled, sizeof accesses);
+    memcpy(unmodelled, _diagUnmodelled, sizeof unmodelled);
+    memcpy(mmio, _diagMmio, sizeof mmio);
     pthread_mutex_unlock(&_lock);
 
-    char engine[1024], hardware[2048];
+    char engine[1024], devices[4096], missing[4096];
     if (active)
         (void)arm_ci_describe_stats(&stats, retired, engine, sizeof engine);
     else
-        (void)snprintf(engine, sizeof engine,
-                       "Standard backend in use (no cached-interpreter counters).\n");
-    (void)s5l_unmodelled_describe(accesses, S5L_UNMODELLED_LOG, 12u,
-                                  hardware, sizeof hardware);
+        (void)snprintf(engine, sizeof engine, "Cached interpreter not running.\n");
+    (void)s5l_access_log_describe(mmio, S5L_ACCESS_LOG, 32u, devices, sizeof devices);
+    (void)s5l_access_log_describe(unmodelled, S5L_ACCESS_LOG, 32u,
+                                  missing, sizeof missing);
     return [NSString stringWithFormat:
-        @"CPU engine:\n%s\nRecent unmodelled hardware accesses (most recent first):\n%s",
-        engine, hardware];
+        @"CPU engine:\n%s%@%@\n"
+        @"Recent hardware accesses, any device (most recent first):\n%s\n"
+        @"Recent accesses to unmodelled hardware (most recent first):\n%s",
+        engine, active || !note ? @"" : note, active || !note ? @"" : @"\n",
+        devices, missing];
 }
 
 - (NSString *)audioStatusDescription {

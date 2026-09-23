@@ -24,9 +24,9 @@ static int g_fail;
                        printf(__VA_ARGS__); printf("\n"); g_fail++; }          \
     } while (0)
 
-static const s5l_unmodelled_access_t *find(uint32_t pc, uint32_t addr, bool write) {
-    for (unsigned i = 0; i < S5L_UNMODELLED_LOG; i++) {
-        const s5l_unmodelled_access_t *e = &g_m.unmodelled[i];
+static const s5l_access_entry_t *find(uint32_t pc, uint32_t addr, bool write) {
+    for (unsigned i = 0; i < S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &g_m.unmodelled[i];
         if (e->seq && e->pc == pc && e->addr == addr && e->write == (uint8_t)write)
             return e;
     }
@@ -44,16 +44,17 @@ static void test_unmodelled_log(void) {
     g_m.cpu.r[15] = 0xc0010000u;
     (void)bus->read32(bus->ctx, S5L8900_CLOCK_BASE + 0x10u);   /* clkrstgen stub */
 
-    const s5l_unmodelled_access_t *r = find(0xc0717434u, AMC_REG, false);
-    const s5l_unmodelled_access_t *w = find(0xc0717434u, AMC_REG, true);
-    const s5l_unmodelled_access_t *st = find(0xc0010000u, S5L8900_CLOCK_BASE + 0x10u, false);
-    CHECK(r && r->count == 2u && !r->stub && r->region && !strcmp(r->region, "sram/amc"),
+    const s5l_access_entry_t *r = find(0xc0717434u, AMC_REG, false);
+    const s5l_access_entry_t *w = find(0xc0717434u, AMC_REG, true);
+    const s5l_access_entry_t *st = find(0xc0010000u, S5L8900_CLOCK_BASE + 0x10u, false);
+    CHECK(r && r->count == 2u && r->kind == S5L_ACCESS_UNMAPPED && r->region &&
+          !strcmp(r->region, "sram/amc"),
           "unmapped read entry wrong");
     CHECK(w && w->count == 1u && w->value == 5u, "unmapped write entry wrong");
-    CHECK(st && st->stub && st->region && !strcmp(st->region, "clkrstgen") &&
+    CHECK(st && st->kind == S5L_ACCESS_STUB && st->region && !strcmp(st->region, "clkrstgen") &&
           st->value == 0xffffffffu, "stub read entry wrong");
 
-    size_t n = s5l_unmodelled_describe(g_m.unmodelled, S5L_UNMODELLED_LOG, 8u,
+    size_t n = s5l_access_log_describe(g_m.unmodelled, S5L_ACCESS_LOG, 8u,
                                        text, sizeof text);
     CHECK(n == strlen(text) && n > 0u, "describe length");
     /* Most recent first: the stub read, then the write, then the reads. */
@@ -61,6 +62,25 @@ static void test_unmodelled_log(void) {
     const char *rd = strstr(text, "R 22000400");
     CHECK(first && wr && rd && first < wr && wr < rd, "describe order:\n%s", text);
     CHECK(strstr(text, "x2") && strstr(text, "unmapped sram/amc"), "describe fields:\n%s", text);
+
+    /* The all-device table sees the same accesses, and modelled devices too
+     * (which the unmodelled table must not). */
+    g_m.cpu.r[15] = 0xc0020000u;
+    (void)bus->read32(bus->ctx, S5L8900_POWER_BASE + POWER_STATE);
+    const s5l_access_entry_t *pw = NULL, *amc = NULL;
+    for (unsigned i = 0; i < S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &g_m.mmio_recent[i];
+        if (e->seq && e->pc == 0xc0020000u) pw = e;
+        if (e->seq && e->pc == 0xc0717434u && e->addr == AMC_REG && !e->write) amc = e;
+    }
+    CHECK(pw && pw->kind == S5L_ACCESS_DEVICE && pw->region && !strcmp(pw->region, "power"),
+          "modelled device missing from the all-device table");
+    CHECK(amc && amc->count == 2u && amc->kind == S5L_ACCESS_UNMAPPED,
+          "unmapped access missing from the all-device table");
+    CHECK(find(0xc0020000u, S5L8900_POWER_BASE + POWER_STATE, false) == NULL,
+          "modelled device in the unmodelled table");
+    n = s5l_access_log_describe(g_m.mmio_recent, S5L_ACCESS_LOG, 4u, text, sizeof text);
+    CHECK(strstr(text, "device power") != NULL, "device kind not described:\n%s", text);
 
     /* The table keeps the most recent distinct accesses: 40 more pcs evict
      * the oldest entries, never the newest. */
@@ -73,7 +93,7 @@ static void test_unmodelled_log(void) {
 
     /* Tiny buffers truncate but stay terminated. */
     char tiny[8];
-    n = s5l_unmodelled_describe(g_m.unmodelled, S5L_UNMODELLED_LOG, 8u, tiny, sizeof tiny);
+    n = s5l_access_log_describe(g_m.unmodelled, S5L_ACCESS_LOG, 8u, tiny, sizeof tiny);
     CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
 }
 
@@ -128,7 +148,7 @@ static void test_guest_pc(void) {
         g_m.cpu.r[15] = code;
         arm_status_t st = ARM_OK;
         (void)s5l8900_run(&g_m, 200u, &st);
-        const s5l_unmodelled_access_t *e = find(code, AMC_REG + 0x10u, false);
+        const s5l_access_entry_t *e = find(code, AMC_REG + 0x10u, false);
         CHECK(st == ARM_OK && e && e->count == 100u,
               "backend %d: load pc not recorded (count %u)", backend, e ? e->count : 0u);
     }

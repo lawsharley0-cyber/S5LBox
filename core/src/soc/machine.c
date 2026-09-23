@@ -126,7 +126,7 @@ static const char *soc_region_name(uint32_t addr) {
     return NULL;
 }
 
-size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
+size_t s5l_access_log_describe(const s5l_access_entry_t *log, unsigned n,
                                unsigned max_lines, char *out, size_t cap) {
     if (!out || !cap) return 0;
     out[0] = '\0';
@@ -134,7 +134,7 @@ size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
     size_t len = 0;
     uint64_t below = UINT64_MAX;          /* emit strictly decreasing recency */
     for (unsigned line = 0; line < max_lines; line++) {
-        const s5l_unmodelled_access_t *best = NULL;
+        const s5l_access_entry_t *best = NULL;
         for (unsigned i = 0; i < n; i++)
             if (log[i].seq && log[i].seq < below && (!best || log[i].seq > best->seq))
                 best = &log[i];
@@ -145,15 +145,16 @@ size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
                          best->pc, best->write ? "W" : "R", best->addr,
                          best->write ? "<-" : "->", best->value, best->count,
                          best->count == UINT32_MAX ? "+" : "",
-                         best->bytes == 4u ? "" : best->bytes == 2u ? " h" : " b",
-                         best->stub ? "stub" : "unmapped",
+                         best->bytes == 2u ? " h" : best->bytes == 1u ? " b" : "",
+                         best->kind == S5L_ACCESS_DEVICE ? "device" :
+                         best->kind == S5L_ACCESS_STUB ? "stub" : "unmapped",
                          best->region ? " " : "",
                          best->region ? best->region : "");
         if (w < 0) break;
         if ((size_t)w >= cap - len) { len = cap - 1u; break; }
         len += (size_t)w;
     }
-    if (len == 0) len = (size_t)snprintf(out, cap, "(no unmodelled accesses)\n");
+    if (len == 0) len = (size_t)snprintf(out, cap, "(none)\n");
     return len < cap ? len : cap - 1u;
 }
 
@@ -356,15 +357,16 @@ static void note_unmapped(s5l8900_t *m, uint32_t addr) {
 
 static const char *soc_region_name(uint32_t addr);
 
-/* Record one unmodelled access in m->unmodelled: update the entry for the
- * same (pc, addr, direction) if there is one, else take an empty slot or the
- * least recent one. Only reached on the slow unmodelled paths. */
-static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
-                            unsigned bytes, bool is_write, const s5l_stub_t *stub) {
-    const uint32_t pc = m->cpu.r[15];
-    s5l_unmodelled_access_t *slot = NULL, *oldest = &m->unmodelled[0];
-    for (unsigned i = 0; i < S5L_UNMODELLED_LOG; i++) {
-        s5l_unmodelled_access_t *e = &m->unmodelled[i];
+/* Record one access in an access log: bump the entry for the same (pc, addr,
+ * direction) if there is one, else take an empty slot or the least recent
+ * one. Returns the slot and whether it was newly taken, so the caller names
+ * the region only once per entry. */
+static s5l_access_entry_t *log_access(s5l_access_entry_t *log, uint64_t *seq,
+                                      uint32_t pc, uint32_t addr, uint32_t val,
+                                      unsigned bytes, bool is_write, bool *fresh) {
+    s5l_access_entry_t *slot = NULL, *oldest = &log[0];
+    for (unsigned i = 0; i < S5L_ACCESS_LOG; i++) {
+        s5l_access_entry_t *e = &log[i];
         if (!e->seq) { if (!slot) slot = e; continue; }
         if (e->pc == pc && e->addr == addr && e->write == (uint8_t)is_write) {
             slot = e;
@@ -373,20 +375,53 @@ static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
         if (e->seq < oldest->seq) oldest = e;
     }
     if (!slot) slot = oldest;
-    if (slot->seq && slot->pc == pc && slot->addr == addr &&
-        slot->write == (uint8_t)is_write) {
-        if (slot->count != UINT32_MAX) slot->count++;
-    } else {
+    *fresh = !(slot->seq && slot->pc == pc && slot->addr == addr &&
+               slot->write == (uint8_t)is_write);
+    if (*fresh) {
         slot->pc = pc;
         slot->addr = addr;
         slot->write = (uint8_t)is_write;
-        slot->stub = stub ? 1u : 0u;
-        slot->region = stub ? stub->name : soc_region_name(addr);
         slot->count = 1u;
+    } else if (slot->count != UINT32_MAX) {
+        slot->count++;
     }
     slot->value = val;
     slot->bytes = (uint8_t)bytes;
-    slot->seq = ++m->unmodelled_seq;
+    slot->seq = ++*seq;
+    return slot;
+}
+
+/* The unmodelled table: unmapped addresses and storage-only stubs. */
+static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
+                            unsigned bytes, bool is_write, const s5l_stub_t *stub) {
+    bool fresh;
+    s5l_access_entry_t *e = log_access(m->unmodelled, &m->unmodelled_seq,
+                                       m->cpu.r[15], addr, val, bytes, is_write,
+                                       &fresh);
+    if (fresh) {
+        e->kind = stub ? S5L_ACCESS_STUB : S5L_ACCESS_UNMAPPED;
+        e->region = stub ? stub->name : soc_region_name(addr);
+    }
+}
+
+/* The all-device table: every access that reaches the device paths. */
+static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
+                      unsigned bytes, bool is_write) {
+    bool fresh;
+    s5l_access_entry_t *e = log_access(m->mmio_recent, &m->mmio_seq,
+                                       m->cpu.r[15], addr, val, bytes, is_write,
+                                       &fresh);
+    if (!fresh) return;
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++) {
+        if (addr - DEVICE_WINDOWS[i].base < DEVICE_WINDOWS[i].size) {
+            e->kind = S5L_ACCESS_DEVICE;
+            e->region = DEVICE_WINDOWS[i].name;
+            return;
+        }
+    }
+    const s5l_stub_t *stub = find_stub(m, addr, 1u);
+    e->kind = stub ? S5L_ACCESS_STUB : S5L_ACCESS_UNMAPPED;
+    e->region = stub ? stub->name : soc_region_name(addr);
 }
 
 static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write) {
@@ -551,6 +586,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
             m->unmapped_reads++;
             note_unmapped(m, addr);
             note_unmodelled(m, addr, 0, bytes, false, NULL);
+            note_mmio(m, addr, 0, bytes, false);
             note_device(m, addr, 0, false);
             return 0;
         }
@@ -558,6 +594,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         v = stub_read(s, addr, bytes);
         note_unmodelled(m, addr, v, bytes, false, s);
     }
+    note_mmio(m, addr, v, bytes, false);
     note_device(m, addr, v, false);
     return v;
 }
@@ -571,6 +608,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         return;
     }
     m->level_dirty = true;      /* a device store; see bus_read() */
+    note_mmio(m, addr, val, bytes, true);
     if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
         in_dev(addr, bytes, S5L8900_UART0_BASE)) {
         note_device(m, addr, val, true);

@@ -1064,8 +1064,11 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
     if (restored && s5l_pcf50635_in_standby(&machine->pmu)) {
         uint32_t ram_base = machine->ram_base;
         uint32_t ram_size = machine->ram_size;
+        /* The rebuilt machine keeps the host's execution-backend choice. */
+        s5l8900_cpu_backend_t backend = s5l8900_get_cpu_backend(machine);
         s5l8900_free(machine);
-        if (!s5l8900_init(machine, ram_base, ram_size)) {
+        if (!s5l8900_init(machine, ram_base, ram_size) ||
+            !s5l8900_set_cpu_backend(machine, backend)) {
             free(kernel);
             free(tree);
             (void)file_block_close(boot->media);

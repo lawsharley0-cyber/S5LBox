@@ -3887,14 +3887,23 @@ typedef struct {
 } s5l_stub_t;
 
 /*
- * One recent access to hardware this machine does not model: an address no
- * device claims (unmapped) or a declared storage stub. Kept in a small table
- * of the most recent DISTINCT (pc, address, direction) triples with a repeat
- * count, so a driver spinning on a register it is waiting for shows up as a
- * handful of entries with large counts instead of scrolling everything else
- * out. Host-side diagnostics only: not machine state, not snapshotted.
+ * One recent device-space access, for on-device diagnostics. The machine keeps
+ * two small tables of the most recent DISTINCT (pc, address, direction)
+ * triples, each with a repeat count, so a driver spinning on a register shows
+ * up as a handful of entries with large counts instead of scrolling
+ * everything else out:
+ *
+ *   unmodelled   accesses to hardware this machine does not model (unmapped
+ *                addresses and storage-only stubs): what to model next.
+ *   mmio_recent  accesses to ANY device, modelled or not: the whole register
+ *                sequence of a loop, including the device it is waiting on.
+ *
+ * Host-side diagnostics only: not machine state, not snapshotted. Recording
+ * happens only on the device slow paths, never on RAM accesses.
  */
-#define S5L_UNMODELLED_LOG 32u
+#define S5L_ACCESS_LOG 32u
+
+enum { S5L_ACCESS_DEVICE = 0, S5L_ACCESS_STUB = 1, S5L_ACCESS_UNMAPPED = 2 };
 
 typedef struct {
     uint32_t    pc;       /* cpu.r[15] when the access was made              */
@@ -3902,18 +3911,18 @@ typedef struct {
     uint32_t    value;    /* last value read (as answered) or written          */
     uint32_t    count;    /* accesses of this triple, saturating              */
     uint64_t    seq;      /* recency: larger is more recent; 0 = empty slot   */
-    const char *region;   /* stub name or SoC region name; NULL if none       */
+    const char *region;   /* device, stub or SoC region name; NULL if none    */
     uint8_t     write;
-    uint8_t     stub;     /* 1: declared storage stub, 0: unmapped            */
-    uint8_t     bytes;
+    uint8_t     kind;     /* S5L_ACCESS_*                                     */
+    uint8_t     bytes;    /* access size; 0 when not known                    */
     uint8_t     pad;
-} s5l_unmodelled_access_t;
+} s5l_access_entry_t;
 
-/* Format a copy of the table, most recent first, at most max_lines lines,
- * into out (always NUL-terminated when cap > 0). Returns the length written.
- * Takes the table rather than the machine so a frontend can copy it between
- * run chunks and format it on another thread. */
-size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
+/* Format a copy of a table, most recent first, at most max_lines lines, into
+ * out (always NUL-terminated when cap > 0). Returns the length written. Takes
+ * the table rather than the machine so a frontend can copy it between run
+ * chunks and format it on another thread. */
+size_t s5l_access_log_describe(const s5l_access_entry_t *log, unsigned n,
                                unsigned max_lines, char *out, size_t cap);
 
 /* ------------------------------------------------------------- machine ---
@@ -3991,10 +4000,11 @@ typedef struct {
     bool       dev_is_write[S5L_DEVLOG];
     unsigned   dev_count;
 
-    /* Always on (it costs nothing on RAM or modelled-device accesses): the
-     * recent unmodelled accesses, see s5l_unmodelled_access_t. */
-    s5l_unmodelled_access_t unmodelled[S5L_UNMODELLED_LOG];
+    /* Always on, device slow paths only: see s5l_access_entry_t. */
+    s5l_access_entry_t unmodelled[S5L_ACCESS_LOG];
     uint64_t   unmodelled_seq;
+    s5l_access_entry_t mmio_recent[S5L_ACCESS_LOG];
+    uint64_t   mmio_seq;
 
     /*
      * How fast guest time runs relative to guest work. See S5L8900_CPU_HZ.

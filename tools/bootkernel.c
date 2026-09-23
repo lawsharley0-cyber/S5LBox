@@ -38414,7 +38414,7 @@ external_md_work_ready:
     }
     if (ci_stats || ci_verify) {
         char text[4096];
-        (void)s5l_unmodelled_describe(mach.unmodelled, S5L_UNMODELLED_LOG, 16u,
+        (void)s5l_access_log_describe(mach.unmodelled, S5L_ACCESS_LOG, 16u,
                                       text, sizeof text);
         printf("recent unmodelled hardware accesses (most recent first):\n%s", text);
     }

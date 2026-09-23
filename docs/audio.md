@@ -406,3 +406,45 @@ Details and Copy Report. The pcs resolve to kernel symbols with
 polling, and the value says what it keeps reading. That is the input a
 register model needs; nothing is changed in the guest by collecting it.
 
+## First device report (iPhone18,2, iOS 27.2, build 3a9ddef, 2026-09-23)
+
+The run was on the forced interpreter (`(interpreter control)`), 6,627.6 M
+instructions in, guest time 0.41x wall time; I2S0 received 0 words. The
+twelve most recent unmodelled accesses were:
+
+| pc | access | count | region |
+|---|---|---:|---|
+| c05a7e54 | R 3c500024 -> fffffffa | 19,461 | stub clkrstgen |
+| c05a7e60 | W 3c500024 <- fffffffb | 19,479 | stub clkrstgen |
+| c05a7e78 | W 38100008 <- 00001000 | 19,461 | stub miu |
+| c05a7e78 | W 38100404 <- 00000000 | 19,461 | stub miu |
+| c05a7e60 | W 3c50004c <- 0001edcf | 1,003 | stub clkrstgen |
+| c05a7e60 | W 3c500048 <- 6fcff3ff | 22 | stub clkrstgen |
+| c06f5526 | R 38d00018 -> 00000000 | 10,001 | unmapped arm-io |
+| c06f54e8, c06f54ac, c06f54a6, c06f460c, c06f4604 | 38d00010 R; 38d00008 <- 00040045, 38d0000c <- 0, 38d00034 <- 2, 38d0003c <- 3 | 1 each | unmapped arm-io |
+
+What this shows, and what it does not:
+
+- **Observed:** one ARM routine (c05a7e54-c05a7e78) read-modify-writes
+  clkrstgen `+0x24`, toggling bit 0 (the stub stores writes, and the last
+  read returned the bit clear while the last write set it), and on each pass
+  writes the MIU's `+0x008` (0x1000) and `+0x404` (0) — the two MIU offsets
+  already recorded as the clock controller's second range. About 19,500
+  passes over the run. The `+0x404 <- 0` write is the "writes 0 to offset
+  +0x400-ish" of the earlier trace; nothing ever reads it back.
+- **Observed:** a Thumb routine (c06f4604-c06f5526) programs an unmapped
+  block at 0x38d00000 (+0x3c, +0x34, +0x0c, +0x08 = 0x00040045), reads
+  +0x10 once, then polls +0x18 exactly 10,001 times (reads 0) and gives up:
+  a bounded poll timing out. `BOOTLOG.md` records
+  `AppleS5L8900XSDIO::sendCommand(): Timeout waiting for CMDRDY`; that this
+  block is the SDIO controller is a **hypothesis** until the pcs are
+  resolved to symbols.
+- **Not observed:** any access to the `sram/amc` window (0x22000000) among
+  these entries, and nothing reads back a register that the loop above
+  could be waiting on. The next build therefore also logs the most recent
+  accesses to **modelled** devices (`s5l8900_t::mmio_recent`), because a
+  poll on the power controller or another modelled block would not appear
+  in the unmodelled table at all.
+
+To resolve the pcs with your own kernelcache on a desktop:
+`machoinfo <kernel> -r c05a7e54`, `-r c06f5526`.
