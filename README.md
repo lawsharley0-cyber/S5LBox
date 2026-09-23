@@ -275,6 +275,21 @@ slower on average; it therefore stays off. Full synthetic, physical and
 rejected-engine measurements remain in
 [`docs/hotpath.md`](docs/hotpath.md); they are evidence, not FPS multipliers.
 
+A portable **cached interpreter** (`core/src/arm/arm_ci*.c`) is available as
+an opt-in CPU backend on every host, including the app (Settings →
+Diagnostics → CPU Execution Backend) and `bootkernel --cpu-backend cached`.
+It predecodes guest code into blocks of specialised handlers, runs anything
+uncommon through the reference interpreter's own code, keeps device time
+exact, and generates no host code. On compiled ARMv6 workloads it measured
+2.56× the reference on a desktop x86-64 host, 2.50× with MSVC and 2.94× on
+Apple Silicon CI runners, with identical final machine state on every run; a
+differential fuzzer and the workload suite check it on every push. It has not
+yet been validated across a full firmware boot or measured on a phone, so the
+reference interpreter stays the default. Details:
+[`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md),
+[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md),
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+
 ## Build & run
 
 Building the app needs no local Apple SDK or toolchain — CI does the

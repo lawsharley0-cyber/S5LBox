@@ -196,3 +196,28 @@ MSVC runs other than CI, Xcode/iOS builds, physical-device performance and
 thermals, ARM64 host profiling on a phone. Each has exact instructions in
 `WINDOWS_BUILD.md` / `MAC_VALIDATION.md`, and nothing is claimed about them
 until they are run.
+
+## 9. Status (2026-09-23, head `a50b124`)
+
+| Plan item | State | Where |
+|---|---|---|
+| Remove unsound tiers, fix strict CI | done | `7143034` |
+| Presets, Windows guide | done | `0b2aea4`, `WINDOWS_BUILD.md` |
+| Compiled guest workloads + baseline | done | `554c587`, `BENCHMARK_RESULTS.md` §1–2 |
+| `arm_step` split for reuse (×1.010, no regression) | done | `12430ef` |
+| Engine: decoder, blocks, reference-in-block, specialised DP / load-store / branch / multiply / extend, exact run-loop budget, code bitmap + SMC invalidation, host TLB | done | `962aa8b` |
+| Differential fuzzer (planned name `test_cpu_diff`; built as `test_ci_diff`, program-level: random ARM/Thumb sequences, random state incl. banks/VFP/monitor, MMU faults, MMIO, SMC between cases) | done | `962aa8b`, extended `373d674` |
+| Lockstep over compiled workloads incl. timer FIQ | done (`test_guest_workloads`, final-state digest and retired count per run rather than per block) | `962aa8b` |
+| Multiples (LDM/STM/PUSH/POP) | done | `373d674` |
+| Block lookup: VA-keyed map (instead of per-block successor pointers, §5) | done; successor linking not built | `e06c8e7` |
+| Translation-cache purge across reset/restore/host SCTLR.M | done, regression test | `e06c8e7` |
+| Threaded dispatch | done, default on GCC/Clang | `a50b124` |
+| Real-firmware verify tooling | done (`bootkernel --ci-verify/--ci-stats`); not run | `a50b124`, `MAC_VALIDATION.md` §3 |
+| Dedicated exception-entry and condition-table unit tests (§6 rows 3–4) | covered by the fuzzer (all conditions × random NZCV; SVC/undefined/aborts/IRQ/FIQ via STOP to `arm_step`), no separate test file | — |
+| Reports | done | `WINDOWS_VALIDATION.md`, `MAC_VALIDATION.md`, `KNOWN_ISSUES.md`, `IOS6_READINESS.md` |
+
+Next candidates, each to be kept only if measured faster with a fuzzer
+proof: cheaper device refresh at timebase edges (now ~18–24 % of engine-mode
+host time), a larger or two-level host TLB for page-walk-bound code, VFP
+load/store and arithmetic specialisation, successor linking, and on Apple
+silicon `musttail` threading (`MAC_VALIDATION.md` §5).
