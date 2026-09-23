@@ -16,6 +16,7 @@
 #include "arm.h"
 #include <string.h>
 #include "vfp.h"
+#include "arm_internal.h"
 
 #include <stddef.h>
 
@@ -27,6 +28,16 @@
 #define ARM_INTERP_NOINLINE __attribute__((noinline))
 #else
 #define ARM_INTERP_NOINLINE
+#endif
+
+/* Forced inlining for the post-fetch halves of arm_step() (see
+ * arm_exec_fetched): splitting them out must not change arm_step's code. */
+#if defined(_MSC_VER)
+#define ARM_INTERP_ALWAYS_INLINE __forceinline
+#elif defined(__clang__) || defined(__GNUC__)
+#define ARM_INTERP_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define ARM_INTERP_ALWAYS_INLINE inline
 #endif
 
 static inline void set_flag(arm_cpu_t *c, uint32_t bit, bool on) {
@@ -2751,106 +2762,34 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
 
 #undef TB
 
-arm_status_t arm_step(arm_cpu_t *c) {
-    uint32_t pc   = c->r[15];
-
-    /* A corrupted snapshot or malformed exception frame must not turn an
-     * unimplemented CPSR mode into privileged User-bank execution. */
-    if (!arm_mode_is_valid(c->cpsr)) return ARM_UNDEFINED;
-
-    /* Sample the interrupt lines before fetching. FIQ outranks IRQ. The return
-     * address convention is "next instruction + 4", so handlers return with
-     * SUBS pc, lr, #4. */
-    if (c->fiq_line && !(c->cpsr & ARM_CPSR_F)) {
-        uint32_t vec;
-        c->cycles++;
-        take_exception(c, ARM_VEC_FIQ, ARM_MODE_FIQ, pc + 4, true, &vec);
-        c->r[15] = vec;
+/*
+ * The two halves of arm_step() after the fetch: execute one already fetched
+ * ARM or Thumb instruction at `pc`, exactly as arm_step() does -- retirement
+ * count, condition, decode, data-abort completion, undefined-instruction
+ * discrimination and the r15 update included.
+ *
+ * They are split out, verbatim, so the cached interpreter (arm_ci.c) can run
+ * any instruction it does not specialise through the reference semantics
+ * without paying for a second fetch. Both are forced inline so arm_step()
+ * compiles to what it was before the split; the out-of-line entry points for
+ * the engine are arm_exec_arm_insn()/arm_exec_thumb_insn() below.
+ */
+static ARM_INTERP_ALWAYS_INLINE arm_status_t
+thumb_exec_fetched(arm_cpu_t *c, uint32_t pc, uint16_t tinsn) {
+    uint32_t tnext = pc + 2;
+    c->cycles++;
+    arm_status_t tst = thumb_step(c, pc, tinsn, &tnext);
+    if (tst == ARM_HALT) return ARM_HALT;
+    if (c->abort_pending) {
+        take_pending_data_abort(c, pc);
         return ARM_OK;
     }
-    if (c->irq_line && !(c->cpsr & ARM_CPSR_I)) {
-        uint32_t vec;
-        c->cycles++;
-        take_exception(c, ARM_VEC_IRQ, ARM_MODE_IRQ, pc + 4, false, &vec);
-        c->r[15] = vec;
-        return ARM_OK;
-    }
+    if (tst == ARM_OK) c->r[15] = tnext;
+    return tst;
+}
 
-    /* Instruction fetch is translated too; a fault here is a prefetch abort.
-     * ARM_ACCESS_FETCH rather than "a read": it is what lets the walker check
-     * XN, so branching into a data page dies here with IFAR pointing at the
-     * branch target instead of executing whatever the data happened to be. */
-    uint32_t fetch_pa = 0u;
-    /*
-     * The fetch-block fast path. See the fetch_* fields in arm.h for why this
-     * exists; in short, every instruction pays a translate and an indirect bus
-     * call, and inside a 1 KB block both answer the same thing up to 1024
-     * times running.
-     *
-     * A hit requires the same block, the same flush generation and the same
-     * privilege -- the three things that can change what a fetch resolves to
-     * or whether it is permitted. On a miss the ORIGINAL path runs unchanged,
-     * fault behaviour included, and the cache is refilled only if the block is
-     * plain RAM.
-     */
-    const bool fetch_priv = cpu_is_priv(c);
-    const uint32_t fetch_blk = pc & ~0x3ffu;
-    const uint8_t *fetch_host = NULL;
-
-    if (c->fetch_host && c->fetch_blk == fetch_blk &&
-        c->fetch_gen == c->tlb_gen && c->fetch_priv == fetch_priv) {
-        fetch_host = c->fetch_host + (pc - fetch_blk);
-    } else {
-        uint32_t fetch_fsr = arm_mmu_translate(c, pc, ARM_ACCESS_FETCH,
-                                               fetch_priv, &fetch_pa);
-        if (fetch_fsr) {
-            uint32_t vec;
-            c->cycles++;
-            c->cp15.ifsr = fetch_fsr;
-            c->cp15.ifar = pc;
-            take_exception(c, ARM_VEC_PREFETCH, ARM_MODE_ABT, pc + 4, false,
-                           &vec);
-            c->r[15] = vec;
-            return ARM_OK;
-        }
-        if (c->bus->host_ram) {
-            uint8_t *blk = c->bus->host_ram(c->bus->ctx, fetch_pa & ~0x3ffu,
-                                            0x400u);
-            if (blk) {
-                c->fetch_host = blk;
-                c->fetch_blk  = fetch_blk;
-                c->fetch_gen  = c->tlb_gen;
-                c->fetch_priv = fetch_priv;
-                fetch_host    = blk + (pc - fetch_blk);
-            }
-        }
-    }
-    /* Thumb: 16-bit instructions, PC advances by 2. Dispatch before the ARM
-     * decoder — the two instruction sets share every helper below. */
-    if (c->cpsr & ARM_CPSR_T) {
-        /* Assembled from bytes rather than memcpy'd, so it does not depend on
-         * the host's endianness; the bus contract is little-endian either
-         * way. Instructions are aligned, so a fetch never leaves the block. */
-        uint16_t tinsn = fetch_host
-            ? (uint16_t)((uint16_t)fetch_host[0] |
-                         ((uint16_t)fetch_host[1] << 8))
-            : c->bus->read16(c->bus->ctx, fetch_pa);
-        uint32_t tnext = pc + 2;
-        c->cycles++;
-        arm_status_t tst = thumb_step(c, pc, tinsn, &tnext);
-        if (tst == ARM_HALT) return ARM_HALT;
-        if (c->abort_pending) {
-            take_pending_data_abort(c, pc);
-            return ARM_OK;
-        }
-        if (tst == ARM_OK) c->r[15] = tnext;
-        return tst;
-    }
-
-    uint32_t insn = fetch_host
-        ? ((uint32_t)fetch_host[0] | ((uint32_t)fetch_host[1] << 8) |
-           ((uint32_t)fetch_host[2] << 16) | ((uint32_t)fetch_host[3] << 24))
-        : c->bus->read32(c->bus->ctx, fetch_pa);
+static ARM_INTERP_ALWAYS_INLINE arm_status_t
+arm_exec_fetched(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     uint32_t next = pc + 4;
     arm_status_t st = ARM_OK;
 
@@ -3345,4 +3284,119 @@ arm_status_t arm_step(arm_cpu_t *c) {
 
     if (st == ARM_OK) c->r[15] = next;
     return st;
+}
+
+arm_status_t arm_step(arm_cpu_t *c) {
+    uint32_t pc   = c->r[15];
+
+    /* A corrupted snapshot or malformed exception frame must not turn an
+     * unimplemented CPSR mode into privileged User-bank execution. */
+    if (!arm_mode_is_valid(c->cpsr)) return ARM_UNDEFINED;
+
+    /* Sample the interrupt lines before fetching. FIQ outranks IRQ. The return
+     * address convention is "next instruction + 4", so handlers return with
+     * SUBS pc, lr, #4. */
+    if (c->fiq_line && !(c->cpsr & ARM_CPSR_F)) {
+        uint32_t vec;
+        c->cycles++;
+        take_exception(c, ARM_VEC_FIQ, ARM_MODE_FIQ, pc + 4, true, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
+    }
+    if (c->irq_line && !(c->cpsr & ARM_CPSR_I)) {
+        uint32_t vec;
+        c->cycles++;
+        take_exception(c, ARM_VEC_IRQ, ARM_MODE_IRQ, pc + 4, false, &vec);
+        c->r[15] = vec;
+        return ARM_OK;
+    }
+
+    /* Instruction fetch is translated too; a fault here is a prefetch abort.
+     * ARM_ACCESS_FETCH rather than "a read": it is what lets the walker check
+     * XN, so branching into a data page dies here with IFAR pointing at the
+     * branch target instead of executing whatever the data happened to be. */
+    uint32_t fetch_pa = 0u;
+    /*
+     * The fetch-block fast path. See the fetch_* fields in arm.h for why this
+     * exists; in short, every instruction pays a translate and an indirect bus
+     * call, and inside a 1 KB block both answer the same thing up to 1024
+     * times running.
+     *
+     * A hit requires the same block, the same flush generation and the same
+     * privilege -- the three things that can change what a fetch resolves to
+     * or whether it is permitted. On a miss the ORIGINAL path runs unchanged,
+     * fault behaviour included, and the cache is refilled only if the block is
+     * plain RAM.
+     */
+    const bool fetch_priv = cpu_is_priv(c);
+    const uint32_t fetch_blk = pc & ~0x3ffu;
+    const uint8_t *fetch_host = NULL;
+
+    if (c->fetch_host && c->fetch_blk == fetch_blk &&
+        c->fetch_gen == c->tlb_gen && c->fetch_priv == fetch_priv) {
+        fetch_host = c->fetch_host + (pc - fetch_blk);
+    } else {
+        uint32_t fetch_fsr = arm_mmu_translate(c, pc, ARM_ACCESS_FETCH,
+                                               fetch_priv, &fetch_pa);
+        if (fetch_fsr) {
+            uint32_t vec;
+            c->cycles++;
+            c->cp15.ifsr = fetch_fsr;
+            c->cp15.ifar = pc;
+            take_exception(c, ARM_VEC_PREFETCH, ARM_MODE_ABT, pc + 4, false,
+                           &vec);
+            c->r[15] = vec;
+            return ARM_OK;
+        }
+        if (c->bus->host_ram) {
+            uint8_t *blk = c->bus->host_ram(c->bus->ctx, fetch_pa & ~0x3ffu,
+                                            0x400u);
+            if (blk) {
+                c->fetch_host = blk;
+                c->fetch_blk  = fetch_blk;
+                c->fetch_gen  = c->tlb_gen;
+                c->fetch_priv = fetch_priv;
+                fetch_host    = blk + (pc - fetch_blk);
+            }
+        }
+    }
+    /* Thumb: 16-bit instructions, PC advances by 2. Dispatch before the ARM
+     * decoder — the two instruction sets share every helper below. */
+    if (c->cpsr & ARM_CPSR_T) {
+        /* Assembled from bytes rather than memcpy'd, so it does not depend on
+         * the host's endianness; the bus contract is little-endian either
+         * way. Instructions are aligned, so a fetch never leaves the block. */
+        uint16_t tinsn = fetch_host
+            ? (uint16_t)((uint16_t)fetch_host[0] |
+                         ((uint16_t)fetch_host[1] << 8))
+            : c->bus->read16(c->bus->ctx, fetch_pa);
+        return thumb_exec_fetched(c, pc, tinsn);
+    }
+
+    uint32_t insn = fetch_host
+        ? ((uint32_t)fetch_host[0] | ((uint32_t)fetch_host[1] << 8) |
+           ((uint32_t)fetch_host[2] << 16) | ((uint32_t)fetch_host[3] << 24))
+        : c->bus->read32(c->bus->ctx, fetch_pa);
+    return arm_exec_fetched(c, pc, insn);
+}
+
+/* ------------------------------------------------ engine entry points --- */
+
+arm_status_t arm_exec_arm_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    return arm_exec_fetched(c, pc, insn);
+}
+
+arm_status_t arm_exec_thumb_insn(arm_cpu_t *c, uint32_t pc, uint16_t insn) {
+    return thumb_exec_fetched(c, pc, insn);
+}
+
+uint32_t arm_mem_read32(arm_cpu_t *c, uint32_t va, bool priv) { return mem_r32_as(c, va, priv); }
+uint32_t arm_mem_read16(arm_cpu_t *c, uint32_t va, bool priv) { return mem_r16_as(c, va, priv); }
+uint32_t arm_mem_read8 (arm_cpu_t *c, uint32_t va, bool priv) { return mem_r8_as(c, va, priv); }
+void arm_mem_write32(arm_cpu_t *c, uint32_t va, uint32_t v, bool priv) { mem_w32_as(c, va, v, priv); }
+void arm_mem_write16(arm_cpu_t *c, uint32_t va, uint32_t v, bool priv) { mem_w16_as(c, va, (uint16_t)v, priv); }
+void arm_mem_write8 (arm_cpu_t *c, uint32_t va, uint32_t v, bool priv) { mem_w8_as(c, va, (uint8_t)v, priv); }
+
+void arm_take_data_abort(arm_cpu_t *c, uint32_t pc) {
+    take_pending_data_abort(c, pc);
 }
