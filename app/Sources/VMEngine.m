@@ -127,7 +127,10 @@ static uint64_t vm_now_ns(void) {
 - (void)noteDroppedButton;
 - (void)drainOneTouch_emulatorThread;
 - (void)drainOneButton_emulatorThread;
-- (void)publishDiagnostics_emulatorThread:(uint64_t)retired;
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired
+                                    runNs:(uint64_t)runNs
+                                   idleNs:(uint64_t)idleNs
+                                 threadNs:(uint64_t)threadNs;
 - (void)beginCheckpointInputQuiesce_emulatorThread;
 - (BOOL)checkpointInputIsQuiescent_emulatorThread;
 - (void)publishBlankSnapshotLocked;
@@ -297,6 +300,9 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     uint64_t                _diagRetired;
     s5l_access_entry_t _diagUnmodelled[S5L_ACCESS_LOG];
     s5l_access_entry_t _diagMmio[S5L_ACCESS_LOG];
+    /* Where the emulator thread's time went since this run started: inside
+     * s5l8900_run, of which asleep in guest idle (paced WFI), and in total. */
+    uint64_t                _diagRunNs, _diagIdleNs, _diagThreadNs;
     NSString               *_diagBackendNote;  /* why the cached interpreter is off */
 }
 
@@ -1697,6 +1703,9 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     (void)unused;
     /* The engine counters describe this run, like `retired` below. */
     if (_machine.ci) arm_ci_reset_stats(_machine.ci);
+    const uint64_t threadStartNs = vm_now_ns();
+    const uint64_t idleBaseNs = _machine.wfi_paced_wait_ns;
+    uint64_t runNs = 0;
     double lastPublish = vm_now();
     uint64_t retired = 0, retiredAtLastPublish = 0;
     arm_status_t status = ARM_OK;
@@ -1815,7 +1824,11 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 [self drainOneButton_emulatorThread];
             }
 
-            retired += s5l8900_run(&_machine, kVMChunkInstructions, &status);
+            {
+                const uint64_t t0 = vm_now_ns();
+                retired += s5l8900_run(&_machine, kVMChunkInstructions, &status);
+                runNs += vm_now_ns() - t0;
+            }
 
             /* Taken here precisely because the chunk has ENDED: the machine is
              * between instructions, this thread owns it, and no lock is held. */
@@ -1949,7 +1962,10 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 double instantRate = elapsed > 0
                     ? (double)(retired - retiredAtLastPublish) / elapsed : 0.0;
                 [self publishRetired:retired rate:instantRate status:status];
-                [self publishDiagnostics_emulatorThread:retired];
+                [self publishDiagnostics_emulatorThread:retired
+                                                  runNs:runNs
+                                                 idleNs:_machine.wfi_paced_wait_ns - idleBaseNs
+                                               threadNs:vm_now_ns() - threadStartNs];
                 lastPublish = now;
                 retiredAtLastPublish = retired;
             }
@@ -2205,7 +2221,10 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 }
 
 /* Emulator thread only, between chunks. */
-- (void)publishDiagnostics_emulatorThread:(uint64_t)retired {
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired
+                                    runNs:(uint64_t)runNs
+                                   idleNs:(uint64_t)idleNs
+                                 threadNs:(uint64_t)threadNs {
     arm_ci_stats_t stats;
     BOOL active = _machine.ci != NULL;
     if (active) arm_ci_get_stats(_machine.ci, &stats);
@@ -2214,6 +2233,9 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _diagCiActive = active;
     _diagCiStats = stats;
     _diagRetired = retired;
+    _diagRunNs = runNs;
+    _diagIdleNs = idleNs;
+    _diagThreadNs = threadNs;
     memcpy(_diagUnmodelled, _machine.unmodelled, sizeof _diagUnmodelled);
     memcpy(_diagMmio, _machine.mmio_recent, sizeof _diagMmio);
     pthread_mutex_unlock(&_lock);
@@ -2226,12 +2248,30 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     BOOL active = _diagCiActive;
     uint64_t retired = _diagRetired;
     NSString *note = _diagBackendNote;
+    const uint64_t runNs = _diagRunNs, idleNs = _diagIdleNs, threadNs = _diagThreadNs;
     stats = _diagCiStats;
     memcpy(unmodelled, _diagUnmodelled, sizeof unmodelled);
     memcpy(mmio, _diagMmio, sizeof mmio);
     pthread_mutex_unlock(&_lock);
 
-    char engine[1024], devices[4096], missing[4096];
+    char engine[1024], devices[4096], missing[4096], timing[512];
+    {
+        /* Busy = executing guest instructions (inside the machine, not
+         * asleep in guest idle). A low busy share means the guest is idle or
+         * the thread is starved; a high one with a low rate means the CPU
+         * emulation itself is the limit. */
+        const double thread = threadNs / 1e9, run = runNs / 1e9, idle = idleNs / 1e9;
+        const double busy = run > idle ? run - idle : 0.0;
+        (void)snprintf(timing, sizeof timing,
+            "Emulator thread over %.0f s: %.0f%% executing guest code, %.0f%% asleep "
+            "while the guest idles (WFI), %.0f%% outside the machine. Rate while "
+            "executing: %.1f M insn/s.\n",
+            thread,
+            thread > 0 ? 100.0 * busy / thread : 0.0,
+            thread > 0 ? 100.0 * (run - busy) / thread : 0.0,
+            thread > 0 ? 100.0 * (thread > run ? thread - run : 0.0) / thread : 0.0,
+            busy > 0 ? retired / busy / 1e6 : 0.0);
+    }
     if (active)
         (void)arm_ci_describe_stats(&stats, retired, engine, sizeof engine);
     else
@@ -2240,10 +2280,10 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     (void)s5l_access_log_describe(unmodelled, S5L_ACCESS_LOG, 32u,
                                   missing, sizeof missing);
     return [NSString stringWithFormat:
-        @"CPU engine:\n%s%@%@\n"
+        @"%s\nCPU engine:\n%s%@%@\n"
         @"Recent hardware accesses, any device (most recent first):\n%s\n"
         @"Recent accesses to unmodelled hardware (most recent first):\n%s",
-        engine, active || !note ? @"" : note, active || !note ? @"" : @"\n",
+        timing, engine, active || !note ? @"" : note, active || !note ? @"" : @"\n",
         devices, missing];
 }
 

@@ -1060,11 +1060,12 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
     if (!out || !cap) return 0;
     out[0] = '\0';
     if (!st) return 0;
-    char q[16][16];            /* one buffer per argument of one snprintf */
+    char q[20][16];            /* one buffer per argument of one snprintf */
     const uint64_t *sc = st->step_cause, *rc = st->ref_class;
     int w = snprintf(out, cap,
         "Engine retired %s instructions%s%.1f%%%s; via reference %.1f%% "
         "(decoded %.1f%%, fallback %.1f%%)\n"
+        "Runs: %s (budget %s, step %s, event %s, status %s)\n"
         "Blocks: %s run, %s built, %s stale, %s invalidations, %s flushes\n"
         "Handed to arm_step: SVC %s, CP15 c13 %s, WFI %s, CP15 %s, CP14 %s, "
         "other %s, interrupt/abort %s, fetch %s\n",
@@ -1074,6 +1075,9 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
         pct(st->ref_retired, st->retired),
         pct(st->ref_retired - st->ref_fallback, st->retired),
         pct(st->ref_fallback, st->retired),
+        qty(q[14], st->runs), qty(q[15], st->stop[ARM_CI_STOP_BUDGET]),
+        qty(q[16], st->stop[ARM_CI_STOP_STEP]), qty(q[17], st->stop[ARM_CI_STOP_EVENT]),
+        qty(q[18], st->stop[ARM_CI_STOP_STATUS]),
         qty(q[1], st->block_execs), qty(q[2], st->builds), qty(q[3], st->stale),
         qty(q[4], st->invalidations), qty(q[5], st->flushes),
         qty(q[6], sc[ARM_CI_STEP_SVC]), qty(q[7], sc[ARM_CI_STEP_CP15_TLS]),
