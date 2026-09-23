@@ -1,5 +1,9 @@
 # Current S5LBox Architecture Audit
 
+> **Superseded** by [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)
+> (2026-09-23). Section 4 below lists bottlenecks without the measurements in
+> `hotpath.md` that refute several of them; do not use it to plan work.
+
 ## 1. System Overview
 
 S5LBox is a full-system emulator modeling the Samsung **S5L8900** System-on-Chip (SoC) and its core ARM processor, the **ARM1176JZF-S** (ARMv6 architecture with VFPv2 vector floating point). The emulator's primary objective is booting genuine Apple iPhone OS (versions 1.x through 3.x, targeting iPhone1,1 and iPhone1,2 / iPhone 3G) without reimplementing the guest operating system's higher-level APIs.
