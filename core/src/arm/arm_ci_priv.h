@@ -70,6 +70,10 @@ enum {
     CI_K_LDM,
     CI_K_LDM_PC,       /* list includes r15: interworking load, ends block   */
     CI_K_STM,          /* never r15 in the list                              */
+    /* CP15 c13 thread-ID registers: rd = core register, sa = opc2 (2..4),
+     * rm = CRm. User-mode access rules are checked at run time. */
+    CI_K_MRC_TID,
+    CI_K_MCR_TID,
     /* Control flow. All end the block. */
     CI_K_B,            /* imm = target                                       */
     CI_K_BL,           /* ARM: LR = pc + 4                                   */

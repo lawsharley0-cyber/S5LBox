@@ -475,6 +475,7 @@ typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
     X(MUL) X(MULS) X(MLA) X(MLAS) X(UMULL) X(UMLAL) X(SMULL) X(SMLAL)         \
     X(NOP) X(CLREX) X(MRS_CPSR) X(CLZ) X(SXTB) X(SXTH) X(UXTB) X(UXTH)        \
     X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
+    X(MRC_TID) X(MCR_TID)                                                     \
     X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)
 
 /* The data-processing and memory families, shared by the handlers and the
@@ -789,6 +790,23 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             CI_NEXT();
         }
 
+        /* CP15 c13, exactly the reference's rules: User mode may read
+         * TPIDRURW and TPIDRURO and write TPIDRURW, with CRm 0; privileged
+         * modes may do anything here. The rest is the reference's to refuse. */
+        CI_HK(MRC_TID) {
+            if (!priv && !(op->rm == 0u && (op->sa == 2u || op->sa == 3u))) goto ref;
+            R[op->rd] = op->sa == 2u ? c->cp15.tpidrurw
+                      : op->sa == 3u ? c->cp15.tpidruro : c->cp15.tpidrprw;
+            CI_NEXT();
+        }
+        CI_HK(MCR_TID) {
+            if (!priv && !(op->rm == 0u && op->sa == 2u)) goto ref;
+            if (op->sa == 2u) c->cp15.tpidrurw = R[op->rd];
+            else if (op->sa == 3u) c->cp15.tpidruro = R[op->rd];
+            else c->cp15.tpidrprw = R[op->rd];
+            CI_NEXT();
+        }
+
         /* ------------------------------------------------- control flow */
         CI_HK(B)
             next_pc = op->imm;
@@ -860,8 +878,22 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             if (op->kind == CI_K_REF) ci->st.ref_class[op->sa]++;
             else ci->st.ref_fallback++;
             op++;
-            if (CI_UNLIKELY((c->cpsr & CI_CTRL_MASK) != ctrl ||
-                            ci->code_written ||
+            /* A mode or endianness change always needs the machine. A change
+             * of the interrupt masks alone does only when it makes something
+             * deliverable: the lines move only in the machine's tick, never
+             * inside a run, so masking, or unmasking with nothing pending,
+             * leaves the next instruction boundary exactly as it was. */
+            const uint32_t now = c->cpsr & CI_CTRL_MASK;
+            if (CI_UNLIKELY(now != ctrl) &&
+                (((now ^ ctrl) & ~(ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A)) != 0u ||
+                 c->abort_pending ||
+                 (c->irq_line && !(c->cpsr & ARM_CPSR_I)) ||
+                 (c->fiq_line && !(c->cpsr & ARM_CPSR_F)))) {
+                *stop = ARM_CI_STOP_EVENT;
+                *retired_out = (unsigned)(op - base);
+                return EXEC_STOP;
+            }
+            if (CI_UNLIKELY(ci->code_written ||
                             (ci->cfg.level_dirty && *ci->cfg.level_dirty))) {
                 *stop = ARM_CI_STOP_EVENT;
                 *retired_out = (unsigned)(op - base);

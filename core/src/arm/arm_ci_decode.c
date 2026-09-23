@@ -278,7 +278,11 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
             op->imm = (pc + 8u + (uint32_t)off + (((insn >> 24) & 1u) << 1)) & ~1u;
             return CI_DEC_END;
         }
-        return CI_DEC_STOP;           /* CPS, SRS, RFE, SETEND, SIMD, undefined */
+        /* CPS: the reference runs it in-block; a mode change still ends the
+         * run there, and a mask-only change continues unless it makes an
+         * interrupt deliverable (arm_ci.c, the ref path). */
+        if ((insn & 0xfff1fe20u) == 0xf1000000u) return ref(op, false);
+        return CI_DEC_STOP;           /* SRS, RFE, SETEND, SIMD, undefined */
     }
 
     /* Hoisted data processing, exactly arm_step's guard. */
@@ -334,7 +338,31 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return CI_DEC_STOP;                               /* reserved: UNDEFINED */
     if ((insn & 0x0f000010u) == 0x0e000010u) {            /* MCR / MRC */
         unsigned cp = (insn >> 8) & 0xfu;
-        return (cp == 10u || cp == 11u) ? ref(op, false) : CI_DEC_STOP;
+        if (cp == 10u || cp == 11u) return ref(op, false);
+        if (cp == 15u) {
+            const bool L = (insn >> 20) & 1u;
+            const unsigned opc1 = (insn >> 21) & 7u, crn = (insn >> 16) & 0xfu;
+            const unsigned rd = (insn >> 12) & 0xfu, opc2 = (insn >> 5) & 7u;
+            const unsigned crm = insn & 0xfu;
+            /* c7 writes other than WFI (MCR p15,0,Rd,c7,c0,4): the memory
+             * barriers and cache maintenance, a no-op in the reference in
+             * every mode (User mode may issue c7). */
+            if (!L && crn == 7u && !(opc1 == 0u && opc2 == 4u && crm == 0u)) {
+                op->kind = CI_K_NOP;
+                return CI_DEC_OP;
+            }
+            /* c13 opc2 2..4: TPIDRURW/URO/PRW, plain registers in the
+             * reference. Opc2 1 (CONTEXTIDR) flushes the TLB and stays on
+             * arm_step, as does anything naming r15. */
+            if (crn == 13u && rd != 15u && opc2 >= 2u && opc2 <= 4u) {
+                op->kind = L ? CI_K_MRC_TID : CI_K_MCR_TID;
+                op->rd = (uint8_t)rd;
+                op->sa = (uint8_t)opc2;
+                op->rm = (uint8_t)crm;
+                return CI_DEC_OP;
+            }
+        }
+        return CI_DEC_STOP;
     }
     if ((insn & 0x0f000e10u) == 0x0e000a00u ||            /* VFP CDP */
         (insn & 0x0e000e00u) == 0x0c000a00u)              /* VFP LDC/STC/MCRR */

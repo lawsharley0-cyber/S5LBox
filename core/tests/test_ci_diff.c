@@ -131,7 +131,7 @@ static uint32_t arm_cond(void) {
 static uint32_t gen_arm(unsigned idx, unsigned len) {
     uint32_t c = arm_cond() << 28;
     unsigned rd = reg_field(), rn = reg_field(), rm = reg_field(), rs = reg_field();
-    switch (rnd_n(22u)) {
+    switch (rnd_n(25u)) {
         case 0: case 1: case 2:                                         /* DP imm */
             return c | 0x02000000u | (rnd_n(16u) << 21) | (rnd_n(2u) << 20) |
                    (rn << 16) | (rd << 12) | (rnd_n(16u) << 8) |
@@ -198,6 +198,28 @@ static uint32_t gen_arm(unsigned idx, unsigned len) {
             if (f == 0xf5d0f000u) f |= rn << 16 | rnd_n(4096u);
             return f;
         }
+        case 21: case 22: {                                              /* CP15 MCR/MRC */
+            /* c7 (barriers, cache maintenance, sometimes WFI), c13 (thread
+             * and context IDs), c0 (identification): the forms the engine
+             * specialises or must leave to arm_step. Never c1-c3, which would
+             * wreck this harness's own translation set-up. */
+            static const uint8_t crns[] = { 7u, 7u, 13u, 13u, 13u, 0u };
+            unsigned crn = crns[rnd_n(6u)];
+            unsigned opc2 = crn == 13u ? rnd_n(8u) : rnd_n(8u);
+            unsigned crm = crn == 7u ? (chance(10) ? 0u : rnd_n(16u)) : (chance(80) ? 0u : rnd_n(2u));
+            unsigned L = crn == 0u ? 1u : rnd_n(2u);
+            unsigned r = chance(5) ? 15u : rnd_n(15u);
+            return c | 0x0e000f10u | (L << 20) | (crn << 16) | (r << 12) | (opc2 << 5) | crm |
+                   ((chance(10) ? rnd_n(8u) : 0u) << 21);
+        }
+        case 23: {                                                       /* CPS */
+            static const uint32_t modes[] = { ARM_MODE_USR, ARM_MODE_SVC, ARM_MODE_IRQ,
+                                              ARM_MODE_SYS, 0x1bu, 0x05u };
+            unsigned imod = chance(80) ? 2u + rnd_n(2u) : rnd_n(2u);
+            unsigned M = chance(25) ? 1u : 0u;
+            return 0xf1000000u | (imod << 18) | (M << 17) | (rnd_n(8u) << 6) |
+                   (M ? modes[rnd_n(6u)] : 0u);
+        }
         default:                                                         /* anything */
             return (rnd() & 0x0fffffffu) | c;
     }
@@ -248,6 +270,8 @@ typedef struct {
     uint64_t cycles;
     bool excl_valid;
     uint32_t excl_addr;
+    uint32_t tid[3];      /* TPIDRURW, TPIDRURO, TPIDRPRW */
+    bool irq_pending;     /* a VIC software interrupt asserted before the run */
 } state_t;
 
 static void random_state(state_t *s, bool thumb) {
@@ -272,6 +296,8 @@ static void random_state(state_t *s, bool thumb) {
     s->cycles = rnd();
     s->excl_valid = chance(30);
     s->excl_addr = DATA_VA + (rnd_n(DATA_BYTES) & ~3u);
+    for (int i = 0; i < 3; i++) s->tid[i] = rnd();
+    s->irq_pending = chance(25);
 }
 
 static void apply_state(s5l8900_t *m, const state_t *s) {
@@ -300,7 +326,22 @@ static void apply_state(s5l8900_t *m, const state_t *s) {
     c->excl_valid = s->excl_valid;
     c->excl_addr = s->excl_addr;
     c->abort_pending = false;
+    c->cp15.tpidrurw = s->tid[0];
+    c->cp15.tpidruro = s->tid[1];
+    c->cp15.tpidrprw = s->tid[2];
+    c->cp15.context_id = 0;
     arm_mmu_tlb_flush(c);
+    /* A real, level-asserted IRQ (VIC0 software interrupt, line 5) or none,
+     * so unmasking with something pending is exercised. The previous case's
+     * VIC state is cleared either way. */
+    m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_INTENCLEAR, 0xffffffffu);
+    m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_SOFTINTCLEAR, 0xffffffffu);
+    m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_INTSELECT, 0u);
+    if (s->irq_pending) {
+        m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_INTENABLE, 1u << 5);
+        m->bus.write32(m->bus.ctx, S5L8900_VIC0_BASE + VIC_SOFTINT, 1u << 5);
+    }
+    s5l8900_tick(m, 0u);
 }
 
 static int compare(const s5l8900_t *a, const s5l8900_t *b, char *why, size_t n) {
@@ -318,6 +359,10 @@ static int compare(const s5l8900_t *a, const s5l8900_t *b, char *why, size_t n) 
     DIFF(excl_valid, "%d"); DIFF(excl_addr, "%08x");
     DIFF(cp15.dfsr, "%08x"); DIFF(cp15.dfar, "%08x");
     DIFF(cp15.ifsr, "%08x"); DIFF(cp15.ifar, "%08x");
+    DIFF(cp15.tpidrurw, "%08x"); DIFF(cp15.tpidruro, "%08x");
+    DIFF(cp15.tpidrprw, "%08x"); DIFF(cp15.context_id, "%08x");
+    DIFF(cp15.fcse_pid, "%08x"); DIFF(cp15.sctlr, "%08x");
+    DIFF(irq_line, "%d"); DIFF(fiq_line, "%d");
     DIFF(abort_pending, "%d");
     DIFF(vfp_fpscr, "%08x"); DIFF(vfp_fpexc, "%08x");
     for (int i = 0; i < 32; i++) DIFF(vfp_s[i], "%08x");

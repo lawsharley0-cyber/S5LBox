@@ -99,10 +99,12 @@ static void test_unmodelled_log(void) {
 static void test_engine_counters(void) {
     static const uint32_t prog[] = {
         0xe3a00001u,   /* mov   r0, #1                 */
-        0xee1d1f70u,   /* mrc   p15, 0, r1, c13, c0, 3 (thread ID: step) */
+        0xee1d1f30u,   /* mrc   p15, 0, r1, c13, c0, 1 (context ID: step) */
+        0xee1d3f70u,   /* mrc   p15, 0, r3, c13, c0, 3 (thread ID: engine) */
+        0xee070f9au,   /* mcr   p15, 0, r0, c7, c10, 4 (barrier: engine) */
         0xe328f000u,   /* msr   cpsr_f, #0             (reference, status) */
         0xee102f10u,   /* mrc   p15, 0, r2, c0, c0, 0  (main ID: step) */
-        0xeafffffau,   /* b     prog                   */
+        0xeafffff8u,   /* b     prog                   */
     };
     for (unsigned i = 0; i < sizeof prog / sizeof prog[0]; i++)
         g_m.bus.write32(g_m.bus.ctx, RAM_BASE + i * 4u, prog[i]);
@@ -119,6 +121,16 @@ static void test_engine_counters(void) {
     CHECK(cs.step_cause[ARM_CI_STEP_CP15_TLS] > 0u, "no CP15 c13 steps");
     CHECK(cs.step_cause[ARM_CI_STEP_CP15] > 0u, "no CP15 steps");
     CHECK(cs.step_cause[ARM_CI_STEP_SVC] == 0u, "phantom SVC steps");
+    /* Seven instructions per pass, two of them stepping: the thread-ID read
+     * and the barrier stay in the engine, so the steps are exactly one per
+     * context-ID read and one per main-ID read. */
+    CHECK(cs.step_cause[ARM_CI_STEP_CP15_TLS] <= cs.step_cause[ARM_CI_STEP_CP15] + 1u &&
+          cs.step_cause[ARM_CI_STEP_CP15] <= cs.step_cause[ARM_CI_STEP_CP15_TLS] + 1u &&
+          cs.step_cause[ARM_CI_STEP_CP15] <= 5000u / 7u + 1u,
+          "thread-ID read or barrier left the engine (c13 %llu, cp15 %llu)",
+          (unsigned long long)cs.step_cause[ARM_CI_STEP_CP15_TLS],
+          (unsigned long long)cs.step_cause[ARM_CI_STEP_CP15]);
+    CHECK(g_m.cpu.r[3] == g_m.cpu.cp15.tpidruro, "thread-ID read wrong");
     CHECK(cs.ref_class[ARM_CI_REF_STATUS] > 0u, "MSR not counted as status");
     CHECK(cs.ref_fallback == 0u, "unexpected fallback");
 
