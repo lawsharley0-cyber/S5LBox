@@ -102,7 +102,8 @@ typedef struct ci_block {
     uint32_t gen;      /* region generation of pa_off's 1 KiB when built     */
     uint16_t n;        /* ops                                                */
     uint8_t  thumb;    /* CPSR.T it was decoded for                          */
-    uint8_t  pad;
+    uint8_t  stop_cause; /* arm_ci_step_cause_t of the instruction that ended
+                            decoding with CI_DEC_STOP (meaningful when n == 0) */
     ci_op_t *ops;
 } ci_block_t;
 
@@ -118,6 +119,12 @@ typedef enum {
  * which stay reference-executed). */
 ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op);
 ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op);
+
+/* Diagnostics: why an instruction that decoded to CI_DEC_STOP must run on
+ * arm_step (arm_ci_step_cause_t), and the class of one that decoded to
+ * CI_K_REF (arm_ci_ref_class_t). Build-time only. */
+unsigned ci_stop_cause(uint32_t insn, bool thumb);
+unsigned ci_ref_class(uint32_t insn, bool thumb);
 
 /* --------------------------------------------------------- engine state --- */
 

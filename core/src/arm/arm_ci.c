@@ -15,6 +15,7 @@
 #include "arm_ci_priv.h"
 #include "arm_internal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -381,14 +382,22 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
     const unsigned isz = thumb ? 2u : 4u;
     const uint32_t room = 0x400u - (pa_off & 0x3ffu);
     unsigned n = 0;
+    uint8_t stop_cause = ARM_CI_STEP_OTHER;
     for (uint32_t off = 0; n < CI_BLOCK_MAX_OPS && off + isz <= room; off += isz) {
         const uint8_t *p = host + off;
-        ci_dec_t d = thumb
-            ? ci_decode_thumb(pc + off, (uint16_t)(p[0] | (p[1] << 8)), &ops[n])
-            : ci_decode_arm(pc + off, (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                                      ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24),
-                            &ops[n]);
-        if (d == CI_DEC_STOP) break;
+        const uint32_t word = thumb
+            ? (uint32_t)(p[0] | (p[1] << 8))
+            : (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+              ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        ci_dec_t d = thumb ? ci_decode_thumb(pc + off, (uint16_t)word, &ops[n])
+                           : ci_decode_arm(pc + off, word, &ops[n]);
+        if (d == CI_DEC_STOP) {
+            stop_cause = (uint8_t)ci_stop_cause(word, thumb);
+            break;
+        }
+        /* A reference record uses only kind and raw; its class rides in sa
+         * for the statistics. */
+        if (ops[n].kind == CI_K_REF) ops[n].sa = (uint8_t)ci_ref_class(word, thumb);
         n++;
         if (d == CI_DEC_END) break;
     }
@@ -399,6 +408,7 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
     b->gen = ci->region_gen[r];
     b->n = (uint16_t)n;
     b->thumb = thumb ? 1u : 0u;
+    b->stop_cause = stop_cause;
     b->ops = ops;
     ci->nblocks++;
     ci->nops += n;
@@ -847,6 +857,8 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                 return EXEC_STOP;
             }
             ci->st.ref_retired++;
+            if (op->kind == CI_K_REF) ci->st.ref_class[op->sa]++;
+            else ci->st.ref_fallback++;
             op++;
             if (CI_UNLIKELY((c->cpsr & CI_CTRL_MASK) != ctrl ||
                             ci->code_written ||
@@ -910,6 +922,7 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         (c->fiq_line && !(c->cpsr & ARM_CPSR_F)) ||
         (c->irq_line && !(c->cpsr & ARM_CPSR_I))) {
         stop_local = ARM_CI_STOP_STEP;
+        ci->st.step_cause[ARM_CI_STEP_EXCEPTION]++;
         goto done;
     }
 
@@ -920,7 +933,11 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
     while (retired < budget) {
         const uint32_t pc = c->r[15];
         const bool thumb = (c->cpsr & ARM_CPSR_T) != 0u;
-        if (pc & (thumb ? 1u : 3u)) { stop_local = ARM_CI_STOP_STEP; break; }
+        if (pc & (thumb ? 1u : 3u)) {
+            stop_local = ARM_CI_STOP_STEP;
+            ci->st.step_cause[ARM_CI_STEP_FETCH]++;
+            break;
+        }
         const uint32_t ctx = (thumb ? 1u : 0u) | (priv ? 2u : 0u);
 
         ci->st.lookups++;
@@ -932,7 +949,11 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
             ci->st.hits++;
         } else {
             const uint8_t *h = fetch(c, pc, priv);
-            if (!h || h < ram || h >= ram_end) { stop_local = ARM_CI_STOP_STEP; break; }
+            if (!h || h < ram || h >= ram_end) {
+                stop_local = ARM_CI_STOP_STEP;
+                ci->st.step_cause[ARM_CI_STEP_FETCH]++;
+                break;
+            }
             const uint32_t pa_off = (uint32_t)(h - ram);
             b = ci->table[hash_slot(pa_off, thumb)];
             if (b && b->pa_off == pa_off && b->va == pc && b->thumb == (uint8_t)thumb) {
@@ -955,7 +976,11 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
             f->gen = c->tlb_gen;
             f->b = b;
         }
-        if (b->n == 0u) { stop_local = ARM_CI_STOP_STEP; break; }
+        if (b->n == 0u) {
+            stop_local = ARM_CI_STOP_STEP;
+            ci->st.step_cause[b->stop_cause]++;
+            break;
+        }
 
         unsigned n = 0;
         ci->st.block_execs++;
@@ -971,4 +996,57 @@ done:
     if (status) *status = st_local;
     if (stop) *stop = stop_local;
     return retired;
+}
+
+/* ------------------------------------------------------------- report --- */
+
+static double pct(uint64_t part, uint64_t whole) {
+    return whole ? 100.0 * (double)part / (double)whole : 0.0;
+}
+
+/* 1234 -> "1234", 12345678 -> "12.3M": compact enough for a phone alert. */
+static const char *qty(char buf[16], uint64_t v) {
+    if (v < 10000u) snprintf(buf, 16, "%llu", (unsigned long long)v);
+    else if (v < 10000000u) snprintf(buf, 16, "%.1fk", (double)v / 1e3);
+    else if (v < UINT64_C(10000000000)) snprintf(buf, 16, "%.1fM", (double)v / 1e6);
+    else snprintf(buf, 16, "%.1fG", (double)v / 1e9);
+    return buf;
+}
+
+size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
+                             char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!st) return 0;
+    char q[16][16];            /* one buffer per argument of one snprintf */
+    const uint64_t *sc = st->step_cause, *rc = st->ref_class;
+    int w = snprintf(out, cap,
+        "Engine retired %s instructions%s%.1f%%%s; via reference %.1f%% "
+        "(decoded %.1f%%, fallback %.1f%%)\n"
+        "Blocks: %s run, %s built, %s stale, %s invalidations, %s flushes\n"
+        "Handed to arm_step: SVC %s, CP15 c13 %s, WFI %s, CP15 %s, CP14 %s, "
+        "other %s, interrupt/abort %s, fetch %s\n",
+        qty(q[0], st->retired),
+        total_retired ? " (" : "", pct(st->retired, total_retired),
+        total_retired ? " of all)" : "",
+        pct(st->ref_retired, st->retired),
+        pct(st->ref_retired - st->ref_fallback, st->retired),
+        pct(st->ref_fallback, st->retired),
+        qty(q[1], st->block_execs), qty(q[2], st->builds), qty(q[3], st->stale),
+        qty(q[4], st->invalidations), qty(q[5], st->flushes),
+        qty(q[6], sc[ARM_CI_STEP_SVC]), qty(q[7], sc[ARM_CI_STEP_CP15_TLS]),
+        qty(q[8], sc[ARM_CI_STEP_WFI]), qty(q[9], sc[ARM_CI_STEP_CP15]),
+        qty(q[10], sc[ARM_CI_STEP_CP14]), qty(q[11], sc[ARM_CI_STEP_OTHER]),
+        qty(q[12], sc[ARM_CI_STEP_EXCEPTION]), qty(q[13], sc[ARM_CI_STEP_FETCH]));
+    if (w < 0) return 0;
+    size_t len = (size_t)w < cap ? (size_t)w : cap - 1u;
+    w = snprintf(out + len, cap - len,
+        "Reference by class: VFP %s, block %s, status %s, memory %s, "
+        "media %s, PC %s, other %s\n",
+        qty(q[0], rc[ARM_CI_REF_VFP]), qty(q[1], rc[ARM_CI_REF_BLOCK]),
+        qty(q[2], rc[ARM_CI_REF_STATUS]), qty(q[3], rc[ARM_CI_REF_MEM]),
+        qty(q[4], rc[ARM_CI_REF_MEDIA]), qty(q[5], rc[ARM_CI_REF_PC]),
+        qty(q[6], rc[ARM_CI_REF_OTHER]));
+    if (w > 0) len += (size_t)w < cap - len ? (size_t)w : cap - len - 1u;
+    return len;
 }

@@ -40,6 +40,7 @@
 #import "VMSettings.h"
 #import "VMFramePublication.h"
 #import "VMAudioOutput.h"
+#import "arm_ci.h"
 
 #import <mach/mach.h>
 #import <pthread.h>
@@ -126,6 +127,7 @@ static uint64_t vm_now_ns(void) {
 - (void)noteDroppedButton;
 - (void)drainOneTouch_emulatorThread;
 - (void)drainOneButton_emulatorThread;
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired;
 - (void)beginCheckpointInputQuiesce_emulatorThread;
 - (BOOL)checkpointInputIsQuiescent_emulatorThread;
 - (void)publishBlankSnapshotLocked;
@@ -284,6 +286,16 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     vm_button_momentary_holds_t _momentaryHolds;
     BOOL              _droppedButtonLogged;
     VMAudioOutput    *_audioOutput;
+    /*
+     * Diagnostics copied by the emulator thread between chunks (the only time
+     * it may read the machine) and formatted on request by the UI thread,
+     * both under _lock: the cached interpreter's counters since this run
+     * started, and the machine's recent unmodelled hardware accesses.
+     */
+    BOOL                    _diagCiActive;
+    arm_ci_stats_t          _diagCiStats;
+    uint64_t                _diagRetired;
+    s5l_unmodelled_access_t _diagUnmodelled[S5L_UNMODELLED_LOG];
 }
 
 + (uint64_t)physFootprintBytes {
@@ -1656,6 +1668,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 
 - (void)threadMain:(id)unused {
     (void)unused;
+    /* The engine counters describe this run, like `retired` below. */
+    if (_machine.ci) arm_ci_reset_stats(_machine.ci);
     double lastPublish = vm_now();
     uint64_t retired = 0, retiredAtLastPublish = 0;
     arm_status_t status = ARM_OK;
@@ -1813,6 +1827,16 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                             (unsigned)spin.count[i]];
                     }
                     uint32_t base = region << kVMSpinRegionShift;
+                    /* What the loop is waiting on, when it is hardware we do
+                     * not model: the most recent distinct unmodelled accesses,
+                     * with their pcs and repeat counts. */
+                    char unmodelled[1024];
+                    (void)s5l_unmodelled_describe(_machine.unmodelled,
+                                                  S5L_UNMODELLED_LOG, 6u,
+                                                  unmodelled, sizeof unmodelled);
+                    [self appendConsole:[NSString stringWithFormat:
+                        @"[stall] recent unmodelled hardware accesses:\n%s",
+                        unmodelled]];
                     [self appendConsole:[NSString stringWithFormat:
                         @"[stall] at %.1f M insn the guest is looping in %u "
                         @"region%@: 0x%08x-0x%08x took %u of %u samples, cpsr "
@@ -1894,6 +1918,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 double instantRate = elapsed > 0
                     ? (double)(retired - retiredAtLastPublish) / elapsed : 0.0;
                 [self publishRetired:retired rate:instantRate status:status];
+                [self publishDiagnostics_emulatorThread:retired];
                 lastPublish = now;
                 retiredAtLastPublish = retired;
             }
@@ -2146,6 +2171,43 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     }
     pthread_mutex_unlock(&_lock);
     return out;
+}
+
+/* Emulator thread only, between chunks. */
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired {
+    arm_ci_stats_t stats;
+    BOOL active = _machine.ci != NULL;
+    if (active) arm_ci_get_stats(_machine.ci, &stats);
+    else memset(&stats, 0, sizeof stats);
+    pthread_mutex_lock(&_lock);
+    _diagCiActive = active;
+    _diagCiStats = stats;
+    _diagRetired = retired;
+    memcpy(_diagUnmodelled, _machine.unmodelled, sizeof _diagUnmodelled);
+    pthread_mutex_unlock(&_lock);
+}
+
+- (NSString *)diagnosticsDescription {
+    arm_ci_stats_t stats;
+    s5l_unmodelled_access_t accesses[S5L_UNMODELLED_LOG];
+    pthread_mutex_lock(&_lock);
+    BOOL active = _diagCiActive;
+    uint64_t retired = _diagRetired;
+    stats = _diagCiStats;
+    memcpy(accesses, _diagUnmodelled, sizeof accesses);
+    pthread_mutex_unlock(&_lock);
+
+    char engine[1024], hardware[2048];
+    if (active)
+        (void)arm_ci_describe_stats(&stats, retired, engine, sizeof engine);
+    else
+        (void)snprintf(engine, sizeof engine,
+                       "Reference interpreter in use (no engine counters).\n");
+    (void)s5l_unmodelled_describe(accesses, S5L_UNMODELLED_LOG, 12u,
+                                  hardware, sizeof hardware);
+    return [NSString stringWithFormat:
+        @"CPU engine:\n%s\nRecent unmodelled hardware accesses (most recent first):\n%s",
+        engine, hardware];
 }
 
 - (NSString *)audioStatusDescription {

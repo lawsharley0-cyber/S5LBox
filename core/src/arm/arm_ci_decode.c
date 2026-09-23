@@ -546,3 +546,69 @@ ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op) {
 }
 
 #undef TB
+
+/* ------------------------------------------------------- diagnostics --- */
+
+unsigned ci_stop_cause(uint32_t insn, bool thumb) {
+    if (thumb) {
+        if ((insn & 0xff00u) == 0xdf00u) return ARM_CI_STEP_SVC;
+        return ARM_CI_STEP_OTHER;
+    }
+    if ((insn >> 28) == 0xfu) return ARM_CI_STEP_OTHER;
+    if ((insn & 0x0f000000u) == 0x0f000000u) return ARM_CI_STEP_SVC;
+    if ((insn & 0x0c000000u) == 0x0c000000u) {               /* coprocessor */
+        const unsigned cp = (insn >> 8) & 0xfu;
+        if (cp == 15u) {
+            const bool xfer = (insn & 0x0f000010u) == 0x0e000010u;  /* MCR/MRC */
+            const bool mcr = ((insn >> 20) & 1u) == 0u;
+            const unsigned crn = (insn >> 16) & 0xfu, crm = insn & 0xfu;
+            const unsigned opc2 = (insn >> 5) & 7u;
+            if (xfer && crn == 13u) return ARM_CI_STEP_CP15_TLS;
+            if (xfer && mcr && crn == 7u && crm == 0u && opc2 == 4u)
+                return ARM_CI_STEP_WFI;
+            return ARM_CI_STEP_CP15;
+        }
+        if (cp == 14u) return ARM_CI_STEP_CP14;
+    }
+    return ARM_CI_STEP_OTHER;
+}
+
+unsigned ci_ref_class(uint32_t insn, bool thumb) {
+    if (thumb) {
+        const uint32_t t = insn & 0xffffu;
+        if ((t & 0xfc00u) == 0x4400u) return ARM_CI_REF_PC;   /* hi regs, BX, BLX */
+        if ((t & 0xf600u) == 0xb400u || (t & 0xf000u) == 0xc000u)
+            return ARM_CI_REF_BLOCK;                          /* PUSH/POP, LDMIA/STMIA */
+        if ((t & 0xf800u) == 0xe800u) return ARM_CI_REF_PC;   /* BLX suffix */
+        if ((t & 0xffe0u) == 0xb660u || (t & 0xfff7u) == 0xb650u)
+            return ARM_CI_REF_STATUS;                         /* CPS, SETEND */
+        if ((t & 0xf800u) == 0x4800u || ((t >> 12) >= 5u && (t >> 12) <= 9u))
+            return ARM_CI_REF_MEM;
+        return ARM_CI_REF_OTHER;
+    }
+    if ((insn >> 28) == 0xfu) return ARM_CI_REF_OTHER;
+    const unsigned top = (insn >> 25) & 7u;
+    const bool rd_pc = ((insn >> 12) & 0xfu) == 15u;
+    if ((insn & 0x0c000000u) == 0x0c000000u) {
+        const unsigned cp = (insn >> 8) & 0xfu;
+        return (cp == 10u || cp == 11u) ? ARM_CI_REF_VFP : ARM_CI_REF_OTHER;
+    }
+    if (top == 4u) return ARM_CI_REF_BLOCK;
+    if (top == 3u && (insn & 0x10u)) return ARM_CI_REF_MEDIA;
+    if (top == 2u || top == 3u) return rd_pc ? ARM_CI_REF_PC : ARM_CI_REF_MEM;
+    if (top == 0u && (insn & 0x90u) == 0x90u) {
+        if ((insn & 0x60u) != 0u) return rd_pc ? ARM_CI_REF_PC : ARM_CI_REF_MEM;
+        if ((insn & 0x0f800ff0u) == 0x01800f90u || (insn & 0x0fb00ff0u) == 0x01000090u)
+            return ARM_CI_REF_MEM;                            /* exclusives, SWP */
+        return ARM_CI_REF_MEDIA;                              /* multiplies */
+    }
+    const unsigned opc = (insn >> 21) & 0xfu;
+    const bool S = (insn >> 20) & 1u;
+    if (opc >= 8u && opc <= 11u && !S) {
+        if ((insn & 0x0f900090u) == 0x01000080u) return ARM_CI_REF_MEDIA;  /* DSP */
+        if ((insn & 0x0ffffff0u) == 0x012fff10u || (insn & 0x0ffffff0u) == 0x012fff30u)
+            return ARM_CI_REF_PC;                             /* BX/BLX pc */
+        return ARM_CI_REF_STATUS;
+    }
+    return rd_pc ? ARM_CI_REF_PC : ARM_CI_REF_OTHER;
+}

@@ -386,3 +386,23 @@ device itself.
 3. The "Force Interpreter" toggle (Developer Mode → machine menu) now ships
    in the app and is generally useful for any future "is this an emulator
    bug or a translation bug" question, not just this one.
+
+# 2026-09-23 Device-side evidence for the BSU loop, without a disassembler
+
+The trace above stopped at "the device the `+0x400` register actually belongs
+to is still unidentified". The machine now keeps, always on, the most recent
+distinct accesses to hardware it does not model (unmapped addresses and
+storage-only stubs), each with the guest pc, the value, and a repeat count
+(`s5l8900_t::unmodelled`, `s5l_unmodelled_describe()`). A driver spinning on
+a register it is waiting for shows up as a few lines with large counts.
+
+To capture it on the device: boot, reproduce the freeze (it also fires on its
+own after `launchd[N] Builtin profile: MobileMail (seatbelt)`; Settings >
+Sounds makes it visible), wait for the console's `[stall]` line, which now
+prints the most recent unmodelled accesses, then open Performance & Sound
+Details and Copy Report. The pcs resolve to kernel symbols with
+`machoinfo <kernel> -r <pc>`; the address and region name say which window
+(`sram/amc`, a stub such as `clkrstgen`, or plain unmapped) the driver is
+polling, and the value says what it keeps reading. That is the input a
+register model needs; nothing is changed in the guest by collecting it.
+

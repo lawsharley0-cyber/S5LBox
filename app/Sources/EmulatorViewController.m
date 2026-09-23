@@ -1187,7 +1187,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
          "Measured window: %.1f s\nChanged scanouts: %llu\nLayer submissions: %llu\n"
          "Guest time / wall time: %.2fx (approximate)\n"
          "Longest scanout interval: %.1f ms\nScanout gaps >100 ms: %llu\n"
-         "Average image work: %.2f ms\n\n%@\n\n"
+         "Average image work: %.2f ms\n\n%@\n\n%@\n"
          "Layer submissions are not measured on-screen FPS. Start Show Performance, use the guest for 60 seconds, then reopen this report. Guest time is instruction-based, not cycle accurate.",
         host.machine, UIDevice.currentDevice.systemVersion, revision,
         [_engine statusLine] ?: @"No machine", seconds,
@@ -1196,7 +1196,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         state.scanout_max_attempt_gap_ns / 1e6,
         (unsigned long long)state.scanout_attempt_gaps_over_100ms,
         state.layer_attempts ? (double)state.layer_total_work_ns / state.layer_attempts / 1e6 : 0,
-        [_engine audioStatusDescription] ?: @"Audio status unavailable"];
+        [_engine audioStatusDescription] ?: @"Audio status unavailable",
+        [_engine diagnosticsDescription] ?: @"Diagnostics unavailable"];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Performance & Sound"
         message:report preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Copy Report" style:UIAlertActionStyleDefault

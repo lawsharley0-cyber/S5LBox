@@ -11,6 +11,7 @@
 #include "soc.h"
 #include "arm_ci.h"
 #include "../arm/a64_static_engine.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -113,6 +114,47 @@ bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
     uint64_t b0 = b, b1 = b0 + blen;
     if (!alen || !blen) return false;
     return b0 < a1 && a0 < b1;
+}
+
+/* The SoC region an unmodelled address falls in, for the diagnostic log.
+ * The DRAM row names the whole fitted aperture; an unmapped address inside it
+ * is beyond this machine's configured RAM. */
+static const char *soc_region_name(uint32_t addr) {
+    for (unsigned i = 0; i < sizeof SOC_REGIONS / sizeof SOC_REGIONS[0]; i++)
+        if (addr - SOC_REGIONS[i].base < SOC_REGIONS[i].size)
+            return SOC_REGIONS[i].name;
+    return NULL;
+}
+
+size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
+                               unsigned max_lines, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!log) return 0;
+    size_t len = 0;
+    uint64_t below = UINT64_MAX;          /* emit strictly decreasing recency */
+    for (unsigned line = 0; line < max_lines; line++) {
+        const s5l_unmodelled_access_t *best = NULL;
+        for (unsigned i = 0; i < n; i++)
+            if (log[i].seq && log[i].seq < below && (!best || log[i].seq > best->seq))
+                best = &log[i];
+        if (!best) break;
+        below = best->seq;
+        int w = snprintf(out + len, cap - len,
+                         "pc %08x %s %08x %s %08x x%u%s%s (%s%s%s)\n",
+                         best->pc, best->write ? "W" : "R", best->addr,
+                         best->write ? "<-" : "->", best->value, best->count,
+                         best->count == UINT32_MAX ? "+" : "",
+                         best->bytes == 4u ? "" : best->bytes == 2u ? " h" : " b",
+                         best->stub ? "stub" : "unmapped",
+                         best->region ? " " : "",
+                         best->region ? best->region : "");
+        if (w < 0) break;
+        if ((size_t)w >= cap - len) { len = cap - 1u; break; }
+        len += (size_t)w;
+    }
+    if (len == 0) len = (size_t)snprintf(out, cap, "(no unmodelled accesses)\n");
+    return len < cap ? len : cap - 1u;
 }
 
 unsigned s5l8900_soc_regions(const s5l_window_t **out) {
@@ -312,6 +354,41 @@ static void note_unmapped(s5l8900_t *m, uint32_t addr) {
         m->unmapped_addr[m->unmapped_addr_count++] = page;
 }
 
+static const char *soc_region_name(uint32_t addr);
+
+/* Record one unmodelled access in m->unmodelled: update the entry for the
+ * same (pc, addr, direction) if there is one, else take an empty slot or the
+ * least recent one. Only reached on the slow unmodelled paths. */
+static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
+                            unsigned bytes, bool is_write, const s5l_stub_t *stub) {
+    const uint32_t pc = m->cpu.r[15];
+    s5l_unmodelled_access_t *slot = NULL, *oldest = &m->unmodelled[0];
+    for (unsigned i = 0; i < S5L_UNMODELLED_LOG; i++) {
+        s5l_unmodelled_access_t *e = &m->unmodelled[i];
+        if (!e->seq) { if (!slot) slot = e; continue; }
+        if (e->pc == pc && e->addr == addr && e->write == (uint8_t)is_write) {
+            slot = e;
+            break;
+        }
+        if (e->seq < oldest->seq) oldest = e;
+    }
+    if (!slot) slot = oldest;
+    if (slot->seq && slot->pc == pc && slot->addr == addr &&
+        slot->write == (uint8_t)is_write) {
+        if (slot->count != UINT32_MAX) slot->count++;
+    } else {
+        slot->pc = pc;
+        slot->addr = addr;
+        slot->write = (uint8_t)is_write;
+        slot->stub = stub ? 1u : 0u;
+        slot->region = stub ? stub->name : soc_region_name(addr);
+        slot->count = 1u;
+    }
+    slot->value = val;
+    slot->bytes = (uint8_t)bytes;
+    slot->seq = ++m->unmodelled_seq;
+}
+
 static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write) {
     if (!m->trace_devices || m->dev_count >= S5L_DEVLOG) return;
     m->dev_addr[m->dev_count]     = addr;
@@ -473,11 +550,13 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         if (!s) {
             m->unmapped_reads++;
             note_unmapped(m, addr);
+            note_unmodelled(m, addr, 0, bytes, false, NULL);
             note_device(m, addr, 0, false);
             return 0;
         }
         s->reads++;
         v = stub_read(s, addr, bytes);
+        note_unmodelled(m, addr, v, bytes, false, s);
     }
     note_device(m, addr, v, false);
     return v;
@@ -644,12 +723,14 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         if (s) {
             s->writes++;
             note_device(m, addr, val, true);
+            note_unmodelled(m, addr, val, bytes, true, s);
             stub_write(s, addr, val, bytes);
             return;
         }
     }
     m->unmapped_writes++;
     note_unmapped(m, addr);
+    note_unmodelled(m, addr, val, bytes, true, NULL);
     note_device(m, addr, val, true);
 }
 

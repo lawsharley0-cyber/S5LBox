@@ -3886,6 +3886,36 @@ typedef struct {
     uint64_t    oob;                  /* accesses past the backing store */
 } s5l_stub_t;
 
+/*
+ * One recent access to hardware this machine does not model: an address no
+ * device claims (unmapped) or a declared storage stub. Kept in a small table
+ * of the most recent DISTINCT (pc, address, direction) triples with a repeat
+ * count, so a driver spinning on a register it is waiting for shows up as a
+ * handful of entries with large counts instead of scrolling everything else
+ * out. Host-side diagnostics only: not machine state, not snapshotted.
+ */
+#define S5L_UNMODELLED_LOG 32u
+
+typedef struct {
+    uint32_t    pc;       /* cpu.r[15] when the access was made              */
+    uint32_t    addr;     /* physical address                                 */
+    uint32_t    value;    /* last value read (as answered) or written          */
+    uint32_t    count;    /* accesses of this triple, saturating              */
+    uint64_t    seq;      /* recency: larger is more recent; 0 = empty slot   */
+    const char *region;   /* stub name or SoC region name; NULL if none       */
+    uint8_t     write;
+    uint8_t     stub;     /* 1: declared storage stub, 0: unmapped            */
+    uint8_t     bytes;
+    uint8_t     pad;
+} s5l_unmodelled_access_t;
+
+/* Format a copy of the table, most recent first, at most max_lines lines,
+ * into out (always NUL-terminated when cap > 0). Returns the length written.
+ * Takes the table rather than the machine so a frontend can copy it between
+ * run chunks and format it on another thread. */
+size_t s5l_unmodelled_describe(const s5l_unmodelled_access_t *log, unsigned n,
+                               unsigned max_lines, char *out, size_t cap);
+
 /* ------------------------------------------------------------- machine ---
  * Wires the CPU to RAM and the peripherals through one arm_bus_t.
  */
@@ -3960,6 +3990,11 @@ typedef struct {
     uint32_t   dev_value[S5L_DEVLOG];
     bool       dev_is_write[S5L_DEVLOG];
     unsigned   dev_count;
+
+    /* Always on (it costs nothing on RAM or modelled-device accesses): the
+     * recent unmodelled accesses, see s5l_unmodelled_access_t. */
+    s5l_unmodelled_access_t unmodelled[S5L_UNMODELLED_LOG];
+    uint64_t   unmodelled_seq;
 
     /*
      * How fast guest time runs relative to guest work. See S5L8900_CPU_HZ.

@@ -135,6 +135,12 @@ typedef void (^VMEngineStopCompletion)(void);
 - (NSString *)audioStatusDescription;
 - (void)playAudioTestTone;
 
+/* The cached interpreter's counters for this run (what share of instructions
+ * it retired and why the rest went to the reference interpreter) and the
+ * machine's most recent accesses to hardware it does not model. Refreshed
+ * with the status line; safe on any thread. */
+- (NSString *)diagnosticsDescription;
+
 /*
  * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
  * the build-time compact AArch64 engine compiled in, this forces every guest

@@ -57,6 +57,33 @@ typedef enum {
     ARM_CI_STOP_STATUS      /* an instruction returned a non-OK status        */
 } arm_ci_stop_t;
 
+/* Why an instruction was handed to arm_step instead of the engine (a STEP
+ * stop), for arm_ci_stats_t.step_cause. */
+typedef enum {
+    ARM_CI_STEP_SVC = 0,        /* SVC / SWI                                   */
+    ARM_CI_STEP_CP15_TLS,       /* MRC/MCR p15 c13 (thread / context ID)       */
+    ARM_CI_STEP_WFI,            /* MCR p15, 0, rX, c7, c0, 4                    */
+    ARM_CI_STEP_CP15,           /* any other CP15 (caches, TLB, barriers, ...)  */
+    ARM_CI_STEP_CP14,
+    ARM_CI_STEP_OTHER,          /* BKPT, undefined, CPS/SRS/RFE, reserved      */
+    ARM_CI_STEP_EXCEPTION,      /* pending IRQ/FIQ/abort or invalid mode        */
+    ARM_CI_STEP_FETCH,          /* PC misaligned, not in RAM, or fetch fault    */
+    ARM_CI_STEP_CAUSES
+} arm_ci_step_cause_t;
+
+/* Instructions decoded as "run the reference" (CI_K_REF), by class, for
+ * arm_ci_stats_t.ref_class. */
+typedef enum {
+    ARM_CI_REF_OTHER = 0,
+    ARM_CI_REF_VFP,             /* coprocessor 10/11                            */
+    ARM_CI_REF_BLOCK,           /* LDM/STM forms without a fast path            */
+    ARM_CI_REF_STATUS,          /* MSR, MRS, CPS, SETEND, other misc DP space   */
+    ARM_CI_REF_MEM,             /* single/extra/exclusive load-store corner     */
+    ARM_CI_REF_MEDIA,           /* media, saturating and DSP multiplies         */
+    ARM_CI_REF_PC,              /* writes or reads PC in a special way          */
+    ARM_CI_REF_CLASSES
+} arm_ci_ref_class_t;
+
 typedef struct {
     uint64_t runs;              /* arm_ci_run calls                          */
     uint64_t retired;           /* instructions retired by the engine        */
@@ -71,7 +98,17 @@ typedef struct {
     uint64_t verify_mismatch;   /* verify mode: cached code != RAM (a bug)   */
     uint64_t stop[4];           /* by arm_ci_stop_t                          */
     uint64_t mem_fast, mem_slow;/* data accesses by path                     */
+    uint64_t step_cause[ARM_CI_STEP_CAUSES];  /* STEP stops, by cause        */
+    uint64_t ref_class[ARM_CI_REF_CLASSES];   /* decoded-REF ops retired     */
+    uint64_t ref_fallback;      /* specialised ops that took the reference
+                                   path at run time (TLB miss, MMIO, ...)     */
 } arm_ci_stats_t;
+
+/* One human-readable summary of the counters. total_retired, when non-zero,
+ * is every instruction the machine retired (engine plus arm_step), so the
+ * engine's share can be shown. Always NUL-terminates when cap > 0. */
+size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
+                             char *out, size_t cap);
 
 arm_ci_t *arm_ci_create(const arm_ci_config_t *cfg);
 void      arm_ci_destroy(arm_ci_t *ci);

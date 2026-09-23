@@ -38398,15 +38398,10 @@ external_md_work_ready:
 
     if (ci_stats && mach.ci) {
         arm_ci_stats_t cs;
+        char text[2048];
         arm_ci_get_stats(mach.ci, &cs);
-        printf("cached interpreter: %" PRIu64 " runs, %" PRIu64 " retired "
-               "(%" PRIu64 " via reference), %" PRIu64 " block executions\n",
-               cs.runs, cs.retired, cs.ref_retired, cs.block_execs);
-        printf("  lookups %" PRIu64 ", hits %" PRIu64 ", builds %" PRIu64
-               " (%" PRIu64 " ops), stale %" PRIu64 ", flushes %" PRIu64
-               ", invalidations %" PRIu64 "\n",
-               cs.lookups, cs.hits, cs.builds, cs.build_ops, cs.stale,
-               cs.flushes, cs.invalidations);
+        (void)arm_ci_describe_stats(&cs, mach.cpu.cycles, text, sizeof text);
+        printf("cached interpreter:\n%s", text);
         printf("  stops: budget %" PRIu64 ", step %" PRIu64 ", event %" PRIu64
                ", status %" PRIu64 "; slow memory translations %" PRIu64 "\n",
                cs.stop[ARM_CI_STOP_BUDGET], cs.stop[ARM_CI_STOP_STEP],
@@ -38416,6 +38411,12 @@ external_md_work_ready:
             printf("  verify: %" PRIu64 " stale block(s) caught%s\n",
                    cs.verify_mismatch,
                    cs.verify_mismatch ? "  <-- a guest write escaped invalidation" : "");
+    }
+    if (ci_stats || ci_verify) {
+        char text[4096];
+        (void)s5l_unmodelled_describe(mach.unmodelled, S5L_UNMODELLED_LOG, 16u,
+                                      text, sizeof text);
+        printf("recent unmodelled hardware accesses (most recent first):\n%s", text);
     }
 
     /* A terminal CPU status can end the run before a statically reachable

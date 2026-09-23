@@ -49,7 +49,23 @@ These are correct (the reference code runs them) but not fast:
 - `arm_ci_stats_t.mem_fast` is never incremented (the fast path is kept free
   of counters); it always reads 0.
 
-## 3. Pre-existing reference-interpreter gap found during this work
+## 3. Guest app (IPA) install: probably not visible on the home screen yet
+
+`VMUserAppInstall.c` copies a validated, unencrypted legacy IPA into the
+guest disk at `/Applications/<bundle-id>.app`, and a machine with a user app
+boots with guest code-signing enforcement off (`VMFirmwareBoot.c`). Nothing
+refreshes SpringBoard's MobileInstallation cache
+(`/var/mobile/Library/Caches/com.apple.mobile.installation.plist`), which is
+what iPhone OS 3's SpringBoard builds its icon list from; the Cydia payload
+path does this by running `uicache` in the guest (`VMGuestRootfsPlan.c`),
+the user-app path does not, and a stock image has no `uicache` or shell to
+run. No real app has been installed end to end (`APP_COMPATIBILITY.md`: no
+test apps), so this is unconfirmed. To check: install one small, unencrypted
+iPhone OS 3-era app you own and see whether its icon appears after boot. If
+it does not, the fix is either a host-side rewrite of that cache in the disk
+image (the HFS writer is create-only today) or a guest-side refresh.
+
+## 4. Pre-existing reference-interpreter gap found during this work
 
 **A host that clears `SCTLR.M` directly, without calling
 `arm_mmu_tlb_flush()`, keeps getting the old translation from the reference
@@ -64,7 +80,7 @@ host-side misuse. Nothing in the repository clears M directly on a running
 machine. Contract until fixed: after changing `SCTLR.M` from the host, call
 `arm_mmu_tlb_flush(&m->cpu)`.
 
-## 4. Bugs found and fixed by this work (for the record)
+## 5. Bugs found and fixed by this work (for the record)
 
 | Where | Bug | Found by | Fixed in |
 |---|---|---|---|
@@ -73,7 +89,7 @@ machine. Contract until fixed: after changing `SCTLR.M` from the host, call
 | Engine | host TLBs and (later) block map outlived `arm_reset`, snapshot restore and a host SCTLR.M clear | code review while adding the map; `test_ci_translation` | `e06c8e7` |
 | Engine | `base` local in LDM/STM handlers shadowed the block base used by `PC_OF` (latent) | `-Wpointer-to-int-cast` when dispatch was inlined | `a50b124` |
 
-## 5. Repository hygiene
+## 6. Repository hygiene
 
 - The baseline tag `baseline-pre-cached-interpreter` exists only in the
   session clone: the git proxy refused the tag push. The baseline is commit
@@ -83,7 +99,7 @@ machine. Contract until fixed: after changing `SCTLR.M` from the host, call
   superseded by `CURRENT_ARCHITECTURE.md` and `ICUBE_DOLPHIN_RESEARCH.md`
   (each carries a note); they are kept for history.
 
-## 6. Existing emulator limitations (not caused by the CPU work)
+## 7. Existing emulator limitations (not caused by the CPU work)
 
 Carried from `CURRENT_ARCHITECTURE.md` §8, sources README, `QUALITY.md`,
 `ROADMAP.md`, `audio.md`:
