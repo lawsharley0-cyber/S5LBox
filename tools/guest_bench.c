@@ -24,17 +24,21 @@
 #define MB_USER   8u
 #define MB_RESULT 12u
 #define MB_DONE   16u
+#define MB_FIQ    20u
+/* Device pages start.S uses for the optional timer FIQ. */
+#define GB_TIMER_VA 0x00fe0000u
+#define GB_VIC_VA   0x00ff0000u
 
 typedef struct {
     const uint8_t *image;
-    uint32_t size, entry, mbox, bss_end;
+    uint32_t size, entry, mbox, bss_end, fiq_counter;
 } gb_image_t;
 
 static const gb_image_t g_images[GB_ISA_COUNT] = {
     { guest_bench_arm_image, GUEST_BENCH_ARM_SIZE, GUEST_BENCH_ARM_START,
-      GUEST_BENCH_ARM_MBOX, GUEST_BENCH_ARM_BSSEND },
+      GUEST_BENCH_ARM_MBOX, GUEST_BENCH_ARM_BSSEND, GUEST_BENCH_ARM_FIQCOUNTER },
     { guest_bench_thumb_image, GUEST_BENCH_THUMB_SIZE, GUEST_BENCH_THUMB_START,
-      GUEST_BENCH_THUMB_MBOX, GUEST_BENCH_THUMB_BSSEND },
+      GUEST_BENCH_THUMB_MBOX, GUEST_BENCH_THUMB_BSSEND, GUEST_BENCH_THUMB_FIQCOUNTER },
 };
 
 #if defined(CLOCK_MONOTONIC)
@@ -115,6 +119,11 @@ static void build_tables(s5l8900_t *m) {
             poke32(m, l2 + p * 4u, (GB_RAM_BASE + va) | 0x032u);
         }
     }
+    /* Two device pages for the optional timer FIQ: MMIO through the MMU. */
+    poke32(m, GB_L2_PA + (GB_TIMER_VA >> 20) * 1024u + ((GB_TIMER_VA >> 12) & 0xffu) * 4u,
+           S5L8900_TIMER_BASE | 0x032u);
+    poke32(m, GB_L2_PA + (GB_VIC_VA >> 20) * 1024u + ((GB_VIC_VA >> 12) & 0xffu) * 4u,
+           S5L8900_VIC0_BASE | 0x032u);
 }
 
 static uint64_t fnv64(uint64_t h, const void *data, size_t n) {
@@ -181,6 +190,7 @@ bool gb_run(const gb_config_t *cfg, gb_result_t *out) {
     poke32(m, GB_RAM_BASE + img->mbox + MB_ID, cfg->workload);
     poke32(m, GB_RAM_BASE + img->mbox + MB_SCALE, cfg->scale);
     poke32(m, GB_RAM_BASE + img->mbox + MB_USER, cfg->user ? 1u : 0u);
+    poke32(m, GB_RAM_BASE + img->mbox + MB_FIQ, cfg->fiq_period);
     build_tables(m);
 
     arm_cpu_t *c = &m->cpu;
@@ -216,6 +226,7 @@ bool gb_run(const gb_config_t *cfg, gb_result_t *out) {
     out->seconds = seconds;
     out->final_pc = c->r[15];
     out->final_cpsr = c->cpsr;
+    out->fiqs = peek32(m, GB_RAM_BASE + img->fiq_counter);
     out->state_digest = state_digest(m);
 
     s5l8900_free(m);

@@ -206,10 +206,12 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 125776 adds the host-only CPU backend selection (s5l8900_cpu_backend_t, 4
  * bytes plus tail padding). It is execution policy, not guest state, and is
  * deliberately outside snap_mach().
+ * 125784 adds the cached interpreter pointer (8): a cache derived from guest
+ * RAM, never serialised; restore flushes it (s5l8900_ram_replaced).
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         125776, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         125784, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -1531,6 +1533,9 @@ static snapshot_status_t snap_validate_structure(const s5l8900_t *m, FILE *f,
 
 static snapshot_status_t snap_apply(s5l8900_t *m, FILE *f,
                                     const uint8_t *in, size_t in_len) {
+    /* Guest RAM is about to be replaced wholesale (possibly partially, on an
+     * I/O error): nothing the cached interpreter derived from it survives. */
+    s5l8900_ram_replaced(m);
     sn_io_t io = {0};
     io.mode = SN_LOAD; io.f = f; io.in = in; io.in_len = in_len;
     io.hash = FNV64_OFFSET;

@@ -32,7 +32,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "bench", "guest")
 OUT = os.path.join(SRC, "generated", "guest_images.h")
 INPUTS = ["start.S", "runtime.c", "workloads.c", "workloads.h", "link.ld"]
-SYMBOLS = ["_start", "mbox", "svc_counter", "wl_arena", "__bss_end"]
+SYMBOLS = ["_start", "mbox", "svc_counter", "fiq_counter", "wl_arena", "__bss_end"]
 
 COMMON = ["--target=armv6kz-none-eabi", "-mcpu=arm1176jzf-s", "-O2",
           "-ffreestanding", "-fno-builtin", "-nostdlib", "-fno-pic",

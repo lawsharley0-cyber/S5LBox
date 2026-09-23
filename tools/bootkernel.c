@@ -37158,6 +37158,8 @@ external_md_work_ready:
         bridge_config.ram_size = UINT64_C(128) << 20;
         bridge_config.ram = mach.ram;
         bridge_config.block = file_block_get(external_block_adapter);
+        bridge_config.ram_written = s5l8900_ram_written_callback;
+        bridge_config.ram_written_context = &mach;
         md_raw_bridge_config_t raw_config;
         memset(&raw_config, 0, sizeof raw_config);
         raw_config.site.pc = IOS3_KERNEL_PATCH_RAW_WATCHER_VA;
@@ -37176,6 +37178,8 @@ external_md_work_ready:
         raw_config.ram_size = UINT64_C(128) << 20;
         raw_config.ram = mach.ram;
         raw_config.block = file_block_get(external_block_adapter);
+        raw_config.ram_written = s5l8900_ram_written_callback;
+        raw_config.ram_written_context = &mach;
 
         if (!md_bridge_config_valid(&bridge_config) ||
             !md_raw_bridge_config_valid(&raw_config)) {
@@ -37381,15 +37385,17 @@ external_md_work_ready:
     vm_resolve();
     printf("\n");
 
-    s5l8900_set_cpu_backend(&mach, cpu_backend_choice);
+    if (!s5l8900_set_cpu_backend(&mach, cpu_backend_choice)) {
+        fprintf(stderr, "could not allocate the cached interpreter\n");
+        return 1;
+    }
     if (cpu_backend_choice != S5L8900_CPU_BACKEND_INTERPRETER) {
-        const char *bname = (cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached-block" :
-                            (cpu_backend_choice == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "ir-optimized" : "jit";
-        /* Say what actually executes, not only what was asked for: the
-         * backend only matters on the --run-api path, and until the cached
-         * interpreter is wired in every request runs on arm_step. */
-        printf("cpu backend: %s requested; executing on the reference "
-               "interpreter\n", bname);
+        /* ir and jit are retired names for the same engine (soc.h). It is
+         * used only on the --run-api path: the diagnostic loop below calls
+         * arm_step() directly so it can observe every instruction. */
+        printf("cpu backend: cached interpreter%s\n",
+               cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK
+                   ? "" : " (requested by a retired alias)");
     }
 
     arm_status_t st = ARM_OK;

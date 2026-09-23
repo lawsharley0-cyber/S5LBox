@@ -18,6 +18,8 @@ endif()
 # This same static library is what the iOS app links against.
 add_library(emucore STATIC
     src/arm/arm_interp.c
+    src/arm/arm_ci.c
+    src/arm/arm_ci_decode.c
     src/arm/vfp.c
     src/arm/a64_static_engine.c
     src/mmu.c
@@ -1448,6 +1450,13 @@ endif()
 
 add_executable(cpubench ../tools/cpubench.c)
 target_link_libraries(cpubench PRIVATE guest_bench)
+
+# Cached interpreter vs reference interpreter on random instruction sequences
+# (every architectural bit compared). The argument is cases per ISA; run it
+# with a larger count locally after any engine change.
+add_executable(test_ci_diff tests/test_ci_diff.c)
+target_link_libraries(test_ci_diff PRIVATE emucore)
+add_test(NAME cached_interpreter_differential COMMAND test_ci_diff 10000)
 
 add_executable(test_guest_workloads tests/test_guest_workloads.c)
 target_link_libraries(test_guest_workloads PRIVATE guest_bench)

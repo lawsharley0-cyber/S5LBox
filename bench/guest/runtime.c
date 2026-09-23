@@ -13,13 +13,14 @@
 #include "workloads.h"
 
 struct mailbox {
-    uint32_t id, scale, user, result, done;
+    uint32_t id, scale, user, result, done, fiq_period;
 };
 
 __attribute__((section(".mbox"), used))
 volatile struct mailbox mbox;
 
 volatile uint32_t svc_counter;
+volatile uint32_t fiq_counter;
 
 __attribute__((aligned(4096)))
 uint8_t wl_arena[WL_ARENA_BYTES];

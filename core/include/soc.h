@@ -26,6 +26,8 @@
  * names them keeps compiling; see s5l8900_set_cpu_backend() for what each
  * selects today.
  */
+struct arm_ci;
+
 typedef enum {
     S5L8900_CPU_BACKEND_INTERPRETER = 0,
     S5L8900_CPU_BACKEND_CACHED_BLOCK,
@@ -4143,6 +4145,10 @@ typedef struct {
      * compute.
      */
     s5l8900_cpu_backend_t     cpu_backend;
+    /* The cached interpreter (core/include/arm_ci.h) when a non-interpreter
+     * backend is selected; its blocks are derived from guest RAM and are
+     * never serialised. */
+    struct arm_ci            *ci;
 } s5l8900_t;
 
 /*
@@ -4640,13 +4646,37 @@ uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m);
 uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m);
 
 /*
- * Select the CPU backend used by s5l8900_run(). Today every value executes
- * through the reference interpreter: the CACHED_BLOCK / IR_OPTIMIZED / JIT
- * tiers added in 75ad89f were removed because they computed wrong results
- * (docs/CURRENT_ARCHITECTURE.md section 7). The request is recorded so
- * frontends keep their settings, and get() reports what was requested.
+ * Select the CPU backend used by s5l8900_run().
+ *
+ *   INTERPRETER   arm_step(), the specification (default).
+ *   CACHED_BLOCK  the cached interpreter (core/include/arm_ci.h): blocks of
+ *                 predecoded, specialised operations; bit-exact with
+ *                 INTERPRETER, including retirement counts and device timing.
+ *   IR_OPTIMIZED, JIT
+ *                 retired names kept so existing frontends compile; both now
+ *                 select the cached interpreter. The tiers that used to sit
+ *                 behind them computed wrong results and were removed
+ *                 (docs/CURRENT_ARCHITECTURE.md section 7). No runtime code
+ *                 generation exists behind any value.
+ *
+ * While the cached interpreter is selected the optional signed-static
+ * AArch64 engine is bypassed, so an A/B compares one engine with another.
+ * Pre-step hooks (HLE) run on the interpreter path. Returns false only if the
+ * engine could not be allocated (the machine then stays on the interpreter).
  */
-void                  s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend);
+bool                  s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend);
 s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m);
+
+/*
+ * Guest RAM was written by host code that bypasses the bus (disk bridges,
+ * loaders, patchers). Cached code overlapping [pa, pa+len) is invalidated.
+ * s5l8900_ram_replaced() is the wholesale form (snapshot restore). Both are
+ * no-ops on the interpreter backend.
+ */
+void s5l8900_note_ram_write(s5l8900_t *m, uint32_t pa, uint32_t len);
+void s5l8900_ram_replaced(s5l8900_t *m);
+/* The same notification in the callback shape the memory-disk bridges use
+ * (md_bridge_config_t::ram_written); `machine` is the s5l8900_t. */
+void s5l8900_ram_written_callback(void *machine, uint64_t pa, uint64_t len);
 
 #endif /* S5LBOX_SOC_H */

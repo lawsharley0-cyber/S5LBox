@@ -40,6 +40,8 @@ static fw_status_t fw_load_img3_common(s5l8900_t *m, const uint8_t *buf,
     if (off + img.data_len > (uint64_t)m->ram_size) return FW_ERR_NO_ROOM;
 
     uint8_t *dst = &m->ram[off];
+    /* Whatever happens below, these bytes may change under cached code. */
+    s5l8900_note_ram_write(m, load_addr, (uint32_t)img.data_len);
 
     /* A KBAG we could not parse means "encrypted, but we do not know how".
      * Refuse rather than copying ciphertext in and calling it success. */

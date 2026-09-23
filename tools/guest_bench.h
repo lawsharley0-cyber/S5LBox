@@ -32,6 +32,11 @@ typedef struct {
     s5l8900_cpu_backend_t backend;
     bool                  direct_writes; /* the app's direct-RAM-write contract */
     uint64_t              max_insns;  /* 0: a generous default */
+    /* Non-zero: a periodic timer FIQ every fiq_period timebase ticks (about
+     * 68 guest instructions each), handled by the guest runtime. The
+     * workload's checksum is unaffected; the FIQ timing is visible in the
+     * state digest (LR_fiq, SPSR_fiq, the handler's counter). */
+    uint32_t              fiq_period;
 } gb_config_t;
 
 typedef struct {
@@ -44,6 +49,7 @@ typedef struct {
     double   seconds;       /* wall time inside s5l8900_run() only */
     uint64_t state_digest;  /* architectural CPU state + guest DRAM */
     uint32_t final_pc, final_cpsr;
+    uint32_t fiqs;          /* FIQs the guest handled */
 } gb_result_t;
 
 /* True when the guest completed, reported the host checksum and every

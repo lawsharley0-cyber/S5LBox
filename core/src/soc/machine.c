@@ -9,6 +9,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
+#include "arm_ci.h"
 #include "../arm/a64_static_engine.h"
 #include <stdlib.h>
 #include <string.h>
@@ -351,6 +352,17 @@ static uint8_t *machine_host_ram(void *ctx, uint32_t pa, uint32_t len) {
     return m->ram + (pa - m->ram_base);
 }
 
+/*
+ * The direct-write consent, with one refusal: a range holding cached
+ * interpreter code. Every store into it must pass bus_write(), which is where
+ * the cache is invalidated; a host pointer would let a store bypass that.
+ */
+static uint8_t *machine_host_ram_write(void *ctx, uint32_t pa, uint32_t len) {
+    s5l8900_t *m = ctx;
+    if (m && m->ci && arm_ci_range_has_code(m->ci, pa, len)) return NULL;
+    return machine_host_ram(ctx, pa, len);
+}
+
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -476,6 +488,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
 
     if (in_ram(m, addr, bytes)) {
         memcpy(&m->ram[addr - m->ram_base], &val, bytes);
+        if (m->ci) arm_ci_note_ram_write(m->ci, addr, bytes);
         return;
     }
     m->level_dirty = true;      /* a device store; see bus_read() */
@@ -695,7 +708,7 @@ bool s5l8900_set_direct_ram_writes(s5l8900_t *m, bool enabled) {
         memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
         return false;
     }
-    m->bus.host_ram_write = enabled ? machine_host_ram : NULL;
+    m->bus.host_ram_write = enabled ? machine_host_ram_write : NULL;
     /* A pointer granted under an earlier frontend contract must never survive
      * a mode change. Generation tags cannot express revoked consent. */
     memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
@@ -1529,6 +1542,8 @@ void s5l8900_free(s5l8900_t *m) {
     free(m->mbx.edram);
     m->mbx.edram = NULL;
     s5l_nor_free(&m->nor);
+    arm_ci_destroy(m->ci);
+    m->ci = NULL;
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
@@ -1537,6 +1552,7 @@ void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
     if (len > 0xffffffffu) return;
     if (!in_ram(m, addr, (uint32_t)len)) return;
     memcpy(&m->ram[addr - m->ram_base], data, len);
+    if (m->ci) arm_ci_note_ram_write(m->ci, addr, (uint32_t)len);
 }
 
 /*
@@ -2152,7 +2168,7 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
          * expensive timebase/input eligibility gate: the old order paid a
          * 64-bit divide and several scattered loads on every interpreted guest
          * instruction even though no signed state had ever been allocated. */
-        if (s5l8900_static_a64_is_enabled(m)) {
+        if (!m->ci && s5l8900_static_a64_is_enabled(m)) {
             bool known_negative = false;
             arm_status_t engine_status = ARM_OK;
             unsigned boundary_retired = 0u;
@@ -2201,6 +2217,40 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
         }
 #endif
 
+        /*
+         * The cached interpreter (arm_ci.h). It receives exactly the budget
+         * the signed engine and the tick batch below receive -- never past
+         * the next timebase edge, and nothing at all while a device level or
+         * host input is dirty -- so one s5l8900_tick() for the whole batch is
+         * the same device timeline the literal loop produces. It never runs
+         * SVC, CP14/CP15 (WFI included) or anything else that can advance
+         * device time; for those it stops with STEP and the one-instruction
+         * path at the bottom of this loop runs arm_step() + tick(1). Unlike
+         * the interpreter batch it may run privileged code, because the
+         * instructions that made that unsafe are exactly the ones it refuses.
+         */
+        bool single_step = false;
+        if (m->ci && !m->pre_step_hook) {
+            unsigned batch = run_retirement_batch_limit(m, max_steps - n,
+                                                        active_clock);
+            if (batch) {
+                arm_ci_stop_t why = ARM_CI_STOP_BUDGET;
+                arm_status_t est = ARM_OK;
+                unsigned ran = arm_ci_run(m->ci, &m->cpu, batch, &est, &why);
+                if (ran) {
+                    n += ran;
+                    run_clock_retired(m, &active_clock,
+                                      &active_pending_retired, ran,
+                                      est != ARM_OK,
+                                      m->level_dirty ||
+                                      ext_inputs(m) != m->ext_seen);
+                }
+                if (est != ARM_OK) { st = est; break; }
+                if (why != ARM_CI_STOP_STEP) continue;
+            }
+            single_step = true;
+        }
+
         /* A limit of one cannot save a tick call, so retain the smaller
          * ordinary path at the edge itself. Inside a real batch, inspect every
          * retirement boundary for the exact three events the public tick would
@@ -2208,7 +2258,7 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
          * User mode. The final lump contains only successfully retired
          * instructions; a non-OK arm_step() receives no device tick, matching
          * the literal loop exactly. */
-        unsigned limit = interpreter_tick_batch_limit(
+        unsigned limit = single_step ? 0u : interpreter_tick_batch_limit(
             m, max_steps - n, active_clock);
         if (limit > 1u) {
             unsigned retired = 0u;
@@ -2270,9 +2320,45 @@ uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m) {
     return m ? m->interpreter_tick_batched_retired : 0u;
 }
 
-void s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend) {
-    if (!m) return;
+bool s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend) {
+    if (!m) return false;
+    if (backend == S5L8900_CPU_BACKEND_INTERPRETER) {
+        arm_ci_destroy(m->ci);
+        m->ci = NULL;
+        m->cpu_backend = backend;
+        return true;
+    }
+    if (!m->ci) {
+        arm_ci_config_t cfg = {
+            .ram = m->ram, .ram_base = m->ram_base, .ram_size = m->ram_size,
+            .level_dirty = &m->level_dirty,
+        };
+        m->ci = arm_ci_create(&cfg);
+        if (!m->ci) {
+            m->cpu_backend = S5L8900_CPU_BACKEND_INTERPRETER;
+            return false;
+        }
+    }
+    /* Direct write pointers granted before the engine existed may point at
+     * what is about to become cached code; the engine refuses new ones. */
+    memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
     m->cpu_backend = backend;
+    return true;
+}
+
+void s5l8900_note_ram_write(s5l8900_t *m, uint32_t pa, uint32_t len) {
+    if (m && m->ci) arm_ci_note_ram_write(m->ci, pa, len);
+}
+
+void s5l8900_ram_replaced(s5l8900_t *m) {
+    if (m && m->ci) arm_ci_flush(m->ci);
+}
+
+void s5l8900_ram_written_callback(void *machine, uint64_t pa, uint64_t len) {
+    s5l8900_t *m = machine;
+    if (!m || !m->ci || pa > 0xffffffffu) return;
+    if (len > 0xffffffffu - pa) len = 0xffffffffu - pa + 1u;
+    arm_ci_note_ram_write(m->ci, (uint32_t)pa, (uint32_t)len);
 }
 
 s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m) {

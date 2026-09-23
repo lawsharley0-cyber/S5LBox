@@ -234,6 +234,20 @@ void arm_mmu_tlb_flush(arm_cpu_t *c) {
  * and an assignment, and caching it would mean flushing on the SCTLR.M edge
  * for no gain.
  */
+void arm_mmu_sync_stamp(arm_cpu_t *c) {
+    if (!c || !(c->cp15.sctlr & ARM_SCTLR_M)) return;
+    if (c->tlb_gen == 0u) c->tlb_gen = 1u;
+    if (!mmu_stamp_matches(c)) {
+        arm_mmu_tlb_flush(c);
+        c->tlb_stamp.sctlr      = c->cp15.sctlr;
+        c->tlb_stamp.ttbr0      = c->cp15.ttbr0;
+        c->tlb_stamp.ttbr1      = c->cp15.ttbr1;
+        c->tlb_stamp.ttbcr      = c->cp15.ttbcr;
+        c->tlb_stamp.dacr       = c->cp15.dacr;
+        c->tlb_stamp.context_id = c->cp15.context_id;
+    }
+}
+
 uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, arm_access_t acc,
                            bool priv, uint32_t *pa) {
     if (!(c->cp15.sctlr & ARM_SCTLR_M)) { *pa = va; return 0; }

@@ -48,7 +48,15 @@ static void test_direct_ram_write_consent_is_fail_closed(void) {
 
     CHECK(s5l8900_set_direct_ram_writes(&m, true),
           "canonical machine bus refused direct writes");
-    CHECK(m.bus.host_ram_write == m.bus.host_ram,
+    /* The write consent is the proven RAM pointer source, not a second one:
+     * for ordinary RAM it hands out exactly the pointers host_ram does. (It
+     * is a separate function only so the cached interpreter can refuse
+     * ranges holding cached code; see test_direct_write_refuses_cached_code.) */
+    CHECK(m.bus.host_ram_write != NULL &&
+          m.bus.host_ram_write(m.bus.ctx, 0x1000u, 0x400u) ==
+              m.bus.host_ram(m.bus.ctx, 0x1000u, 0x400u) &&
+          m.bus.host_ram_write(m.bus.ctx, 0x1000u, 0x400u) != NULL &&
+          m.bus.host_ram_write(m.bus.ctx, (1u << 20) - 0x200u, 0x400u) == NULL,
           "write pointer source differs from proven RAM pointer source");
 
     m.cpu.dwrite[0].host = m.ram;

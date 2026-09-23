@@ -1097,6 +1097,8 @@ s5l_bringup_status_t s5l_bringup(s5l8900_t *machine,
         strategy.ram_size            = machine->ram_size;
         strategy.ram                 = machine->ram;
         strategy.block               = request->root_media;
+        strategy.ram_written         = s5l8900_ram_written_callback;
+        strategy.ram_written_context = machine;
 
         md_raw_bridge_config_t raw;
         memset(&raw, 0, sizeof raw);
@@ -1117,6 +1119,8 @@ s5l_bringup_status_t s5l_bringup(s5l8900_t *machine,
         raw.ram_size                = machine->ram_size;
         raw.ram                     = machine->ram;
         raw.block                   = request->root_media;
+        raw.ram_written             = s5l8900_ram_written_callback;
+        raw.ram_written_context     = machine;
 
         if (!md_bridge_config_valid(&strategy) ||
             !md_raw_bridge_config_valid(&raw))
@@ -1134,6 +1138,10 @@ s5l_bringup_status_t s5l_bringup(s5l8900_t *machine,
                                            md);
         result->md_bridge_installed = true;
     }
+
+    /* Everything above wrote guest RAM directly. Nothing has executed yet, but
+     * a machine reused across boots may already hold cached code. */
+    s5l8900_ram_replaced(machine);
 
     /* --- 9. point the CPU at the kernel ----------------------------------- */
     machine->cpu.r[15] = result->entry_pa;

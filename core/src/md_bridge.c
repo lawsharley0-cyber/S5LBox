@@ -261,6 +261,9 @@ arm_svc_result_t md_bridge_handle_svc(void *context, arm_cpu_t *cpu,
         /* Publish only after the complete block is safely staged. */
         ram_offset = (size_t)(guest_address - config->ram_base);
         memcpy(config->ram + ram_offset, bridge->scratch, length);
+        if (config->ram_written)
+            config->ram_written(config->ram_written_context,
+                                guest_address, length);
         increment_saturating_u64(&bridge->stats.successful_reads);
         bridge->stats.bytes_read =
             add_saturating_u64(bridge->stats.bytes_read, length);

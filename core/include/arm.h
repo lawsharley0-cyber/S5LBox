@@ -611,6 +611,12 @@ bool arm_fetch_cache_try_refill(arm_cpu_t *cpu, uint32_t va, bool priv);
  * flushing less is a stale mapping that surfaces days later as a wild store.
  */
 void     arm_mmu_tlb_flush(arm_cpu_t *cpu);
+/* Perform the translation-register check every walk performs first: if SCTLR,
+ * TTBR0/1, TTBCR, DACR or CONTEXTIDR changed by a route that did not flush
+ * (direct host mutation, snapshot restore), flush now and re-stamp. A caller
+ * that caches translations of its own (the cached interpreter) calls this
+ * before trusting them. No effect with the MMU off. */
+void     arm_mmu_sync_stamp(arm_cpu_t *cpu);
 
 /* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
 arm_bank_t arm_bank_of_mode(uint32_t mode);
