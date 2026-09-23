@@ -52,6 +52,7 @@ static rootfs_work_entry_t *g_jb_entries = NULL;
 #include "sha256.h"
 #include "snapshot.h"
 #include "soc.h"
+#include "arm_ci.h"
 #if defined(S5LBOX_STATIC_A64_ENGINE)
 #include "a64_static.h"
 #include "vfp.h"
@@ -33596,6 +33597,7 @@ static void boot_print_usage(FILE *stream, const char *argv0) {
             "          [--drag <at>:<x0>:<y0>:<x1>:<y1>[:<steps>[:<span>]]] ...\n"
             "          [--fast] [--run-api] [--frame-meter]\n"
             "          [--cpu-backend <interp|cached|ir|jit> | --cached-cpu | --ir-cpu | --jit-cpu]\n"
+            "          [--ci-verify] [--ci-stats]\n"
             "          [--interpreter-control | --compact-raw-control]\n"
             "          [--canonical-bus]\n"
             "          [--no-direct-ram-writes]\n"
@@ -33621,6 +33623,11 @@ static void boot_print_usage(FILE *stream, const char *argv0) {
             "  --fast  skip the expensive per-instruction trace block. This\n"
             "      changes host overhead, not emulated hardware; diagnostic\n"
             "      reports are intentionally reduced.\n"
+            "  --ci-verify  with the cached interpreter, re-read every cached\n"
+            "      block's instruction words before running it and rebuild on any\n"
+            "      difference (counted). Slow; a check that no guest write\n"
+            "      escaped invalidation. Implies --ci-stats.\n"
+            "  --ci-stats  print the cached interpreter's counters at exit.\n"
             "  --run-api  execute in the app's 100000-instruction\n"
             "      s5l8900_run() chunks and time only those chunks. This skips\n"
             "      every per-instruction host observer while retaining CPU,\n"
@@ -34181,6 +34188,7 @@ int main(int argc, char **argv) {
     memset(&external_raw_bridge, 0, sizeof external_raw_bridge);
     memset(&external_bridge_mux, 0, sizeof external_bridge_mux);
     s5l8900_cpu_backend_t cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
+    bool ci_verify = false, ci_stats = false;
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -34191,6 +34199,14 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--cached-cpu")) {
             cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ci-verify")) {
+            ci_verify = ci_stats = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ci-stats")) {
+            ci_stats = true;
             continue;
         }
         if (!strcmp(argv[i], "--ir-cpu")) {
@@ -37393,9 +37409,14 @@ external_md_work_ready:
         /* ir and jit are retired names for the same engine (soc.h). It is
          * used only on the --run-api path: the diagnostic loop below calls
          * arm_step() directly so it can observe every instruction. */
-        printf("cpu backend: cached interpreter%s\n",
+        printf("cpu backend: cached interpreter%s%s\n",
                cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK
-                   ? "" : " (requested by a retired alias)");
+                   ? "" : " (requested by a retired alias)",
+               ci_verify ? ", verify mode" : "");
+        arm_ci_set_verify(mach.ci, ci_verify);
+    } else if (ci_verify || ci_stats) {
+        fprintf(stderr, "--ci-verify/--ci-stats need --cpu-backend cached\n");
+        return 1;
     }
 
     arm_status_t st = ARM_OK;
@@ -38373,6 +38394,28 @@ external_md_work_ready:
                     vm_block_strerror(error->block_status));
         }
         fputc('\n', stderr);
+    }
+
+    if (ci_stats && mach.ci) {
+        arm_ci_stats_t cs;
+        arm_ci_get_stats(mach.ci, &cs);
+        printf("cached interpreter: %" PRIu64 " runs, %" PRIu64 " retired "
+               "(%" PRIu64 " via reference), %" PRIu64 " block executions\n",
+               cs.runs, cs.retired, cs.ref_retired, cs.block_execs);
+        printf("  lookups %" PRIu64 ", hits %" PRIu64 ", builds %" PRIu64
+               " (%" PRIu64 " ops), stale %" PRIu64 ", flushes %" PRIu64
+               ", invalidations %" PRIu64 "\n",
+               cs.lookups, cs.hits, cs.builds, cs.build_ops, cs.stale,
+               cs.flushes, cs.invalidations);
+        printf("  stops: budget %" PRIu64 ", step %" PRIu64 ", event %" PRIu64
+               ", status %" PRIu64 "; slow memory translations %" PRIu64 "\n",
+               cs.stop[ARM_CI_STOP_BUDGET], cs.stop[ARM_CI_STOP_STEP],
+               cs.stop[ARM_CI_STOP_EVENT], cs.stop[ARM_CI_STOP_STATUS],
+               cs.mem_slow);
+        if (ci_verify)
+            printf("  verify: %" PRIu64 " stale block(s) caught%s\n",
+                   cs.verify_mismatch,
+                   cs.verify_mismatch ? "  <-- a guest write escaped invalidation" : "");
     }
 
     /* A terminal CPU status can end the run before a statically reachable

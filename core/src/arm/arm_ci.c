@@ -426,75 +426,49 @@ static bool block_matches_ram(const ci_block_t *b, const uint8_t *host) {
 typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
 
 /*
- * Run ops of one block, retiring at most `budget`. Returns the number
- * retired. EXEC_CONTINUE: control reached a new PC through an ordinary path
- * (r15 written) and the caller may look up the next block.
+ * Dispatch. With GCC and Clang every handler ends in its own copy of the
+ * dispatch -- condition check, then a computed jump through k_dispatch --
+ * so the host predicts each guest op's successor from where it is, not from
+ * one shared indirect jump. Elsewhere (MSVC) the same handlers are the cases
+ * of a switch. Both forms run the same handler bodies; the choice is
+ * measured in docs/BENCHMARK_RESULTS.md. S5LBOX_CI_SWITCH_DISPATCH forces the
+ * switch so it can be tested on any compiler.
  */
-static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
-                                unsigned budget, bool priv, unsigned *retired_out,
-                                arm_ci_stop_t *stop, arm_status_t *status) {
-    uint32_t *const R = c->r;
-    const ci_op_t *const base = b->ops;
-    const ci_op_t *op = base;
-    const ci_op_t *const end = base + (b->n < budget ? b->n : budget);
-    const ci_op_t *flushed = base;         /* cycles accounted up to here */
-    const unsigned shift = b->thumb ? 1u : 2u;
-    uint32_t next_pc = 0;
-    exec_result_t result = EXEC_CONTINUE;
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(S5LBOX_CI_SWITCH_DISPATCH)
+#  define CI_THREADED 1
+#else
+#  define CI_THREADED 0
+#endif
 
-#define PC_OF(o) (b->va + ((uint32_t)((o) - base) << shift))
+#if CI_THREADED
+#  define CI_H(label, kind)  case kind: L_##label:
+#  define CI_DISPATCH()                                                       \
+        do {                                                                  \
+            if (op->cond != CI_COND_AL && !cond_pass(c->cpsr, op->cond))      \
+                goto next;                                                    \
+            goto *k_dispatch[op->kind];                                       \
+        } while (0)
+#  define CI_NEXT()                                                           \
+        do {                                                                  \
+            if (++op == end) { next_pc = PC_OF(op); goto out; }               \
+            CI_DISPATCH();                                                    \
+        } while (0)
+#else
+#  define CI_H(label, kind)  case kind:
+#  define CI_DISPATCH()      continue
+#  define CI_NEXT()          goto next
+#endif
+#define CI_HK(name) CI_H(name, CI_K_##name)
 
-    for (;;) {
-        if (op->cond != CI_COND_AL && !cond_pass(c->cpsr, op->cond)) goto next;
+/* Every specialised kind with a handler of its own, for the dispatch table. */
+#define CI_SIMPLE_KINDS(X)                                                    \
+    X(MUL) X(MULS) X(MLA) X(MLAS) X(UMULL) X(UMLAL) X(SMULL) X(SMLAL)         \
+    X(NOP) X(CLREX) X(MRS_CPSR) X(CLZ) X(SXTB) X(SXTH) X(UXTB) X(UXTH)        \
+    X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
+    X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)
 
-        switch (op->kind) {
-
-        /* ---------------------------------------------- data processing */
-#define B_I          (op->imm)
-#define B_R          (R[op->rm])
-#define B_H          shi_val(op, R[op->rm], c->cpsr)
-#define B_X          shr_val(op->sh, R[op->rm], R[op->rs] & 0xffu)
-#define BC_I(cy)     ((cy) = op->sa ? op->sh : carry(c), op->imm)
-#define BC_R(cy)     ((cy) = carry(c), R[op->rm])
-#define BC_H(cy)     shi_carry(op, R[op->rm], c->cpsr, &(cy))
-#define BC_X(cy)     ((cy) = carry(c), shr_carry(op->sh, R[op->rm], R[op->rs] & 0xffu, &(cy)))
-
-#define LOGIC(OPC, F, B, BC, EXPR)                                              \
-        case CI_DP_KIND(OPC, F, 0): {                                          \
-            uint32_t a = R[op->rn], b2 = (B); (void)a;                         \
-            R[op->rd] = (EXPR);                                                \
-            goto next;                                                         \
-        }                                                                      \
-        case CI_DP_KIND(OPC, F, 1): {                                          \
-            uint32_t cy, b2 = BC(cy), a = R[op->rn]; (void)a;                  \
-            uint32_t r = (EXPR);                                               \
-            R[op->rd] = r;                                                     \
-            set_logic(c, r, cy);                                               \
-            goto next;                                                         \
-        }
-#define TESTOP(OPC, F, BC, EXPR)                                                \
-        case CI_DP_KIND(OPC, F, 1): {                                          \
-            uint32_t cy, b2 = BC(cy), a = R[op->rn];                           \
-            set_logic(c, (EXPR), cy);                                          \
-            goto next;                                                         \
-        }
-#define ARITH(OPC, F, B, VAL, X, Y, CIN)                                        \
-        case CI_DP_KIND(OPC, F, 0): {                                          \
-            uint32_t a = R[op->rn], b2 = (B);                                  \
-            R[op->rd] = (VAL);                                                 \
-            goto next;                                                         \
-        }                                                                      \
-        case CI_DP_KIND(OPC, F, 1): {                                          \
-            uint32_t a = R[op->rn], b2 = (B);                                  \
-            R[op->rd] = add_flags(c, (X), (Y), (CIN));                         \
-            goto next;                                                         \
-        }
-#define CMPOP(OPC, F, B, X, Y, CIN)                                             \
-        case CI_DP_KIND(OPC, F, 1): {                                          \
-            uint32_t a = R[op->rn], b2 = (B);                                  \
-            (void)add_flags(c, (X), (Y), (CIN));                               \
-            goto next;                                                         \
-        }
+/* The data-processing and memory families, shared by the handlers and the
+ * table: each form expands the per-opcode / per-access macro below. */
 #define DP_FORM(F, B, BC)                                                       \
         LOGIC(0,  F, B, BC, a & b2)                                            \
         LOGIC(1,  F, B, BC, a ^ b2)                                            \
@@ -512,118 +486,11 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
         LOGIC(13, F, B, BC, b2)                                                \
         LOGIC(14, F, B, BC, a & ~b2)                                           \
         LOGIC(15, F, B, BC, ~b2)
-
-        DP_FORM(CI_F_IMM, B_I, BC_I)
-        DP_FORM(CI_F_REG, B_R, BC_R)
-        DP_FORM(CI_F_SHI, B_H, BC_H)
+#define DP_ALL_FORMS                                                            \
+        DP_FORM(CI_F_IMM, B_I, BC_I)                                           \
+        DP_FORM(CI_F_REG, B_R, BC_R)                                           \
+        DP_FORM(CI_F_SHI, B_H, BC_H)                                           \
         DP_FORM(CI_F_SHR, B_X, BC_X)
-
-#undef DP_FORM
-#undef CMPOP
-#undef ARITH
-#undef TESTOP
-#undef LOGIC
-
-        /* --------------------------------------------------- multiplies */
-        case CI_K_MUL:  R[op->rd] = R[op->rm] * R[op->rs]; goto next;
-        case CI_K_MULS: {
-            uint32_t r = R[op->rm] * R[op->rs];
-            R[op->rd] = r;
-            c->cpsr = (c->cpsr & 0x3fffffffu) | nz(r);
-            goto next;
-        }
-        case CI_K_MLA:  R[op->rd] = R[op->rm] * R[op->rs] + R[op->rn]; goto next;
-        case CI_K_MLAS: {
-            uint32_t r = R[op->rm] * R[op->rs] + R[op->rn];
-            R[op->rd] = r;
-            c->cpsr = (c->cpsr & 0x3fffffffu) | nz(r);
-            goto next;
-        }
-        case CI_K_UMULL: {
-            uint64_t u = (uint64_t)R[op->rm] * R[op->rs];
-            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
-            goto next;
-        }
-        case CI_K_UMLAL: {
-            uint64_t u = (uint64_t)R[op->rm] * R[op->rs];
-            u += ((uint64_t)R[op->rd] << 32) | R[op->rn];
-            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
-            goto next;
-        }
-        case CI_K_SMULL: {
-            uint64_t u = (uint64_t)((int64_t)(int32_t)R[op->rm] * (int64_t)(int32_t)R[op->rs]);
-            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
-            goto next;
-        }
-        case CI_K_SMLAL: {
-            uint64_t u = (uint64_t)((int64_t)(int32_t)R[op->rm] * (int64_t)(int32_t)R[op->rs]);
-            u += ((uint64_t)R[op->rd] << 32) | R[op->rn];
-            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
-            goto next;
-        }
-
-        /* ------------------------------------------------ miscellaneous */
-        case CI_K_NOP: goto next;
-        case CI_K_CLREX: c->excl_valid = false; goto next;
-        case CI_K_MRS_CPSR: R[op->rd] = c->cpsr; goto next;
-        case CI_K_CLZ: R[op->rd] = clz32(R[op->rm]); goto next;
-        case CI_K_SXTB: R[op->rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)ror32(R[op->rm], op->sa); goto next;
-        case CI_K_SXTH: R[op->rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)ror32(R[op->rm], op->sa); goto next;
-        case CI_K_UXTB: R[op->rd] = ror32(R[op->rm], op->sa) & 0xffu; goto next;
-        case CI_K_UXTH: R[op->rd] = ror32(R[op->rm], op->sa) & 0xffffu; goto next;
-        case CI_K_REV: {
-            uint32_t v = R[op->rm];
-            R[op->rd] = (v << 24) | ((v & 0xff00u) << 8) | ((v >> 8) & 0xff00u) | (v >> 24);
-            goto next;
-        }
-        case CI_K_REV16: {
-            uint32_t v = R[op->rm];
-            R[op->rd] = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);
-            goto next;
-        }
-        case CI_K_REVSH: {
-            uint32_t v = R[op->rm];
-            uint16_t h = (uint16_t)(((v & 0xffu) << 8) | ((v >> 8) & 0xffu));
-            R[op->rd] = (uint32_t)(int32_t)(int16_t)h;
-            goto next;
-        }
-
-        /* ------------------------------------------------------- memory */
-        case CI_K_LDR_LIT: {
-            uint32_t a = op->imm;
-            const uint8_t *h;
-            if ((a & 3u) || !(h = mem_rd(ci, c, a, priv))) goto ref;
-            R[op->rd] = ld32(h);
-            goto next;
-        }
-
-#define ADDR_OFF(OFF)   uint32_t a = R[op->rn] + (OFF), wb = 0; (void)wb
-#define ADDR_PRE(OFF)   uint32_t a = R[op->rn] + (OFF), wb = a
-#define ADDR_POST(OFF)  uint32_t a = R[op->rn], wb = a + (OFF)
-#define WB_OFF          (void)0
-#define WB_PRE          R[op->rn] = wb
-#define WB_POST         R[op->rn] = wb
-#define OFF_IMM         (op->imm)
-#define OFF_REG         mem_reg_off(op, R[op->rm], c->cpsr)
-
-#define LOAD(ACC, SRC, MODE, ADDR, OFF, WB, ALIGN, READ)                        \
-        case CI_MEM_KIND(ACC, SRC, MODE): {                                    \
-            ADDR(OFF);                                                         \
-            const uint8_t *h;                                                  \
-            if ((a & (ALIGN)) || !(h = mem_rd(ci, c, a, priv))) goto ref;      \
-            R[op->rd] = (READ);                                                \
-            WB;                                                                \
-            goto next;                                                         \
-        }
-#define STORE(ACC, SRC, MODE, ADDR, OFF, WB, ALIGN, WRITE)                      \
-        case CI_MEM_KIND(ACC, SRC, MODE): {                                    \
-            ADDR(OFF);                                                         \
-            uint8_t *h;                                                        \
-            if ((a & (ALIGN)) || !(h = mem_wr(ci, c, a, priv))) goto ref;      \
-            WRITE;                                                             \
-            WB;                                                                \
-            goto next;                                                         \
-        }
 #define MEM_MODES(SRC, OFF)                                                     \
         LOAD(CI_A_LDR,   SRC, CI_M_OFF,  ADDR_OFF,  OFF, WB_OFF,  3u, ld32(h))  \
         LOAD(CI_A_LDR,   SRC, CI_M_PRE,  ADDR_PRE,  OFF, WB_PRE,  3u, ld32(h))  \
@@ -649,20 +516,236 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
         STORE(CI_A_STRH, SRC, CI_M_OFF,  ADDR_OFF,  OFF, WB_OFF,  1u, st16(h, R[op->rd]))  \
         STORE(CI_A_STRH, SRC, CI_M_PRE,  ADDR_PRE,  OFF, WB_PRE,  1u, st16(h, R[op->rd]))  \
         STORE(CI_A_STRH, SRC, CI_M_POST, ADDR_POST, OFF, WB_POST, 1u, st16(h, R[op->rd]))
-
-        MEM_MODES(CI_S_IMM, OFF_IMM)
+#define MEM_ALL_MODES                                                           \
+        MEM_MODES(CI_S_IMM, OFF_IMM)                                           \
         MEM_MODES(CI_S_REG, OFF_REG)
 
-#undef MEM_MODES
+#if CI_THREADED
+/* Labels as values, and a table whose unlisted kinds default to the
+ * reference: GNU extensions, used only in this compiler branch. */
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wpedantic"
+#  if defined(__clang__)
+#    pragma GCC diagnostic ignored "-Winitializer-overrides"
+#  else
+#    pragma GCC diagnostic ignored "-Woverride-init"
+#  endif
+#endif
+
+/*
+ * Run ops of one block, retiring at most `budget`. Returns the number
+ * retired. EXEC_CONTINUE: control reached a new PC through an ordinary path
+ * (r15 written) and the caller may look up the next block.
+ */
+static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
+                                unsigned budget, bool priv, unsigned *retired_out,
+                                arm_ci_stop_t *stop, arm_status_t *status) {
+    uint32_t *const R = c->r;
+    const ci_op_t *const base = b->ops;
+    const ci_op_t *op = base;
+    const ci_op_t *const end = base + (b->n < budget ? b->n : budget);
+    const ci_op_t *flushed = base;         /* cycles accounted up to here */
+    const unsigned shift = b->thumb ? 1u : 2u;
+    uint32_t next_pc = 0;
+    exec_result_t result = EXEC_CONTINUE;
+
+#define PC_OF(o) (b->va + ((uint32_t)((o) - base) << shift))
+
+#if CI_THREADED
+#define LOGIC(OPC, F, B, BC, EXPR)                                              \
+        [CI_DP_KIND(OPC, F, 0)] = &&L_DP_##OPC##_##F##_0,                       \
+        [CI_DP_KIND(OPC, F, 1)] = &&L_DP_##OPC##_##F##_1,
+#define ARITH(OPC, F, B, VAL, X, Y, CIN) LOGIC(OPC, F, B, B, VAL)
+#define TESTOP(OPC, F, BC, EXPR) [CI_DP_KIND(OPC, F, 1)] = &&L_DP_##OPC##_##F##_1,
+#define CMPOP(OPC, F, B, X, Y, CIN) TESTOP(OPC, F, B, X)
+#define LOAD(ACC, SRC, MODE, ADDR, OFF, WB, ALIGN, READ)                        \
+        [CI_MEM_KIND(ACC, SRC, MODE)] = &&L_M_##ACC##_##SRC##_##MODE,
+#define STORE LOAD
+#define X(name) [CI_K_##name] = &&L_##name,
+    static const void *const k_dispatch[256] = {
+        [0 ... 255] = &&L_REF,
+        CI_SIMPLE_KINDS(X)
+        DP_ALL_FORMS
+        MEM_ALL_MODES
+    };
+#undef X
+#undef STORE
+#undef LOAD
+#undef CMPOP
+#undef TESTOP
+#undef ARITH
+#undef LOGIC
+#endif
+
+    for (;;) {
+        if (op->cond != CI_COND_AL && !cond_pass(c->cpsr, op->cond)) goto next;
+
+        switch (op->kind) {
+
+        /* ---------------------------------------------- data processing */
+#define B_I          (op->imm)
+#define B_R          (R[op->rm])
+#define B_H          shi_val(op, R[op->rm], c->cpsr)
+#define B_X          shr_val(op->sh, R[op->rm], R[op->rs] & 0xffu)
+#define BC_I(cy)     ((cy) = op->sa ? op->sh : carry(c), op->imm)
+#define BC_R(cy)     ((cy) = carry(c), R[op->rm])
+#define BC_H(cy)     shi_carry(op, R[op->rm], c->cpsr, &(cy))
+#define BC_X(cy)     ((cy) = carry(c), shr_carry(op->sh, R[op->rm], R[op->rs] & 0xffu, &(cy)))
+
+#define LOGIC(OPC, F, B, BC, EXPR)                                              \
+        CI_H(DP_##OPC##_##F##_0, CI_DP_KIND(OPC, F, 0)) {                       \
+            uint32_t a = R[op->rn], b2 = (B); (void)a;                         \
+            R[op->rd] = (EXPR);                                                \
+            CI_NEXT();                                                         \
+        }                                                                      \
+        CI_H(DP_##OPC##_##F##_1, CI_DP_KIND(OPC, F, 1)) {                       \
+            uint32_t cy, b2 = BC(cy), a = R[op->rn]; (void)a;                  \
+            uint32_t r = (EXPR);                                               \
+            R[op->rd] = r;                                                     \
+            set_logic(c, r, cy);                                               \
+            CI_NEXT();                                                         \
+        }
+#define TESTOP(OPC, F, BC, EXPR)                                                \
+        CI_H(DP_##OPC##_##F##_1, CI_DP_KIND(OPC, F, 1)) {                       \
+            uint32_t cy, b2 = BC(cy), a = R[op->rn];                           \
+            set_logic(c, (EXPR), cy);                                          \
+            CI_NEXT();                                                         \
+        }
+#define ARITH(OPC, F, B, VAL, X, Y, CIN)                                        \
+        CI_H(DP_##OPC##_##F##_0, CI_DP_KIND(OPC, F, 0)) {                       \
+            uint32_t a = R[op->rn], b2 = (B);                                  \
+            R[op->rd] = (VAL);                                                 \
+            CI_NEXT();                                                         \
+        }                                                                      \
+        CI_H(DP_##OPC##_##F##_1, CI_DP_KIND(OPC, F, 1)) {                       \
+            uint32_t a = R[op->rn], b2 = (B);                                  \
+            R[op->rd] = add_flags(c, (X), (Y), (CIN));                         \
+            CI_NEXT();                                                         \
+        }
+#define CMPOP(OPC, F, B, X, Y, CIN)                                             \
+        CI_H(DP_##OPC##_##F##_1, CI_DP_KIND(OPC, F, 1)) {                       \
+            uint32_t a = R[op->rn], b2 = (B);                                  \
+            (void)add_flags(c, (X), (Y), (CIN));                               \
+            CI_NEXT();                                                         \
+        }
+        DP_ALL_FORMS
+
+#undef CMPOP
+#undef ARITH
+#undef TESTOP
+#undef LOGIC
+
+        /* --------------------------------------------------- multiplies */
+        CI_HK(MUL)  R[op->rd] = R[op->rm] * R[op->rs]; CI_NEXT();
+        CI_HK(MULS) {
+            uint32_t r = R[op->rm] * R[op->rs];
+            R[op->rd] = r;
+            c->cpsr = (c->cpsr & 0x3fffffffu) | nz(r);
+            CI_NEXT();
+        }
+        CI_HK(MLA)  R[op->rd] = R[op->rm] * R[op->rs] + R[op->rn]; CI_NEXT();
+        CI_HK(MLAS) {
+            uint32_t r = R[op->rm] * R[op->rs] + R[op->rn];
+            R[op->rd] = r;
+            c->cpsr = (c->cpsr & 0x3fffffffu) | nz(r);
+            CI_NEXT();
+        }
+        CI_HK(UMULL) {
+            uint64_t u = (uint64_t)R[op->rm] * R[op->rs];
+            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
+            CI_NEXT();
+        }
+        CI_HK(UMLAL) {
+            uint64_t u = (uint64_t)R[op->rm] * R[op->rs];
+            u += ((uint64_t)R[op->rd] << 32) | R[op->rn];
+            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
+            CI_NEXT();
+        }
+        CI_HK(SMULL) {
+            uint64_t u = (uint64_t)((int64_t)(int32_t)R[op->rm] * (int64_t)(int32_t)R[op->rs]);
+            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
+            CI_NEXT();
+        }
+        CI_HK(SMLAL) {
+            uint64_t u = (uint64_t)((int64_t)(int32_t)R[op->rm] * (int64_t)(int32_t)R[op->rs]);
+            u += ((uint64_t)R[op->rd] << 32) | R[op->rn];
+            R[op->rn] = (uint32_t)u; R[op->rd] = (uint32_t)(u >> 32);
+            CI_NEXT();
+        }
+
+        /* ------------------------------------------------ miscellaneous */
+        CI_HK(NOP) CI_NEXT();
+        CI_HK(CLREX) c->excl_valid = false; CI_NEXT();
+        CI_HK(MRS_CPSR) R[op->rd] = c->cpsr; CI_NEXT();
+        CI_HK(CLZ) R[op->rd] = clz32(R[op->rm]); CI_NEXT();
+        CI_HK(SXTB) R[op->rd] = (uint32_t)(int32_t)(int8_t)(uint8_t)ror32(R[op->rm], op->sa); CI_NEXT();
+        CI_HK(SXTH) R[op->rd] = (uint32_t)(int32_t)(int16_t)(uint16_t)ror32(R[op->rm], op->sa); CI_NEXT();
+        CI_HK(UXTB) R[op->rd] = ror32(R[op->rm], op->sa) & 0xffu; CI_NEXT();
+        CI_HK(UXTH) R[op->rd] = ror32(R[op->rm], op->sa) & 0xffffu; CI_NEXT();
+        CI_HK(REV) {
+            uint32_t v = R[op->rm];
+            R[op->rd] = (v << 24) | ((v & 0xff00u) << 8) | ((v >> 8) & 0xff00u) | (v >> 24);
+            CI_NEXT();
+        }
+        CI_HK(REV16) {
+            uint32_t v = R[op->rm];
+            R[op->rd] = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);
+            CI_NEXT();
+        }
+        CI_HK(REVSH) {
+            uint32_t v = R[op->rm];
+            uint16_t h = (uint16_t)(((v & 0xffu) << 8) | ((v >> 8) & 0xffu));
+            R[op->rd] = (uint32_t)(int32_t)(int16_t)h;
+            CI_NEXT();
+        }
+
+        /* ------------------------------------------------------- memory */
+        CI_HK(LDR_LIT) {
+            uint32_t a = op->imm;
+            const uint8_t *h;
+            if ((a & 3u) || !(h = mem_rd(ci, c, a, priv))) goto ref;
+            R[op->rd] = ld32(h);
+            CI_NEXT();
+        }
+
+#define ADDR_OFF(OFF)   uint32_t a = R[op->rn] + (OFF), wb = 0; (void)wb
+#define ADDR_PRE(OFF)   uint32_t a = R[op->rn] + (OFF), wb = a
+#define ADDR_POST(OFF)  uint32_t a = R[op->rn], wb = a + (OFF)
+#define WB_OFF          (void)0
+#define WB_PRE          R[op->rn] = wb
+#define WB_POST         R[op->rn] = wb
+#define OFF_IMM         (op->imm)
+#define OFF_REG         mem_reg_off(op, R[op->rm], c->cpsr)
+
+#define LOAD(ACC, SRC, MODE, ADDR, OFF, WB, ALIGN, READ)                        \
+        CI_H(M_##ACC##_##SRC##_##MODE, CI_MEM_KIND(ACC, SRC, MODE)) {          \
+            ADDR(OFF);                                                         \
+            const uint8_t *h;                                                  \
+            if ((a & (ALIGN)) || !(h = mem_rd(ci, c, a, priv))) goto ref;      \
+            R[op->rd] = (READ);                                                \
+            WB;                                                                \
+            CI_NEXT();                                                         \
+        }
+#define STORE(ACC, SRC, MODE, ADDR, OFF, WB, ALIGN, WRITE)                      \
+        CI_H(M_##ACC##_##SRC##_##MODE, CI_MEM_KIND(ACC, SRC, MODE)) {          \
+            ADDR(OFF);                                                         \
+            uint8_t *h;                                                        \
+            if ((a & (ALIGN)) || !(h = mem_wr(ci, c, a, priv))) goto ref;      \
+            WRITE;                                                             \
+            WB;                                                                \
+            CI_NEXT();                                                         \
+        }
+        MEM_ALL_MODES
+
 #undef STORE
 #undef LOAD
 
         /* Block transfers. The reference translates every word; the fast
          * path takes only transfers that are word aligned and stay inside
          * one 1 KiB block, where one host-TLB hit stands for all of them. */
-        case CI_K_LDM: case CI_K_LDM_PC: {
-            const uint32_t base = R[op->rn];
-            const uint32_t a = base + (uint32_t)(int32_t)(int8_t)op->sa;
+        CI_HK(LDM) CI_HK(LDM_PC) {
+            const uint32_t rnv = R[op->rn];
+            const uint32_t a = rnv + (uint32_t)(int32_t)(int8_t)op->sa;
             const uint32_t last = a + ((uint32_t)op->rm - 1u) * 4u;
             const uint8_t *h;
             if ((a & 3u) || ((a ^ last) & ~0x3ffu) || !(h = mem_rd(ci, c, a, priv)))
@@ -672,7 +755,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                 if ((t & 3u) == 2u) goto ref;       /* not representable */
                 for (uint32_t l = op->imm & 0x7fffu; l; l &= l - 1u, h += 4)
                     R[ctz32(l)] = ld32(h);
-                if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
+                if (op->rs) R[op->rn] = rnv + (uint32_t)(int32_t)(int8_t)op->rs;
                 c->cpsr = (c->cpsr & ~ARM_CPSR_T) | ((t & 1u) << 5);
                 next_pc = t & ((t & 1u) ? ~1u : ~3u);
                 op++;
@@ -680,40 +763,40 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             }
             for (uint32_t l = op->imm; l; l &= l - 1u, h += 4)
                 R[ctz32(l)] = ld32(h);
-            if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
-            goto next;
+            if (op->rs) R[op->rn] = rnv + (uint32_t)(int32_t)(int8_t)op->rs;
+            CI_NEXT();
         }
-        case CI_K_STM: {
-            const uint32_t base = R[op->rn];
-            const uint32_t a = base + (uint32_t)(int32_t)(int8_t)op->sa;
+        CI_HK(STM) {
+            const uint32_t rnv = R[op->rn];
+            const uint32_t a = rnv + (uint32_t)(int32_t)(int8_t)op->sa;
             const uint32_t last = a + ((uint32_t)op->rm - 1u) * 4u;
             uint8_t *h;
             if ((a & 3u) || ((a ^ last) & ~0x3ffu) || !(h = mem_wr(ci, c, a, priv)))
                 goto ref;
             for (uint32_t l = op->imm; l; l &= l - 1u, h += 4)
                 st32(h, R[ctz32(l)]);
-            if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
-            goto next;
+            if (op->rs) R[op->rn] = rnv + (uint32_t)(int32_t)(int8_t)op->rs;
+            CI_NEXT();
         }
 
         /* ------------------------------------------------- control flow */
-        case CI_K_B:
+        CI_HK(B)
             next_pc = op->imm;
             op++;
             goto out;
-        case CI_K_BL:
+        CI_HK(BL)
             R[14] = PC_OF(op) + 4u;
             next_pc = op->imm;
             op++;
             goto out;
-        case CI_K_TBL2: {
+        CI_HK(TBL2) {
             uint32_t t = R[14] + op->imm;
             R[14] = (PC_OF(op) + 2u) | 1u;
             next_pc = t & ~1u;
             op++;
             goto out;
         }
-        case CI_K_BX: {
+        CI_HK(BX) {
             uint32_t t = R[op->rm];
             if ((t & 3u) == 2u) goto ref;
             c->cpsr = (c->cpsr & ~ARM_CPSR_T) | ((t & 1u) << 5);
@@ -721,7 +804,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             op++;
             goto out;
         }
-        case CI_K_BLX_R: {
+        CI_HK(BLX_R) {
             uint32_t t = R[op->rm];
             if ((t & 3u) == 2u) goto ref;
             R[14] = op->imm;
@@ -730,21 +813,21 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             op++;
             goto out;
         }
-        case CI_K_BLX_I:
+        CI_HK(BLX_I)
             R[14] = PC_OF(op) + 4u;
             c->cpsr |= ARM_CPSR_T;
             next_pc = op->imm;
             op++;
             goto out;
 
-        case CI_K_REF:
+        CI_HK(REF)
         default:
             goto ref;
         }
 
     next:
         if (++op == end) { next_pc = PC_OF(op); goto out; }
-        continue;
+        CI_DISPATCH();
 
     ref: {
             /* The reference semantics for this one instruction. Cycles for
@@ -781,7 +864,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                 goto out;
             }
             if (op == end) { next_pc = PC_OF(op); goto out; }
-            continue;
+            CI_DISPATCH();
         }
     }
 
@@ -792,6 +875,10 @@ out:
     return result;
 #undef PC_OF
 }
+
+#if CI_THREADED
+#  pragma GCC diagnostic pop
+#endif
 
 /* ------------------------------------------------------------ run loop --- */
 

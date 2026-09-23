@@ -135,10 +135,13 @@ the instruction as retired (as `arm_step` does) and exits.
 ## 4. Dispatch
 
 Per-op dispatch is the inner loop. Implemented as a `switch` in a loop
-(portable, MSVC) and, under `S5LBOX_CI_THREADED` on GCC/Clang, computed-`goto`
-threading with one indirect jump per handler. Both are built and tested in CI;
-the faster one on each host becomes that host's default only after
-measurement. Clang `musttail` tail-call threading (iCube I3) is a later ARM64
+(portable, MSVC) and, on GCC/Clang, computed-`goto` threading: every handler
+ends in its own copy of the dispatch (condition check, jump through a
+256-entry label table whose unlisted kinds default to the reference). As
+built: threaded is the GCC/Clang default because it measured ×1.053 geomean
+over the switch (`BENCHMARK_RESULTS.md` §3); `-DS5LBOX_CI_SWITCH_DISPATCH`
+forces the switch on any compiler, and the Windows CI job (MSVC) exercises
+it. Clang `musttail` tail-call threading (iCube I3) is a later ARM64
 experiment. Condition evaluation uses a 16×16-bit truth table indexed by
 `cond` and `NZCV`; `AL` ops skip it.
 
