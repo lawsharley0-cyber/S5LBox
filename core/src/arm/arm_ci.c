@@ -36,10 +36,14 @@
 #  define CI_INLINE      static inline
 #endif
 
-#define CI_HASH_BITS  16u
+/* Sized from a real boot: iPhone OS 3 plus SpringBoard kept ~26 k blocks
+ * live between flushes of the old 32 k pool and flushed it 924 times in
+ * 8.8 G instructions. Buckets chain, so a colliding block is found rather
+ * than rebuilt; the pools are allocated once and touched only as used. */
+#define CI_HASH_BITS  17u
 #define CI_HASH_SIZE  (1u << CI_HASH_BITS)
-#define CI_MAX_BLOCKS 32768u
-#define CI_MAX_OPS    (CI_MAX_BLOCKS * 8u)       /* 4 MiB of records */
+#define CI_MAX_BLOCKS 131072u
+#define CI_MAX_OPS    (CI_MAX_BLOCKS * 8u)       /* 16 MiB of records */
 
 #define CI_FLAG_C     ARM_CPSR_C
 /* CPSR bits whose change needs the machine: mode, I/F/A masks, E. N/Z/C/V/Q,
@@ -412,7 +416,11 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
     b->ops = ops;
     ci->nblocks++;
     ci->nops += n;
-    ci->table[hash_slot(pa_off, thumb)] = b;
+    /* Newest first: a rebuilt (stale-generation) block shadows its old copy,
+     * which stays unreachable in the chain until the next flush. */
+    const uint32_t slot = hash_slot(pa_off, thumb);
+    b->next = ci->table[slot];
+    ci->table[slot] = b;
     ci->st.builds++;
     ci->st.build_ops += n;
     return b;
@@ -988,7 +996,9 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
             }
             const uint32_t pa_off = (uint32_t)(h - ram);
             b = ci->table[hash_slot(pa_off, thumb)];
-            if (b && b->pa_off == pa_off && b->va == pc && b->thumb == (uint8_t)thumb) {
+            while (b && !(b->pa_off == pa_off && b->va == pc && b->thumb == (uint8_t)thumb))
+                b = b->next;
+            if (b) {
                 if (b->gen != ci->region_gen[pa_off >> 10]) {
                     ci->st.stale++;
                     b = build(ci, c, h, pc, pa_off, thumb);

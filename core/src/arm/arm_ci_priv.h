@@ -101,6 +101,7 @@ typedef char ci_kinds_fit_in_a_byte[(CI_K_COUNT <= 256) ? 1 : -1];
 #define CI_BLOCK_MAX_OPS 64u
 
 typedef struct ci_block {
+    struct ci_block *next;  /* hash-bucket chain, newest first               */
     uint32_t va;       /* guest VA of the first instruction                  */
     uint32_t pa_off;   /* its offset in guest DRAM                           */
     uint32_t gen;      /* region generation of pa_off's 1 KiB when built     */

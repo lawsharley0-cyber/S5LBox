@@ -178,6 +178,49 @@ static void test_amc_storage(void) {
     CHECK(g_m.stub_declare_failures == 0u, "a stub failed to declare");
 }
 
+/* The block cache must not rebuild blocks that merely share a hash bucket.
+ * The bucket is ((pa >> 1) ^ (pa >> 18)) mod 2^17 of the offset into RAM, so
+ * offsets j * 0x80000 + 4j all land in bucket 0: seven such blocks, chained
+ * into a loop and run fifty times, must each be built once, not once per
+ * visit as a direct-mapped table would. */
+static void test_no_collision_rebuilds(void) {
+    enum { N = 7, PASSES = 50 };
+    uint32_t at[N];
+    for (uint32_t j = 0; j < N; j++) at[j] = RAM_BASE + (j + 1u) * 0x80000u + 4u * (j + 1u);
+    for (uint32_t j = 0; j < N; j++) {
+        const uint32_t target = at[(j + 1u) % N];
+        const int32_t off = ((int32_t)target - (int32_t)(at[j] + 4u) - 8) / 4;
+        g_m.bus.write32(g_m.bus.ctx, at[j], 0xe2800001u);              /* add r0, r0, #1 */
+        g_m.bus.write32(g_m.bus.ctx, at[j] + 4u, 0xea000000u | ((uint32_t)off & 0xffffffu));
+    }
+    if (!s5l8900_set_cpu_backend(&g_m, S5L8900_CPU_BACKEND_CACHED_BLOCK)) {
+        CHECK(0, "backend");
+        return;
+    }
+    g_m.cpu.r[0] = 0u;
+    g_m.cpu.r[15] = at[0];
+    /* Verify mode bypasses the VA-keyed map in front of the table, so every
+     * block entry is a bucket lookup, as it is on a real boot's large
+     * working set where that small map keeps missing. */
+    arm_ci_set_verify(g_m.ci, true);
+    arm_ci_reset_stats(g_m.ci);
+    arm_status_t st = ARM_OK;
+    unsigned ran = s5l8900_run(&g_m, N * 2u * PASSES, &st);
+    arm_ci_stats_t cs;
+    arm_ci_get_stats(g_m.ci, &cs);
+    CHECK(st == ARM_OK && ran == N * 2u * PASSES && g_m.cpu.r[0] == N * PASSES,
+          "loop ran wrong: status %d ran %u r0 %u", (int)st, ran, g_m.cpu.r[0]);
+    /* A run's budget (the timebase edge) can end between the two
+     * instructions; the next run then enters at the branch, which is a
+     * different block. At most one such entry per run. */
+    CHECK(cs.builds >= N && cs.builds <= N + cs.runs && cs.flushes == 0u,
+          "blocks rebuilt: %llu builds, %llu flushes, %llu runs for %d blocks",
+          (unsigned long long)cs.builds, (unsigned long long)cs.flushes,
+          (unsigned long long)cs.runs, N);
+    CHECK(cs.verify_mismatch == 0u, "verify mismatch");
+    arm_ci_set_verify(g_m.ci, false);
+}
+
 int main(void) {
     if (!s5l8900_init(&g_m, RAM_BASE, RAM_SIZE) ||
         !s5l8900_set_cpu_backend(&g_m, S5L8900_CPU_BACKEND_CACHED_BLOCK)) {
@@ -188,6 +231,7 @@ int main(void) {
     test_engine_counters();
     test_guest_pc();
     test_amc_storage();
+    test_no_collision_rebuilds();
     s5l8900_free(&g_m);
     printf("ci diagnostics: %d failure(s)\n", g_fail);
     return g_fail ? 1 : 0;
