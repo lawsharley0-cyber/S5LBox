@@ -1583,6 +1583,13 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
              * duplicate declaration here would be refused as an overlap and
              * silently counted as a failure rather than shadowing them. */
             { S5L8900_SPI2_BASE,   S5L8900_DEV_SIZE,   "spi2"      },
+            /* AppleAMC (soc.h), and the on-chip SRAM its reg[1] names, which
+             * the same driver reads. SRAM is memory, so storage is its real
+             * behaviour; it is declared only when DRAM does not already cover
+             * it (-R above 416 MB does, and the declaration then fails and is
+             * counted, leaving the historical alias). */
+            { S5L8900_AMC_BASE,    S5L8900_AMC_SIZE,   "amc"       },
+            { S5L8900_SRAM_BASE,   S5L8900_SRAM_SIZE,  "sram"      },
         };
         for (unsigned i = 0; i < sizeof STUBS / sizeof STUBS[0]; i++)
             if (!s5l8900_add_stub(m, STUBS[i].base, STUBS[i].size, STUBS[i].name))

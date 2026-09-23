@@ -13,7 +13,7 @@
 
 #define RAM_BASE 0x08000000u
 #define RAM_SIZE (4u << 20)
-#define AMC_REG  (S5L8900_SRAM_BASE + 0x400u)   /* unmodelled SRAM/AMC window */
+#define AMC_REG  0x30000400u   /* between the NOR window and arm-io: assigned to nothing */
 
 static s5l8900_t g_m;
 static int g_fail;
@@ -47,8 +47,7 @@ static void test_unmodelled_log(void) {
     const s5l_access_entry_t *r = find(0xc0717434u, AMC_REG, false);
     const s5l_access_entry_t *w = find(0xc0717434u, AMC_REG, true);
     const s5l_access_entry_t *st = find(0xc0010000u, S5L8900_CLOCK_BASE + 0x10u, false);
-    CHECK(r && r->count == 2u && r->kind == S5L_ACCESS_UNMAPPED && r->region &&
-          !strcmp(r->region, "sram/amc"),
+    CHECK(r && r->count == 2u && r->kind == S5L_ACCESS_UNMAPPED && !r->region,
           "unmapped read entry wrong");
     CHECK(w && w->count == 1u && w->value == 5u, "unmapped write entry wrong");
     CHECK(st && st->kind == S5L_ACCESS_STUB && st->region && !strcmp(st->region, "clkrstgen") &&
@@ -58,10 +57,10 @@ static void test_unmodelled_log(void) {
                                        text, sizeof text);
     CHECK(n == strlen(text) && n > 0u, "describe length");
     /* Most recent first: the stub read, then the write, then the reads. */
-    const char *first = strstr(text, "clkrstgen"), *wr = strstr(text, "W 22000400");
-    const char *rd = strstr(text, "R 22000400");
+    const char *first = strstr(text, "clkrstgen"), *wr = strstr(text, "W 30000400");
+    const char *rd = strstr(text, "R 30000400");
     CHECK(first && wr && rd && first < wr && wr < rd, "describe order:\n%s", text);
-    CHECK(strstr(text, "x2") && strstr(text, "unmapped sram/amc"), "describe fields:\n%s", text);
+    CHECK(strstr(text, "x2") && strstr(text, "(unmapped)"), "describe fields:\n%s", text);
 
     /* The all-device table sees the same accesses, and modelled devices too
      * (which the unmodelled table must not). */
@@ -154,6 +153,19 @@ static void test_guest_pc(void) {
     }
 }
 
+/* AppleAMC's "lock BSU" handshake writes 1 to +0x400 and reads it back;
+ * the AMC block and the SRAM window are honest storage now. */
+static void test_amc_storage(void) {
+    arm_bus_t *bus = &g_m.bus;
+    bus->write32(bus->ctx, S5L8900_AMC_BASE + 0x400u, 1u);
+    CHECK(bus->read32(bus->ctx, S5L8900_AMC_BASE + 0x400u) == 1u, "AMC +0x400 did not read back");
+    bus->write32(bus->ctx, S5L8900_AMC_BASE + 0x2000u, 3u);
+    CHECK(bus->read32(bus->ctx, S5L8900_AMC_BASE + 0x2000u) == 3u, "AMC +0x2000 did not read back");
+    bus->write16(bus->ctx, S5L8900_SRAM_BASE + 0x28000u, 0xbeefu);
+    CHECK(bus->read16(bus->ctx, S5L8900_SRAM_BASE + 0x28000u) == 0xbeefu, "SRAM did not read back");
+    CHECK(g_m.stub_declare_failures == 0u, "a stub failed to declare");
+}
+
 int main(void) {
     if (!s5l8900_init(&g_m, RAM_BASE, RAM_SIZE) ||
         !s5l8900_set_cpu_backend(&g_m, S5L8900_CPU_BACKEND_CACHED_BLOCK)) {
@@ -163,6 +175,7 @@ int main(void) {
     test_unmodelled_log();
     test_engine_counters();
     test_guest_pc();
+    test_amc_storage();
     s5l8900_free(&g_m);
     printf("ci diagnostics: %d failure(s)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -125,6 +125,18 @@ typedef enum {
  */
 #define S5L8900_GPIO_BASE   0x3e400000u
 #define S5L8900_MIU_BASE    0x38100000u   /* clkrstgen's second reg range */
+/*
+ * AppleAMC's register block, /arm-io/amc reg[0]: child 0x00500000 in the
+ * first arm-io window. Observed on a device (build 3a9ddef/3f74a82 access
+ * logs, docs/audio.md): the driver at 0xc07174cc-0xc0717b6c writes 1 to
+ * +0x400 and reads it back up to 1000 times per attempt ("could not lock
+ * BSU" when it reads 0), programs a DRAM buffer at +0x1000..+0x101c, and
+ * resets the block through +0x2000. Declared as honest storage (reads return
+ * what was written), the span the driver touched. Not a model: no transfer
+ * happens and nothing self-clears.
+ */
+#define S5L8900_AMC_BASE    0x38500000u
+#define S5L8900_AMC_SIZE    0x00003000u
 #define S5L8900_EDGEIC_BASE 0x38e02000u
 /*
  * The two I2S controllers. /arm-io/i2s0 carries reg {0x4a00000,0x1000} and

@@ -448,3 +448,33 @@ What this shows, and what it does not:
 
 To resolve the pcs with your own kernelcache on a desktop:
 `machoinfo <kernel> -r c05a7e54`, `-r c06f5526`.
+
+## Second device report (build 3f74a82): the BSU lock is AMC +0x400
+
+With every device access logged, the retry loop is fully visible (unmodelled
+table, most recent first; counts are since each entry was last inserted):
+
+- `c05a7e54/60/78`: clkrstgen +0x24 bit 0 toggled and MIU +0x008/+0x404
+  written, x13,174; `c0717714`: **W 0x38502000 <- 3**, x13,174 — the AMC
+  reset, once per retry.
+- `c07174cc/c07174d4` then `c07174fc/c0717504`: **W 0x38500400 <- 1, R
+  0x38500400 -> 0**, x3 and x3,000 — the lock: write 1, read it back,
+  up to 1,000 times per attempt, give up when it stays 0.
+- After it, one pass of set-up: 0x38501000..0x3850101c (a channel: enable,
+  **0x095b5000** — a DRAM address — and 0xfef, i.e. a 4,080-byte buffer),
+  0x38500a00, 0x38500004, 0x38500b04/0b0c, 0x38500204, polls of 0x38500b18
+  (x11) and 0x38500010, and two halfword reads of SRAM 0x22028000.
+
+0x38500000 is `/arm-io/amc` reg[0] (child 0x00500000 in the first arm-io
+window); 0x22000000 is its reg[1], the SRAM. Neither was modelled, so every
+read returned 0 and the lock could never be taken.
+
+Change: both are declared as honest storage (`S5L8900_AMC_BASE`, 0x3000
+bytes, the span the driver touched; `S5L8900_SRAM_BASE`, 0x2c000). Reads
+return what the guest wrote, so the lock read-back sees the 1 it wrote. That
+is storage, not a fabricated status. What it does NOT do: move audio. The
+channel at +0x1000 names a DRAM buffer and a length, which looks like the
+AMC fetching samples itself rather than the PL080 feeding I2S0; if the next
+report shows the driver waiting on +0x0b18/+0x0010 for progress, that is a
+real DMA model to build (AMC -> audio sink), with its registers read from
+the driver's own accesses.
