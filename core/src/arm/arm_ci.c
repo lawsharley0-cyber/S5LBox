@@ -324,6 +324,16 @@ static uint32_t clz32(uint32_t v) {
 #endif
 }
 
+CI_INLINE unsigned ctz32(uint32_t v) {          /* v != 0 */
+#if defined(__GNUC__) || defined(__clang__)
+    return (unsigned)__builtin_ctz(v);
+#else
+    unsigned n = 0;
+    while (!(v & 1u)) { v >>= 1; n++; }
+    return n;
+#endif
+}
+
 /* ------------------------------------------------------------- fetch --- */
 
 /* Exactly arm_step()'s fetch: the same 1 KiB fetch cache, the same refill.
@@ -636,6 +646,45 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
 #undef MEM_MODES
 #undef STORE
 #undef LOAD
+
+        /* Block transfers. The reference translates every word; the fast
+         * path takes only transfers that are word aligned and stay inside
+         * one 1 KiB block, where one host-TLB hit stands for all of them. */
+        case CI_K_LDM: case CI_K_LDM_PC: {
+            const uint32_t base = R[op->rn];
+            const uint32_t a = base + (uint32_t)(int32_t)(int8_t)op->sa;
+            const uint32_t last = a + ((uint32_t)op->rm - 1u) * 4u;
+            const uint8_t *h;
+            if ((a & 3u) || ((a ^ last) & ~0x3ffu) || !(h = mem_rd(ci, c, a, priv)))
+                goto ref;
+            if (op->kind == CI_K_LDM_PC) {
+                const uint32_t t = ld32(h + (last - a));
+                if ((t & 3u) == 2u) goto ref;       /* not representable */
+                for (uint32_t l = op->imm & 0x7fffu; l; l &= l - 1u, h += 4)
+                    R[ctz32(l)] = ld32(h);
+                if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
+                c->cpsr = (c->cpsr & ~ARM_CPSR_T) | ((t & 1u) << 5);
+                next_pc = t & ((t & 1u) ? ~1u : ~3u);
+                op++;
+                goto out;
+            }
+            for (uint32_t l = op->imm; l; l &= l - 1u, h += 4)
+                R[ctz32(l)] = ld32(h);
+            if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
+            goto next;
+        }
+        case CI_K_STM: {
+            const uint32_t base = R[op->rn];
+            const uint32_t a = base + (uint32_t)(int32_t)(int8_t)op->sa;
+            const uint32_t last = a + ((uint32_t)op->rm - 1u) * 4u;
+            uint8_t *h;
+            if ((a & 3u) || ((a ^ last) & ~0x3ffu) || !(h = mem_wr(ci, c, a, priv)))
+                goto ref;
+            for (uint32_t l = op->imm; l; l &= l - 1u, h += 4)
+                st32(h, R[ctz32(l)]);
+            if (op->rs) R[op->rn] = base + (uint32_t)(int32_t)(int8_t)op->rs;
+            goto next;
+        }
 
         /* ------------------------------------------------- control flow */
         case CI_K_B:

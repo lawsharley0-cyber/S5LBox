@@ -45,7 +45,44 @@ static bool dp_is_logical(unsigned opc) {
     return opc == 0u || opc == 1u || opc == 8u || opc == 9u || opc >= 12u;
 }
 
+/* A block transfer of the registers in `list` (at most r0..r15), lowest
+ * address = base + start, base += delta afterwards (0: no writeback). The
+ * caller has already routed every form whose reference result is not a
+ * plain ascending transfer (S bit, empty list, UNPREDICTABLE writeback
+ * orderings, STM of r15) to the reference. */
+static ci_dec_t block_transfer(ci_op_t *op, bool load, unsigned rn, uint32_t list,
+                               int start, int delta) {
+    unsigned n = 0;
+    for (uint32_t l = list; l; l &= l - 1u) n++;
+    op->kind = load ? ((list >> 15) ? CI_K_LDM_PC : CI_K_LDM) : CI_K_STM;
+    op->rn = (uint8_t)rn;
+    op->rm = (uint8_t)n;
+    op->imm = list;
+    op->sa = (uint8_t)(int8_t)start;
+    op->rs = (uint8_t)(int8_t)delta;
+    return op->kind == CI_K_LDM_PC ? CI_DEC_END : CI_DEC_OP;
+}
+
 /* --------------------------------------------------------------- ARM --- */
+
+static ci_dec_t decode_block(uint32_t insn, ci_op_t *op) {
+    const bool P = (insn >> 24) & 1u, U = (insn >> 23) & 1u, S = (insn >> 22) & 1u;
+    const bool W = (insn >> 21) & 1u, L = (insn >> 20) & 1u;
+    const unsigned rn = (insn >> 16) & 0xfu;
+    const uint32_t list = insn & 0xffffu;
+    const bool pc_in = (list >> 15) & 1u;
+    /* S: user-bank transfer or exception return. rn == 15 and an empty list
+     * are UNDEFINED in the reference; W with Rn in the list is UNDEFINED or
+     * stores a value only the reference orders correctly; STM of r15 stores
+     * pc + 12. */
+    if (S || rn == 15u || list == 0u || (W && ((list >> rn) & 1u)) || (!L && pc_in))
+        return ref(op, L && pc_in);
+    int n = 0;
+    for (uint32_t l = list; l; l &= l - 1u) n++;
+    int start = U ? (P ? 4 : 0) : (P ? -4 * n : -4 * n + 4);
+    int delta = W ? (U ? 4 * n : -4 * n) : 0;
+    return block_transfer(op, L, rn, list, start, delta);
+}
 
 static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
     unsigned opc = (insn >> 21) & 0xfu;
@@ -283,10 +320,8 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
     if ((insn & 0x0e000000u) == 0x06000000u && (insn & 0x10u))
         return decode_media(insn, op);
     if ((insn & 0x0c000000u) == 0x04000000u) return decode_single(pc, insn, op);
-    if ((insn & 0x0e000000u) == 0x08000000u) {            /* LDM / STM */
-        bool L = (insn >> 20) & 1u;
-        return ref(op, L && (insn & (1u << 15)));
-    }
+    if ((insn & 0x0e000000u) == 0x08000000u)              /* LDM / STM */
+        return decode_block(insn, op);
     if ((insn & 0x0e000000u) == 0x00000000u &&
         (insn & 0x00000090u) == 0x00000090u &&
         (insn & 0x00000060u) != 0x00000000u)
@@ -447,8 +482,18 @@ ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op) {
         if ((insn & 0xff00u) == 0xb000u)                   /* ADD/SUB SP, #imm7*4 */
             return thumb_dp(op, (insn & 0x80u) ? 2u : 4u, CI_F_IMM, 0u, 13u, 13u, 0u,
                             (uint32_t)(insn & 0x7fu) << 2);
-        if ((insn & 0xf600u) == 0xb400u)                   /* PUSH / POP */
-            return ref(op, (insn & 0x0900u) == 0x0900u);    /* POP {..., pc} */
+        if ((insn & 0xf600u) == 0xb400u) {                 /* PUSH / POP */
+            bool load = (insn >> 11) & 1u, extra = (insn >> 8) & 1u;
+            uint32_t list = insn & 0xffu;
+            if (list == 0u && !extra) return ref(op, false);
+            int n = extra ? 1 : 0;
+            for (uint32_t l = list; l; l &= l - 1u) n++;
+            if (load)                                       /* LDMIA sp!, {.., pc} */
+                return block_transfer(op, true, 13u, list | (extra ? 0x8000u : 0u),
+                                      0, 4 * n);
+            return block_transfer(op, false, 13u,           /* STMDB sp!, {.., lr} */
+                                  list | (extra ? 0x4000u : 0u), -4 * n, -4 * n);
+        }
         if ((insn & 0xff00u) == 0xb200u) {                 /* SXTH/SXTB/UXTH/UXTB */
             static const uint8_t k[4] = { CI_K_SXTH, CI_K_SXTB, CI_K_UXTH, CI_K_UXTB };
             op->kind = k[(insn >> 6) & 3u];
@@ -465,8 +510,18 @@ ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op) {
         if ((insn & 0xffe0u) == 0xb660u || (insn & 0xfff7u) == 0xb650u)
             return ref(op, false);                          /* CPS, SETEND */
         return CI_DEC_STOP;                                 /* BKPT, undefined */
-    case 0xc:                                              /* LDMIA/STMIA */
-        return ref(op, false);
+    case 0xc: {                                            /* LDMIA/STMIA Rb! */
+        unsigned rb = (insn >> 8) & 7u;
+        uint32_t list = insn & 0xffu;
+        bool load = (insn >> 11) & 1u, in = (list >> rb) & 1u;
+        if (list == 0u) return ref(op, false);
+        /* STMIA stores Rb's old value only when it is the lowest register. */
+        if (!load && in && (list & ((1u << rb) - 1u))) return ref(op, false);
+        int n = 0;
+        for (uint32_t l = list; l; l &= l - 1u) n++;
+        /* LDMIA with Rb in the list: the loaded value wins, no writeback. */
+        return block_transfer(op, load, rb, list, 0, (load && in) ? 0 : 4 * n);
+    }
     case 0xd: {
         unsigned cond = (insn >> 8) & 0xfu;
         if (cond >= 0xeu) return CI_DEC_STOP;               /* undefined / SWI */

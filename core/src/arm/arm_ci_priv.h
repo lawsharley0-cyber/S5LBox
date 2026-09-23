@@ -63,6 +63,13 @@ enum {
     CI_K_SXTB, CI_K_SXTH, CI_K_UXTB, CI_K_UXTH,
     CI_K_REV, CI_K_REV16, CI_K_REVSH,
     CI_K_LDR_LIT,      /* LDR rd, [pc, #imm]: imm is the absolute address    */
+    /* Block transfers (LDM/STM, Thumb PUSH/POP/LDMIA/STMIA) with S == 0:
+     * imm = register list, rn = base, rm = number of registers,
+     * sa = (int8) offset of the lowest address from the base,
+     * rs = (int8) writeback delta, 0 for none. */
+    CI_K_LDM,
+    CI_K_LDM_PC,       /* list includes r15: interworking load, ends block   */
+    CI_K_STM,          /* never r15 in the list                              */
     /* Control flow. All end the block. */
     CI_K_B,            /* imm = target                                       */
     CI_K_BL,           /* ARM: LR = pc + 4                                   */

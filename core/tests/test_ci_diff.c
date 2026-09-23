@@ -159,9 +159,15 @@ static uint32_t gen_arm(unsigned idx, unsigned len) {
                    (rnd_n(2u) << 21) | (rnd_n(2u) << 20) | (rn << 16) | (rd << 12) |
                    (rnd_n(16u) << 8) | 0x90u | (sh << 5) | (chance(50) ? rnd_n(16u) : rm);
         }
-        case 14:                                                         /* LDM/STM */
+        case 14: {                                                       /* LDM/STM */
+            /* Half random lists, half short ones like compiled code's (which
+             * reach the engine's single-block fast path more often). */
+            uint32_t list = chance(50) ? (rnd() & 0xffffu)
+                          : (1u << rnd_n(16u)) | (1u << rnd_n(13u)) |
+                            (chance(30) ? 0x4000u : 0u) | (chance(20) ? 0x8000u : 0u);
             return c | 0x08000000u | (rnd_n(4u) << 23) | ((chance(10) ? 1u : 0u) << 22) |
-                   (rnd_n(4u) << 20) | (rn << 16) | (rnd() & 0xffffu);
+                   (rnd_n(4u) << 20) | (rn << 16) | list;
+        }
         case 15: {                                                       /* B/BL */
             int32_t off = (int32_t)rnd_n(len + 2u) - (int32_t)idx - 2;
             return c | 0x0a000000u | (rnd_n(2u) << 24) | ((uint32_t)off & 0xffffffu);
