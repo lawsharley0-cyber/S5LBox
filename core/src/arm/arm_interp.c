@@ -3391,6 +3391,23 @@ arm_status_t arm_exec_thumb_insn(arm_cpu_t *c, uint32_t pc, uint16_t insn) {
     return thumb_exec_fetched(c, pc, insn);
 }
 
+/* arm_exec_fetched's path for a VFP encoding, condition passed: the decode
+ * tree sends MCR/MRC through exec_coprocessor (which hands cp10/cp11 to
+ * vfp_execute unchanged) and CDP/LDC/STC/MCRR straight to vfp_execute; the
+ * tail below is arm_exec_fetched's own. */
+arm_status_t arm_exec_vfp_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    c->cycles++;
+    arm_status_t st = vfp_execute(c, pc, insn, &g_vfp_bus);
+    if (c->abort_pending) {
+        take_pending_data_abort(c, pc);
+        return ARM_OK;
+    }
+    if (st == ARM_GUEST_UNDEFINED) return take_undefined_instruction(c, pc);
+    if (st == ARM_UNDEFINED) return undefined_instruction(c, pc, insn);
+    if (st == ARM_OK) c->r[15] = pc + 4u;
+    return st;
+}
+
 uint32_t arm_mem_read32(arm_cpu_t *c, uint32_t va, bool priv) { return mem_r32_as(c, va, priv); }
 uint32_t arm_mem_read16(arm_cpu_t *c, uint32_t va, bool priv) { return mem_r16_as(c, va, priv); }
 uint32_t arm_mem_read8 (arm_cpu_t *c, uint32_t va, bool priv) { return mem_r8_as(c, va, priv); }

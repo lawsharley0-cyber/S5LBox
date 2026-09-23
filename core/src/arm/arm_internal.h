@@ -22,6 +22,13 @@
 arm_status_t arm_exec_arm_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn);
 arm_status_t arm_exec_thumb_insn(arm_cpu_t *c, uint32_t pc, uint16_t insn);
 
+/* The same for an ARM-state VFP instruction (cp10/cp11 MCR/MRC, CDP,
+ * LDC/STC, MCRR/MRRC; condition field not 0xF) whose condition the caller
+ * has already found to pass: arm_exec_arm_insn() minus the decode tree that
+ * leads to the VFP unit. cycles++, the unit, data-abort completion, the
+ * lazy-enable Undefined discrimination and the r15 update are identical. */
+arm_status_t arm_exec_vfp_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn);
+
 /* The interpreter's data accessors, with every rule they implement: alignment
  * faults (SCTLR.A), ARMv6 unaligned support (SCTLR.U), legacy rotation,
  * page-crossing splits, translation and the dread/dwrite caches. A fault is

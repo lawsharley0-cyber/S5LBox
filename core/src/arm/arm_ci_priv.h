@@ -74,6 +74,10 @@ enum {
      * rm = CRm. User-mode access rules are checked at run time. */
     CI_K_MRC_TID,
     CI_K_MCR_TID,
+    /* VFP (cp10/cp11, ARM state): the reference's VFP unit called directly,
+     * without the decode tree. Runs through the reference tail in the
+     * executor; sa carries ARM_CI_REF_VFP for the statistics. */
+    CI_K_VFP,
     /* Control flow. All end the block. */
     CI_K_B,            /* imm = target                                       */
     CI_K_BL,           /* ARM: LR = pc + 4                                   */

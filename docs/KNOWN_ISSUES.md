@@ -22,12 +22,15 @@ everywhere (app, `bootkernel`, `snapboot`); the engine is opt-in.
 
 These are correct (the reference code runs them) but not fast:
 
-- **Reference in-block (`CI_K_REF`)**: VFP and every coprocessor data
-  transfer, `LDM`/`STM` with the S bit (user-bank and exception return),
+- **Reference in-block (`CI_K_REF`)**: every coprocessor data transfer
+  other than VFP, `LDM`/`STM` with the S bit (user-bank and exception return),
   `LDM`/`STM` crossing a 1 KiB boundary or missing the host TLB, `SWP`,
   exclusives, DSP multiplies, SIMD/saturating media, `MSR`, `MRS SPSR`, `CPS`,
   `SETEND`, PC-relative forms the reference treats specially, and every
-  access to device memory. The `vfp` workload therefore gains only ~1.3×.
+  access to device memory. VFP runs the reference's VFP unit directly
+  (`CI_K_VFP`, no decode tree) but the unit itself and its memory path are
+  unspecialised, so the `vfp` workload gains ~1.6× (`BENCHMARK_RESULTS.md`
+  §7).
 - **Single-stepped through `arm_step` (block stop)**: `SVC`, `BKPT`, CP14/CP15
   (including `WFI` and all cache/TLB maintenance), undefined encodings, and
   any instruction that faults on fetch.

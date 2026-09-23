@@ -338,7 +338,7 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return CI_DEC_STOP;                               /* reserved: UNDEFINED */
     if ((insn & 0x0f000010u) == 0x0e000010u) {            /* MCR / MRC */
         unsigned cp = (insn >> 8) & 0xfu;
-        if (cp == 10u || cp == 11u) return ref(op, false);
+        if (cp == 10u || cp == 11u) { op->kind = CI_K_VFP; return CI_DEC_OP; }
         if (cp == 15u) {
             const bool L = (insn >> 20) & 1u;
             const unsigned opc1 = (insn >> 21) & 7u, crn = (insn >> 16) & 0xfu;
@@ -365,8 +365,10 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return CI_DEC_STOP;
     }
     if ((insn & 0x0f000e10u) == 0x0e000a00u ||            /* VFP CDP */
-        (insn & 0x0e000e00u) == 0x0c000a00u)              /* VFP LDC/STC/MCRR */
-        return ref(op, false);
+        (insn & 0x0e000e00u) == 0x0c000a00u) {            /* VFP LDC/STC/MCRR */
+        op->kind = CI_K_VFP;
+        return CI_DEC_OP;
+    }
     if ((insn & 0x0f000000u) == 0x0f000000u) return CI_DEC_STOP;       /* SVC */
     if ((insn & 0x0c000000u) == 0x00000000u) return decode_dp(pc, insn, op);
     return CI_DEC_STOP;

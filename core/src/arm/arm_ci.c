@@ -401,7 +401,8 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
         }
         /* A reference record uses only kind and raw; its class rides in sa
          * for the statistics. */
-        if (ops[n].kind == CI_K_REF) ops[n].sa = (uint8_t)ci_ref_class(word, thumb);
+        if (ops[n].kind == CI_K_REF || ops[n].kind == CI_K_VFP)
+            ops[n].sa = (uint8_t)ci_ref_class(word, thumb);
         n++;
         if (d == CI_DEC_END) break;
     }
@@ -873,7 +874,8 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             const uint32_t ctrl = c->cpsr & CI_CTRL_MASK;
             c->cycles += (uint64_t)(op - flushed);
             R[15] = pc;
-            arm_status_t st = b->thumb ? arm_exec_thumb_insn(c, pc, (uint16_t)op->raw)
+            arm_status_t st = op->kind == CI_K_VFP ? arm_exec_vfp_insn(c, pc, op->raw)
+                            : b->thumb ? arm_exec_thumb_insn(c, pc, (uint16_t)op->raw)
                                        : arm_exec_arm_insn(c, pc, op->raw);
             flushed = op + 1;
             if (CI_UNLIKELY(st != ARM_OK)) {
@@ -883,7 +885,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                 return EXEC_STOP;
             }
             ci->st.ref_retired++;
-            if (op->kind == CI_K_REF) ci->st.ref_class[op->sa]++;
+            if (op->kind == CI_K_REF || op->kind == CI_K_VFP) ci->st.ref_class[op->sa]++;
             else ci->st.ref_fallback++;
             op++;
             /* A mode or endianness change always needs the machine. A change

@@ -167,3 +167,27 @@ device accesses and host-side frame work. The app's Performance & Sound
 Details now reports the engine's share and why instructions leave it
 (`arm_ci_describe_stats`), which is the measurement that decides the next
 optimisation.
+
+## 7. VFP straight to the unit (commit after `4b4fb61`)
+
+The engine used to hand every VFP instruction to `arm_exec_arm_insn`, whose
+decode tree (about 24 % of host time in the `vfp` workload, callgrind) only
+leads to `vfp_execute`. VFP records are now `CI_K_VFP` and call
+`arm_exec_vfp_insn`, the reference's own tail for that path (cycles, the
+unit, data-abort completion, the lazy-enable Undefined rule, r15). The
+differential fuzzer gained VFP generators (every group the unit decodes, a
+varied FPSCR and sometimes VFP disabled): 400,000 runs, 0 mismatches; two
+deliberate bugs in the new helper were caught (242 and 1,166 mismatches in
+40,000 runs). Same host as §3, `cpubench --workload vfp --isa arm`, medians
+of 7 (exact) and 5 (active clock), M instr/s:
+
+| Row | Before | After |
+|---|---:|---:|
+| vfp ARM User, exact | 44.8 | 55.8 |
+| vfp ARM SVC, exact | 46.8 | 56.4 |
+| vfp ARM User, `--active-clock` | 51.3 | 64.8 |
+| vfp ARM SVC, `--active-clock` | 51.8 | 65.5 |
+
+About +22–26 %. What remains per VFP instruction (~250 host instructions)
+is the unit itself: `vfp_execute_inner` 31 %, `f32_do` 7 %, and VLDR/VLDM
+reaching memory through `mem_r32_as` (9 %, no host-TLB fast path yet).
