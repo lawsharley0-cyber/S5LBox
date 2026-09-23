@@ -1,0 +1,74 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ninja-release",
+      "displayName": "Ninja, Release (any host, default compiler)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "ninja-debug",
+      "displayName": "Ninja, Debug (any host, default compiler)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/ninja-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "strict",
+      "displayName": "Ninja, Debug, -Wall -Wextra -Werror, JIT + static engine (mirrors the CI strict job; GCC/Clang)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/strict",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "S5LBOX_JIT": "ON",
+        "S5LBOX_STATIC_A64_ENGINE": "ON",
+        "CMAKE_C_FLAGS": "-Wall -Wextra -Werror"
+      }
+    },
+    {
+      "name": "vs2022",
+      "displayName": "Visual Studio 2022, x64 (MSVC) - multi-config",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/vs2022",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "msvc-ninja-release",
+      "displayName": "Ninja + cl.exe, Release (run from a VS x64 Developer prompt)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/msvc-ninja-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_C_COMPILER": "cl" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "clang-cl-release",
+      "displayName": "Ninja + clang-cl, Release (run from a VS x64 Developer prompt with the LLVM component)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang-cl-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_C_COMPILER": "clang-cl" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "ninja-release", "configurePreset": "ninja-release" },
+    { "name": "ninja-debug", "configurePreset": "ninja-debug" },
+    { "name": "strict", "configurePreset": "strict" },
+    { "name": "vs2022-release", "configurePreset": "vs2022", "configuration": "Release" },
+    { "name": "vs2022-debug", "configurePreset": "vs2022", "configuration": "Debug" },
+    { "name": "msvc-ninja-release", "configurePreset": "msvc-ninja-release" },
+    { "name": "clang-cl-release", "configurePreset": "clang-cl-release" }
+  ],
+  "testPresets": [
+    { "name": "ninja-release", "configurePreset": "ninja-release", "output": { "outputOnFailure": true } },
+    { "name": "ninja-debug", "configurePreset": "ninja-debug", "output": { "outputOnFailure": true } },
+    { "name": "strict", "configurePreset": "strict", "output": { "outputOnFailure": true } },
+    { "name": "vs2022-release", "configurePreset": "vs2022", "configuration": "Release", "output": { "outputOnFailure": true } },
+    { "name": "vs2022-debug", "configurePreset": "vs2022", "configuration": "Debug", "output": { "outputOnFailure": true } },
+    { "name": "msvc-ninja-release", "configurePreset": "msvc-ninja-release", "output": { "outputOnFailure": true } },
+    { "name": "clang-cl-release", "configurePreset": "clang-cl-release", "output": { "outputOnFailure": true } }
+  ]
+}
