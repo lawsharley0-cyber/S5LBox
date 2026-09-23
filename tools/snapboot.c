@@ -413,6 +413,7 @@ int main(int argc, char **argv) {
     const char *cmdline = "debug=0x8 serial=1";
     uint32_t ram_size = 128u << 20;
     unsigned ba_rev = 1, ba_ver = 6;
+    s5l8900_cpu_backend_t cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
 
     struct { uint64_t at; const char *path; } snaps[8];
     unsigned nsnaps = 0;
@@ -420,6 +421,34 @@ int main(int argc, char **argv) {
     unsigned npeeks = 0;
 
     for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--cached-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ir-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
+            continue;
+        }
+        if (!strcmp(argv[i], "--jit-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_JIT;
+            continue;
+        }
+        if (!strcmp(argv[i], "--cpu-backend") && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (!strcmp(val, "interp") || !strcmp(val, "interpreter")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
+            } else if (!strcmp(val, "cached") || !strcmp(val, "block")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            } else if (!strcmp(val, "ir") || !strcmp(val, "opt")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
+            } else if (!strcmp(val, "jit")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_JIT;
+            } else {
+                fprintf(stderr, "unknown CPU backend: %s\n", val);
+                return 1;
+            }
+            continue;
+        }
         if (!strcmp(argv[i], "--snapshot-at") && i + 2 < argc) {
             if (nsnaps < 8) {
                 snaps[nsnaps].at   = strtoull(argv[i + 1], NULL, 0);
@@ -543,6 +572,7 @@ int main(int argc, char **argv) {
     s5l8900_t mach;
     if (!s5l8900_init(&mach, phys_base, ram_size)) { fprintf(stderr, "init failed\n"); return 1; }
     mach.trace_devices = true;
+    s5l8900_set_cpu_backend(&mach, cpu_backend_choice);
 
     for (unsigned i = 0; i < mo.segment_count; i++) {
         macho_segment_t *s = &mo.segments[i];

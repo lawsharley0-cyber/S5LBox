@@ -203,10 +203,12 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 125768 adds host-only audio sink callback/context to s5l8900_t (16) and two
  * s5l_i2s_t host callback/counter fields (2 x 24 = 48), also live host wiring
  * and deliberately outside snap_mach().
+ * 125792 adds host-only CPU backend acceleration state (enum backend, cached block
+ * pointer, micro-op IR pointer, 24 bytes). Never serialized in snap_mach().
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         125768, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         125792, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */

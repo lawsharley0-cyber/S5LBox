@@ -33595,6 +33595,7 @@ static void boot_print_usage(FILE *stream, const char *argv0) {
             "          [--touch <at>:<x>:<y>[:<hold>]] ...\n"
             "          [--drag <at>:<x0>:<y0>:<x1>:<y1>[:<steps>[:<span>]]] ...\n"
             "          [--fast] [--run-api] [--frame-meter]\n"
+            "          [--cpu-backend <interp|cached|ir|jit> | --cached-cpu | --ir-cpu | --jit-cpu]\n"
             "          [--interpreter-control | --compact-raw-control]\n"
             "          [--canonical-bus]\n"
             "          [--no-direct-ram-writes]\n"
@@ -34179,6 +34180,7 @@ int main(int argc, char **argv) {
     memset(&external_bridge, 0, sizeof external_bridge);
     memset(&external_raw_bridge, 0, sizeof external_raw_bridge);
     memset(&external_bridge_mux, 0, sizeof external_bridge_mux);
+    s5l8900_cpu_backend_t cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -34186,6 +34188,38 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             boot_print_usage(stdout, argv[0]);
             return 0;
+        }
+        if (!strcmp(argv[i], "--cached-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ir-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
+            continue;
+        }
+        if (!strcmp(argv[i], "--jit-cpu")) {
+            cpu_backend_choice = S5L8900_CPU_BACKEND_JIT;
+            continue;
+        }
+        if (!strcmp(argv[i], "--cpu-backend")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "--cpu-backend wants <interp|cached|ir|jit>\n");
+                return 1;
+            }
+            const char *val = argv[++i];
+            if (!strcmp(val, "interp") || !strcmp(val, "interpreter")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
+            } else if (!strcmp(val, "cached") || !strcmp(val, "block")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            } else if (!strcmp(val, "ir") || !strcmp(val, "opt")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
+            } else if (!strcmp(val, "jit")) {
+                cpu_backend_choice = S5L8900_CPU_BACKEND_JIT;
+            } else {
+                fprintf(stderr, "unknown CPU backend: %s (expected interp, cached, ir, jit)\n", val);
+                return 1;
+            }
+            continue;
         }
         /* --fast is a harness toggle, not a machine one: it changes what this
          * program OBSERVES, never what the guest executes, so it is deliberately
@@ -37346,6 +37380,13 @@ external_md_work_ready:
         printf("watch      : %-12s vm 0x%08x\n", wps[i].name, wps[i].va);
     vm_resolve();
     printf("\n");
+
+    s5l8900_set_cpu_backend(&mach, cpu_backend_choice);
+    if (cpu_backend_choice != S5L8900_CPU_BACKEND_INTERPRETER) {
+        const char *bname = (cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached-block" :
+                            (cpu_backend_choice == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "ir-optimized" : "jit";
+        printf("cpu backend: %s\n", bname);
+    }
 
     arm_status_t st = ARM_OK;
     /*

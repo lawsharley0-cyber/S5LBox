@@ -18,6 +18,14 @@ endif()
 # This same static library is what the iOS app links against.
 add_library(emucore STATIC
     src/arm/arm_interp.c
+    src/arm/arm_profile.c
+    src/arm/arm_block_decoder.c
+    src/arm/arm_block_cache.c
+    src/arm/arm_block_exec.c
+    src/arm/arm_ir_lifter.c
+    src/arm/arm_ir_opt.c
+    src/arm/arm_ir_cache.c
+    src/arm/arm_ir_exec.c
     src/arm/vfp.c
     src/arm/a64_static_engine.c
     src/mmu.c
@@ -1406,6 +1414,26 @@ add_test(NAME app_option_mirror
             -DBOOTKERNEL=$<TARGET_FILE:bootkernel>
             -DVMOPTIONS=$<TARGET_FILE:test_vmoptions>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_option_mirror.cmake)
+
+add_executable(test_profiler tests/test_profiler.c)
+target_link_libraries(test_profiler PRIVATE emucore)
+add_test(NAME cpu_profiler COMMAND test_profiler)
+
+add_executable(test_cached_interp tests/test_cached_interp.c)
+target_link_libraries(test_cached_interp PRIVATE emucore)
+add_test(NAME cpu_cached_interp COMMAND test_cached_interp)
+
+add_executable(test_block_cache tests/test_block_cache.c)
+target_link_libraries(test_block_cache PRIVATE emucore)
+add_test(NAME cpu_block_cache COMMAND test_block_cache)
+
+add_executable(test_ir tests/test_ir.c)
+target_link_libraries(test_ir PRIVATE emucore)
+add_test(NAME cpu_ir COMMAND test_ir)
+
+add_executable(test_fastmem tests/test_fastmem.c)
+target_link_libraries(test_fastmem PRIVATE emucore)
+add_test(NAME cpu_fastmem COMMAND test_fastmem)
 
 # snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
 # and can restore into a fresh process. Comparing snapshot bytes alone is not

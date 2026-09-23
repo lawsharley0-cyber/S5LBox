@@ -801,6 +801,24 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     return count;
 }
 
+- (void)configureCpuBackend {
+    NSString *backendPref = [[NSUserDefaults standardUserDefaults] stringForKey:@"vm.cpu.backend"];
+    s5l8900_cpu_backend_t backend = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+    if ([backendPref isEqualToString:@"interp"]) {
+        backend = S5L8900_CPU_BACKEND_INTERPRETER;
+    } else if ([backendPref isEqualToString:@"ir"]) {
+        backend = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
+    } else if ([backendPref isEqualToString:@"jit"]) {
+        backend = S5L8900_CPU_BACKEND_JIT;
+    }
+    s5l8900_set_cpu_backend(&_machine, backend);
+    s5l8900_set_direct_ram_writes(&_machine, true);
+    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "interpreter" :
+                        (backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "micro-op IR" :
+                        (backend == S5L8900_CPU_BACKEND_JIT) ? "ARM64 native JIT" : "cached blocks (fastmem)";
+    [self appendConsole:[NSString stringWithFormat:@"[vm] CPU execution backend: %s\n", bname]];
+}
+
 #pragma mark - Lifecycle
 
 - (BOOL)start {
@@ -895,6 +913,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
         [self appendConsole:@"[vm] could not allocate 128 MB of guest DRAM\n"];
         return NO;
     }
+    [self configureCpuBackend];
     if (![self installGuestPayload]) {
         s5l8900_free(&_machine);
         vm_firmware_boot_destroy(&_firmwareBoot);

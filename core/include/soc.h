@@ -20,6 +20,16 @@
 #include <stdint.h>
 #include "arm.h"
 
+typedef struct arm_block_cache arm_block_cache_t;
+typedef struct arm_ir_cache arm_ir_cache_t;
+
+typedef enum {
+    S5L8900_CPU_BACKEND_INTERPRETER = 0,
+    S5L8900_CPU_BACKEND_CACHED_BLOCK,
+    S5L8900_CPU_BACKEND_IR_OPTIMIZED,
+    S5L8900_CPU_BACKEND_JIT
+} s5l8900_cpu_backend_t;
+
 /* ------------------------------------------------------------ memory map
  *
  * CONFIRMED from the shipped device tree (firmware/devicetree.bin, iPhone1,2
@@ -4123,6 +4133,15 @@ typedef struct {
      */
     s5l_audio_ready_fn        audio_ready;
     void                     *audio_ctx;
+
+    /*
+     * Host-only CPU acceleration backends (cached basic block, micro-op IR).
+     * Never serialised: contains host execution policy and caches derivable from
+     * guest RAM.
+     */
+    s5l8900_cpu_backend_t     cpu_backend;
+    arm_block_cache_t        *block_cache;
+    arm_ir_cache_t           *ir_cache;
 } s5l8900_t;
 
 /*
@@ -4618,5 +4637,9 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status);
  * of guest state or a snapshot. */
 uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m);
 uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m);
+
+/* CPU acceleration backend management */
+void                  s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend);
+s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m);
 
 #endif /* S5LBOX_SOC_H */
