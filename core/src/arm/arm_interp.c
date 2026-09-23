@@ -14,7 +14,6 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
-#include "arm_mem.h"
 #include <string.h>
 #include "vfp.h"
 
@@ -207,9 +206,104 @@ static void mem_write_crossing(arm_cpu_t *c, uint32_t va, unsigned n, uint32_t v
 }
 
 /*
- * The data-read and data-write block cache primitives are defined in arm_mem.h.
+ * The data-read block cache. See the dread[] comment in arm.h for why this is
+ * reads-only and why privilege is in the index as well as the tag.
  */
+#define ARM_DREAD_BLK_MASK 0x3ffu
 
+static inline unsigned dread_slot(uint32_t va, bool priv) {
+    return (unsigned)(((va >> 10) + (priv ? ARM_DREAD_ENTRIES / 2u : 0u))
+                      & (ARM_DREAD_ENTRIES - 1u));
+}
+static inline uint32_t dread_tag(uint32_t va, bool priv) {
+    return (va & ~ARM_DREAD_BLK_MASK) | (priv ? 1u : 0u);
+}
+
+/*
+ * A host pointer for an n-byte read at va, or NULL to take the slow path.
+ *
+ * Refuses an access that leaves the block, which is both a permission
+ * question (ARMv6 legacy small pages carry one set of AP bits per 1 KB
+ * subpage) and a bounds one (host_ram only vouched for these 0x400 bytes, and
+ * the last block of RAM has nothing valid after it).
+ *
+ * Never latches an abort and never installs anything: filling is the slow
+ * path's job, because only the slow path has done the walk that proves the
+ * access is permitted at all.
+ */
+static inline const uint8_t *dread_hit(arm_cpu_t *c, uint32_t va, unsigned n,
+                                       bool priv) {
+#ifdef S5LBOX_NO_DREAD
+    /* §9.5's oracle: a pure cache must not change a single retired
+     * instruction, so a build with it disabled is the comparison. */
+    (void)va; (void)n; (void)priv;
+    c->dread_misses++;
+    return NULL;
+#else
+    if (((va & ARM_DREAD_BLK_MASK) + n) > (ARM_DREAD_BLK_MASK + 1u))
+        { c->dread_misses++; return NULL; }
+    const unsigned slot = dread_slot(va, priv);
+    if (!c->dread[slot].host ||
+        c->dread[slot].tag != dread_tag(va, priv) ||
+        c->dread[slot].gen != c->tlb_gen)
+        { c->dread_misses++; return NULL; }
+    c->dread_hits++;
+    return c->dread[slot].host + (va & ARM_DREAD_BLK_MASK);
+#endif
+}
+
+/* Install the block a successful walk just resolved, when it is plain RAM.
+ * `pa` keeps va's low bits, so the offset within the block is the same on
+ * both sides and the pointer lands exactly where bus_read would have. */
+static inline void dread_fill(arm_cpu_t *c, uint32_t va, uint32_t pa,
+                              bool priv) {
+#ifdef S5LBOX_NO_DREAD
+    (void)c; (void)va; (void)pa; (void)priv;
+    return;
+#else
+    if (!c->bus->host_ram) return;
+    uint8_t *blk = c->bus->host_ram(c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK,
+                                    ARM_DREAD_BLK_MASK + 1u);
+    if (!blk) return;
+    const unsigned slot = dread_slot(va, priv);
+    c->dread[slot].host = blk;
+    c->dread[slot].tag  = dread_tag(va, priv);
+    c->dread[slot].gen  = c->tlb_gen;
+#endif
+}
+
+/* The write cache repeats dread's proven translation key, but it is live only
+ * when the frontend supplies host_ram_write. That separate callback is the
+ * permission to bypass bus write observers; host_ram alone is never enough. */
+static inline uint8_t *dwrite_hit(arm_cpu_t *c, uint32_t va, unsigned n,
+                                  bool priv) {
+    if (!c->bus->host_ram_write) return NULL;
+    if (((va & ARM_DREAD_BLK_MASK) + n) > (ARM_DREAD_BLK_MASK + 1u)) {
+        c->dwrite_misses++;
+        return NULL;
+    }
+    const unsigned slot = dread_slot(va, priv);
+    if (!c->dwrite[slot].host ||
+        c->dwrite[slot].tag != dread_tag(va, priv) ||
+        c->dwrite[slot].gen != c->tlb_gen) {
+        c->dwrite_misses++;
+        return NULL;
+    }
+    c->dwrite_hits++;
+    return c->dwrite[slot].host + (va & ARM_DREAD_BLK_MASK);
+}
+
+static inline void dwrite_fill(arm_cpu_t *c, uint32_t va, uint32_t pa,
+                               bool priv) {
+    if (!c->bus->host_ram_write) return;
+    uint8_t *blk = c->bus->host_ram_write(
+        c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK, ARM_DREAD_BLK_MASK + 1u);
+    if (!blk) return;
+    const unsigned slot = dread_slot(va, priv);
+    c->dwrite[slot].host = blk;
+    c->dwrite[slot].tag = dread_tag(va, priv);
+    c->dwrite[slot].gen = c->tlb_gen;
+}
 
 #define MEM_READ(bits)                                                        \
     static uint##bits##_t mem_r##bits##_as(arm_cpu_t *c, uint32_t va, bool priv) { \
@@ -2659,12 +2753,6 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
 
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
-
-    /* Complete any pending data abort latched from accelerated tiers before fetching */
-    if (c->abort_pending) {
-        take_pending_data_abort(c, pc);
-        return ARM_OK;
-    }
 
     /* A corrupted snapshot or malformed exception frame must not turn an
      * unimplemented CPSR mode into privileged User-bank execution. */

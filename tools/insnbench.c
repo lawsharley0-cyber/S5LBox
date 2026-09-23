@@ -51,9 +51,6 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"          /* pulls in arm.h */
-#include "arm_block.h"
-#include "arm_ir.h"
-#include "arm_profile.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -430,10 +427,6 @@ typedef struct {
     bool        run_api;     /* execute through app-facing s5l8900_run() */
     bool        user;        /* execute in unprivileged User mode       */
     bool        thumb;       /* enter with CPSR.T set                   */
-    bool        cached_block;/* execute via cached basic block engine   */
-    bool        direct_link; /* enable direct block linking             */
-    bool        ir_block;    /* execute via micro-op IR engine          */
-    bool        direct_writes;/* enable direct RAM writes (fastmem)      */
 } bench_cfg_t;
 
 /* Designated initialisers deliberately: this table gained a field once and
@@ -443,33 +436,9 @@ static const bench_cfg_t g_configs[] = {
     { .loop = "alu/branch",  .mmu = "off",         .tick = "no",
       .prog = g_prog_alu,   .prog_words = (unsigned)(sizeof g_prog_alu   / 4),
       .loop_insns = 5u },
-    { .loop = "alu/branch CACHED", .mmu = "off",   .tick = "no",
-      .prog = g_prog_alu,   .prog_words = (unsigned)(sizeof g_prog_alu   / 4),
-      .loop_insns = 5u, .cached_block = true },
-    { .loop = "alu/branch LINKED", .mmu = "off",   .tick = "no",
-      .prog = g_prog_alu,   .prog_words = (unsigned)(sizeof g_prog_alu   / 4),
-      .loop_insns = 5u, .cached_block = true, .direct_link = true },
-    { .loop = "alu/branch IR",     .mmu = "off",   .tick = "no",
-      .prog = g_prog_alu,   .prog_words = (unsigned)(sizeof g_prog_alu   / 4),
-      .loop_insns = 5u, .ir_block = true },
     { .loop = "load/store",  .mmu = "off",         .tick = "no",
       .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
       .loop_insns = 5u },
-    { .loop = "load/store CACHED", .mmu = "off",   .tick = "no",
-      .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
-      .loop_insns = 5u, .cached_block = true },
-    { .loop = "load/store FASTMEM", .mmu = "off",  .tick = "no",
-      .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
-      .loop_insns = 5u, .cached_block = true, .direct_writes = true },
-    { .loop = "load/store LINKED FASTMEM", .mmu = "off", .tick = "no",
-      .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
-      .loop_insns = 5u, .cached_block = true, .direct_link = true, .direct_writes = true },
-    { .loop = "load/store IR",     .mmu = "off",   .tick = "no",
-      .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
-      .loop_insns = 5u, .ir_block = true },
-    { .loop = "load/store IR FASTMEM", .mmu = "off", .tick = "no",
-      .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
-      .loop_insns = 5u, .ir_block = true, .direct_writes = true },
     { .loop = "load/store",  .mmu = "off",         .tick = "yes",
       .prog = g_prog_ldst,  .prog_words = (unsigned)(sizeof g_prog_ldst  / 4),
       .loop_insns = 5u, .do_tick = true },
@@ -642,9 +611,6 @@ static bool check_map(s5l8900_t *m, bool small_pages) {
  */
 static bool setup(s5l8900_t *m, const bench_cfg_t *cfg) {
     if (!s5l8900_init(m, BENCH_RAM_BASE, BENCH_RAM_SIZE)) return false;
-    if (cfg->direct_writes) {
-        (void)s5l8900_set_direct_ram_writes(m, true);
-    }
 
     for (unsigned i = 0; i < cfg->prog_words; i++)
         poke32(m, BENCH_CODE_VA + i * 4u, cfg->prog[i]);
@@ -723,62 +689,7 @@ static bool run_burst(s5l8900_t *m, const bench_cfg_t *cfg, uint64_t insns,
     bool ok = true;
 
     double t0 = now_seconds();
-    if (cfg->cached_block) {
-        arm_block_cache_t *bcache = arm_block_cache_create(256);
-        bool thumb = (cpu->cpsr & ARM_CPSR_T) != 0;
-        bool priv = (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-        arm_basic_block_t *block = arm_block_compile(bcache, cpu, cpu->r[15], thumb, priv);
-        if (cfg->direct_link && block && block->exit_type == ARM_EXIT_BRANCH_COND) {
-            if (block->branch_target == block->start_va) {
-                arm_block_link(block, block, NULL);
-            }
-        }
-        while (cpu->cycles - before < insns) {
-            if (!block) {
-                block = arm_block_cache_lookup(bcache, cpu->r[15], thumb, priv);
-                if (!block) {
-                    block = arm_block_compile(bcache, cpu, cpu->r[15], thumb, priv);
-                    if (!block) {
-                        if (arm_step(cpu) != ARM_OK) { ok = false; break; }
-                        continue;
-                    }
-                }
-            }
-            unsigned block_retired = 0;
-            if (arm_block_exec(cpu, block, &block_retired) != ARM_OK) { ok = false; break; }
-            if (cfg->direct_link && block->link_target && cpu->r[15] == block->branch_target) {
-                block = block->link_target;
-            } else {
-                block = NULL;
-            }
-        }
-        arm_block_cache_destroy(bcache);
-    } else if (cfg->ir_block) {
-        arm_ir_cache_t *ircache = arm_ir_cache_create(256);
-        bool thumb = (cpu->cpsr & ARM_CPSR_T) != 0;
-        bool priv = (cpu->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-        arm_ir_block_t *block = arm_ir_compile_block(ircache, cpu, cpu->r[15], thumb, priv);
-        while (cpu->cycles - before < insns) {
-            if (!block) {
-                block = arm_ir_cache_lookup(ircache, cpu->r[15], thumb, priv);
-                if (!block) {
-                    block = arm_ir_compile_block(ircache, cpu, cpu->r[15], thumb, priv);
-                    if (!block) {
-                        if (arm_step(cpu) != ARM_OK) { ok = false; break; }
-                        continue;
-                    }
-                }
-            }
-            unsigned block_retired = 0;
-            if (arm_ir_exec(cpu, block, &block_retired) != ARM_OK) { ok = false; break; }
-            if (block->exit_type == ARM_EXIT_BRANCH_COND && cpu->r[15] == block->start_va) {
-                /* Loop directly within block */
-            } else {
-                block = NULL;
-            }
-        }
-        arm_ir_cache_destroy(ircache);
-    } else if (cfg->run_api) {
+    if (cfg->run_api) {
         uint64_t remaining = insns;
         while (remaining != 0u) {
             unsigned chunk = remaining > UINT_MAX ? UINT_MAX : (unsigned)remaining;
@@ -987,14 +898,11 @@ int main(int argc, char **argv) {
     uint64_t insns = 20000000u;
     unsigned reps = 5u;
     const char *filter = NULL;
-    bool enable_profile = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
-        } else if (strcmp(argv[i], "--profile") == 0) {
-            enable_profile = true;
         } else if (strcmp(argv[i], "--insns") == 0 && i + 1 < argc) {
             insns = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--reps") == 0 && i + 1 < argc) {
@@ -1166,23 +1074,6 @@ int main(int argc, char **argv) {
     free(sorted);
     printf("INSNBENCH-SINK 0x%016" PRIx64 " (checked end-state values; a zero here would "
            "mean nothing executed)\n", g_sink);
-    if (enable_profile) {
-        arm_profiler_t prof;
-        arm_profiler_init(&prof);
-        double selected_rate = (sorted[0] > 0.0) ? sorted[0] : 100.0;
-        prof.total_instructions = insns;
-        prof.elapsed_seconds = (double)insns / (selected_rate * 1e6);
-        prof.time_exec = prof.elapsed_seconds * 0.65;
-        prof.time_decode = prof.elapsed_seconds * 0.20;
-        prof.time_mmu = prof.elapsed_seconds * 0.10;
-        prof.time_mem = prof.elapsed_seconds * 0.05;
-        prof.branch_count = insns / 5;
-        prof.branch_taken_count = (insns / 5) - 1;
-        arm_profiler_record_pc(&prof, BENCH_CODE_VA, false);
-        printf("\n");
-        arm_profiler_print_report(&prof);
-    }
-
     printf("INSNBENCH-DONE failures=%d\n", failures);
     return failures ? 1 : 0;
 }

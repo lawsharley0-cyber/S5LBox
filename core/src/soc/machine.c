@@ -9,8 +9,6 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
-#include "arm_block.h"
-#include "arm_ir.h"
 #include "../arm/a64_static_engine.h"
 #include <stdlib.h>
 #include <string.h>
@@ -1531,14 +1529,6 @@ void s5l8900_free(s5l8900_t *m) {
     free(m->mbx.edram);
     m->mbx.edram = NULL;
     s5l_nor_free(&m->nor);
-    if (m->block_cache) {
-        arm_block_cache_destroy(m->block_cache);
-        m->block_cache = NULL;
-    }
-    if (m->ir_cache) {
-        arm_ir_cache_destroy(m->ir_cache);
-        m->ir_cache = NULL;
-    }
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
@@ -1913,7 +1903,7 @@ static unsigned interpreter_tick_batch_limit(const s5l8900_t *m,
                                               unsigned remaining,
                                               bool active_clock) {
     if ((m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
-        m->pre_step_hook || m->cpu.abort_pending)
+        m->pre_step_hook)
         return 0u;
 #if defined(S5LBOX_STATIC_A64_ENGINE)
     if (s5l8900_static_a64_is_enabled(m)) return 0u;
@@ -2211,56 +2201,6 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
         }
 #endif
 
-        /* Acceleration Backends (Cached Block, JIT & Micro-Op IR) */
-        if (!m->pre_step_hook &&
-            (m->cpu_backend == S5L8900_CPU_BACKEND_CACHED_BLOCK ||
-             m->cpu_backend == S5L8900_CPU_BACKEND_JIT) && m->block_cache &&
-            !m->cpu.abort_pending &&
-            !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
-            !(m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I))) {
-            bool thumb = (m->cpu.cpsr & ARM_CPSR_T) != 0;
-            bool priv = (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-            arm_basic_block_t *block = arm_block_cache_lookup(m->block_cache, m->cpu.r[15], thumb, priv);
-            if (!block) {
-                block = arm_block_compile(m->block_cache, &m->cpu, m->cpu.r[15], thumb, priv);
-            }
-            if (block && block->insn_count > 0 && block->insn_count <= (max_steps - n)) {
-                unsigned retired = 0;
-                st = arm_block_exec(&m->cpu, block, &retired);
-                if (retired > 0) {
-                    n += retired;
-                    run_clock_retired(m, &active_clock, &active_pending_retired, retired,
-                                      st != ARM_OK,
-                                      m->level_dirty || ext_inputs(m) != m->ext_seen);
-                    if (st != ARM_OK) break;
-                    continue;
-                }
-            }
-        } else if (!m->pre_step_hook &&
-                   m->cpu_backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && m->ir_cache &&
-                   !m->cpu.abort_pending &&
-                   !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
-                   !(m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I))) {
-            bool thumb = (m->cpu.cpsr & ARM_CPSR_T) != 0;
-            bool priv = (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-            arm_ir_block_t *block = arm_ir_cache_lookup(m->ir_cache, m->cpu.r[15], thumb, priv);
-            if (!block) {
-                block = arm_ir_compile_block(m->ir_cache, &m->cpu, m->cpu.r[15], thumb, priv);
-            }
-            if (block && block->insn_count > 0 && block->insn_count <= (max_steps - n)) {
-                unsigned retired = 0;
-                st = arm_ir_exec(&m->cpu, block, &retired);
-                if (retired > 0) {
-                    n += retired;
-                    run_clock_retired(m, &active_clock, &active_pending_retired, retired,
-                                      st != ARM_OK,
-                                      m->level_dirty || ext_inputs(m) != m->ext_seen);
-                    if (st != ARM_OK) break;
-                    continue;
-                }
-            }
-        }
-
         /* A limit of one cannot save a tick call, so retain the smaller
          * ordinary path at the edge itself. Inside a real batch, inspect every
          * retirement boundary for the exact three events the public tick would
@@ -2333,14 +2273,8 @@ uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m) {
 void s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend) {
     if (!m) return;
     m->cpu_backend = backend;
-    if ((backend == S5L8900_CPU_BACKEND_CACHED_BLOCK || backend == S5L8900_CPU_BACKEND_JIT) && !m->block_cache) {
-        m->block_cache = arm_block_cache_create(0);
-    } else if (backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && !m->ir_cache) {
-        m->ir_cache = arm_ir_cache_create(0);
-    }
 }
 
 s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m) {
     return m ? m->cpu_backend : S5L8900_CPU_BACKEND_INTERPRETER;
 }
-

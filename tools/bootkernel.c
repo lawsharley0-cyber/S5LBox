@@ -37385,7 +37385,11 @@ external_md_work_ready:
     if (cpu_backend_choice != S5L8900_CPU_BACKEND_INTERPRETER) {
         const char *bname = (cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached-block" :
                             (cpu_backend_choice == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "ir-optimized" : "jit";
-        printf("cpu backend: %s\n", bname);
+        /* Say what actually executes, not only what was asked for: the
+         * backend only matters on the --run-api path, and until the cached
+         * interpreter is wired in every request runs on arm_step. */
+        printf("cpu backend: %s requested; executing on the reference "
+               "interpreter\n", bname);
     }
 
     arm_status_t st = ARM_OK;

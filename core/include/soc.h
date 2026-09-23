@@ -20,9 +20,12 @@
 #include <stdint.h>
 #include "arm.h"
 
-typedef struct arm_block_cache arm_block_cache_t;
-typedef struct arm_ir_cache arm_ir_cache_t;
-
+/*
+ * Host CPU execution backend. INTERPRETER (arm_step) is the specification and
+ * the default. The other three values are kept so every frontend that already
+ * names them keeps compiling; see s5l8900_set_cpu_backend() for what each
+ * selects today.
+ */
 typedef enum {
     S5L8900_CPU_BACKEND_INTERPRETER = 0,
     S5L8900_CPU_BACKEND_CACHED_BLOCK,
@@ -4135,13 +4138,11 @@ typedef struct {
     void                     *audio_ctx;
 
     /*
-     * Host-only CPU acceleration backends (cached basic block, micro-op IR).
-     * Never serialised: contains host execution policy and caches derivable from
-     * guest RAM.
+     * Host-only execution policy: which CPU backend s5l8900_run() uses. Never
+     * serialised -- it changes how instructions are executed, not what they
+     * compute.
      */
     s5l8900_cpu_backend_t     cpu_backend;
-    arm_block_cache_t        *block_cache;
-    arm_ir_cache_t           *ir_cache;
 } s5l8900_t;
 
 /*
@@ -4638,7 +4639,13 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status);
 uint64_t s5l8900_interpreter_tick_batches(const s5l8900_t *m);
 uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m);
 
-/* CPU acceleration backend management */
+/*
+ * Select the CPU backend used by s5l8900_run(). Today every value executes
+ * through the reference interpreter: the CACHED_BLOCK / IR_OPTIMIZED / JIT
+ * tiers added in 75ad89f were removed because they computed wrong results
+ * (docs/CURRENT_ARCHITECTURE.md section 7). The request is recorded so
+ * frontends keep their settings, and get() reports what was requested.
+ */
 void                  s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend);
 s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m);
 
