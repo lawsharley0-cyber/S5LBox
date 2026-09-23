@@ -2212,7 +2212,8 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
 #endif
 
         /* Acceleration Backends (Cached Block, JIT & Micro-Op IR) */
-        if ((m->cpu_backend == S5L8900_CPU_BACKEND_CACHED_BLOCK ||
+        if (!m->pre_step_hook &&
+            (m->cpu_backend == S5L8900_CPU_BACKEND_CACHED_BLOCK ||
              m->cpu_backend == S5L8900_CPU_BACKEND_JIT) && m->block_cache &&
             !m->cpu.abort_pending &&
             !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
@@ -2235,7 +2236,8 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
                     continue;
                 }
             }
-        } else if (m->cpu_backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && m->ir_cache &&
+        } else if (!m->pre_step_hook &&
+                   m->cpu_backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && m->ir_cache &&
                    !m->cpu.abort_pending &&
                    !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
                    !(m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I))) {

@@ -496,6 +496,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
             s5l8900_free(&_machine);
             if (!s5l8900_init(&_machine, VM_GUEST_RAM_BASE, VM_GUEST_RAM_SIZE))
                 return NO;
+            [self configureCpuBackend];
         } else {
             note = @"Not enough memory to start Apple's kernel.";
         }
@@ -803,10 +804,12 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
 
 - (void)configureCpuBackend {
     NSString *backendPref = [[NSUserDefaults standardUserDefaults] stringForKey:@"vm.cpu.backend"];
-    s5l8900_cpu_backend_t backend = S5L8900_CPU_BACKEND_CACHED_BLOCK;
-    if ([backendPref isEqualToString:@"interp"]) {
+    s5l8900_cpu_backend_t backend = S5L8900_CPU_BACKEND_INTERPRETER;
+    if ([self isForcedInterpreterEnabled]) {
         backend = S5L8900_CPU_BACKEND_INTERPRETER;
-    } else if ([backendPref isEqualToString:@"ir"]) {
+    } else if ([backendPref isEqualToString:@"cached"] || [backendPref isEqualToString:@"block"] || [backendPref isEqualToString:@"cached-block"]) {
+        backend = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+    } else if ([backendPref isEqualToString:@"ir"] || [backendPref isEqualToString:@"micro-op"]) {
         backend = S5L8900_CPU_BACKEND_IR_OPTIMIZED;
     } else if ([backendPref isEqualToString:@"jit"]) {
         backend = S5L8900_CPU_BACKEND_JIT;
