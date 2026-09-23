@@ -142,3 +142,28 @@ digests on every row).
 The arm64 runner is the closest available proxy for an iPhone's CPU core; a
 phone measurement is still required (`MAC_VALIDATION.md` §4) and nothing here
 is a frame rate.
+
+## 6. In the app's timing mode (`--active-clock`)
+
+The iOS app runs the machine with an interactive clock
+(`s5l8900_set_active_host_clock`): guest time follows the host's monotonic
+clock, the engine's batches are up to 256 instructions, and the device graph
+is refreshed per host-clock sample (every 4,096 instructions) or on a device
+access, instead of at every timebase edge. `cpubench --active-clock` runs
+the same workloads that way. Same host and build as §3, commit after
+`3a9ddef`, `--reps 3 --mode user,svc`, all 40 rows `failures=0`:
+
+**Geomean 3.295× over the reference** (per row 1.14× `vfp` … 5.79× `raster`
+ARM SVC; e.g. bignum ARM User 58.7 → 280.6, sha1 ARM User 62.1 → 313.8,
+calls ARM User 48.9 → 173.8, mmu ARM User 25.3 → 37.2 M instr/s).
+
+The gain is larger than in exact mode (§3, 2.56×) because the per-edge
+device refresh that dominated there is mostly gone. On the phone, the
+default ("Standard") backend is the reference interpreter plus the compact
+build-time AArch64 engine, which `hotpath.md` measured about 6 % faster
+than the interpreter alone; the cached interpreter replaces both. A real
+boot also spends time the workloads do not: exceptions, SVCs, CP15 work,
+device accesses and host-side frame work. The app's Performance & Sound
+Details now reports the engine's share and why instructions leave it
+(`arm_ci_describe_stats`), which is the measurement that decides the next
+optimisation.

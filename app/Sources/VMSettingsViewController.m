@@ -1032,25 +1032,27 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"] ||
         [backend isEqualToString:@"jit"])
         return @"Cached Interpreter (from an older setting)";
-    return @"Reference Interpreter";
+    return @"Standard";
 }
 
 - (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView {
     NSString *current = [_settings cpuBackend];
     NSString *message =
-        @"Both backends execute the same ARM semantics. The cached interpreter "
-        @"predecodes guest code into blocks and runs anything unusual through "
-        @"the reference interpreter's own code. It is about 2x faster on desktop "
-        @"CPU benchmarks; it has not yet been measured on a device or validated "
-        @"across a full firmware boot, so the reference interpreter stays the "
-        @"default. Applies at the next start.";
+        @"Both backends execute the same ARM semantics. Standard is the "
+        @"reference interpreter plus, in this build, the compact build-time "
+        @"AArch64 engine where it applies. The cached interpreter replaces both: "
+        @"it predecodes guest code into blocks and runs anything unusual through "
+        @"the reference interpreter's own code. It is 2.5-4x faster on desktop "
+        @"CPU benchmarks; it has not yet been validated across a full firmware "
+        @"boot, so Standard stays the default. Performance & Sound Details "
+        @"shows its counters. Applies at the next start.";
     UIAlertController *picker = [UIAlertController
         alertControllerWithTitle:@"CPU Execution Backend"
                          message:message
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSDictionary<NSString *, NSString *> *> *backends = @[
-        @{ @"id": @"interp", @"name": @"Reference Interpreter (default)" },
+        @{ @"id": @"interp", @"name": @"Standard (default)" },
         @{ @"id": @"cached", @"name": @"Cached Interpreter (experimental)" },
     ];
 

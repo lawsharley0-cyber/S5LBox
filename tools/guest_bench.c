@@ -59,6 +59,14 @@ double gb_now_seconds(void) {
 }
 #endif
 
+static bool gb_active_now(void *ctx, uint64_t *nanoseconds) {
+    (void)ctx;
+    double s = gb_now_seconds();
+    if (s < 0.0) return false;
+    *nanoseconds = (uint64_t)(s * 1e9);
+    return true;
+}
+
 const char *gb_isa_name(gb_isa_t isa) {
     return isa == GB_ISA_THUMB ? "thumb" : "arm";
 }
@@ -185,6 +193,11 @@ bool gb_run(const gb_config_t *cfg, gb_result_t *out) {
     if (!s5l8900_init(m, GB_RAM_BASE, GB_RAM_SIZE)) { free(m); return false; }
     (void)s5l8900_set_direct_ram_writes(m, cfg->direct_writes);
     s5l8900_set_cpu_backend(m, cfg->backend);
+    if (cfg->active_clock && !s5l8900_set_active_host_clock(m, gb_active_now, NULL)) {
+        s5l8900_free(m);
+        free(m);
+        return false;
+    }
 
     s5l8900_load(m, GB_RAM_BASE, img->image, img->size);
     poke32(m, GB_RAM_BASE + img->mbox + MB_ID, cfg->workload);

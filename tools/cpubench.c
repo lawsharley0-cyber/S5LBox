@@ -11,7 +11,7 @@
  *
  *   cpubench [--backend interp,cached] [--workload all|name,...]
  *            [--isa arm,thumb] [--mode user,svc] [--reps N] [--div N]
- *            [--scale N] [--no-direct-writes]
+ *            [--scale N] [--no-direct-writes] [--active-clock]
  *
  * Repetitions are interleaved across backends (rep 1: A B, rep 2: A B, ...),
  * so host drift cannot masquerade as a backend difference. The headline is the
@@ -57,7 +57,7 @@ static bool list_has(const char *list, const char *item) {
 static void usage(const char *argv0) {
     printf("usage: %s [--backend interp,cached] [--workload all|name,...]\n"
            "          [--isa arm,thumb] [--mode user,svc] [--reps N]\n"
-           "          [--div N] [--scale N] [--no-direct-writes]\n\n"
+           "          [--div N] [--scale N] [--no-direct-writes] [--active-clock]\n\n"
            "workloads:", argv0);
     for (uint32_t w = 0; w < WL_COUNT; w++) printf(" %s", wl_name(w));
     printf("\n\nPrints median/best/worst M guest instructions/s per row. Exits\n"
@@ -70,6 +70,7 @@ int main(int argc, char **argv) {
     unsigned reps = 3u, div = 1u;
     uint32_t fixed_scale = 0u;
     bool direct_writes = true;
+    bool active_clock = false;   /* the iOS app's wall-clock guest time */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
@@ -81,6 +82,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--div") && i + 1 < argc) div = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) fixed_scale = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--no-direct-writes")) direct_writes = false;
+        else if (!strcmp(argv[i], "--active-clock")) active_clock = true;
         else { fprintf(stderr, "unknown argument: %s\n", argv[i]); usage(argv[0]); return 2; }
     }
     if (reps == 0u || reps > MAX_REPS || div == 0u) { usage(argv[0]); return 2; }
@@ -93,8 +95,9 @@ int main(int argc, char **argv) {
     if (nb == 0u) { fprintf(stderr, "no known backend in '%s'\n", backends_arg); return 2; }
 
     printf("CPUBENCH-METHOD reps=%u order=interleaved headline=median unit=Minsn/s "
-           "path=s5l8900_run chunk=100000 mmu=4K-pages va!=pa ticks=live direct_writes=%s\n",
-           reps, direct_writes ? "on" : "off");
+           "path=s5l8900_run chunk=100000 mmu=4K-pages va!=pa ticks=live direct_writes=%s "
+           "clock=%s\n",
+           reps, direct_writes ? "on" : "off", active_clock ? "active-host" : "exact");
 #if defined(NDEBUG)
     printf("CPUBENCH-BUILD optimised (NDEBUG)\n");
 #else
@@ -128,6 +131,7 @@ int main(int argc, char **argv) {
                             .workload = w, .scale = scale, .isa = (gb_isa_t)isa,
                             .user = user != 0, .backend = backends[b].id,
                             .direct_writes = direct_writes,
+                            .active_clock = active_clock,
                         };
                         gb_result_t res;
                         bool ok = gb_run(&cfg, &res);

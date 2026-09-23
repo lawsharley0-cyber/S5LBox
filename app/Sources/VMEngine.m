@@ -830,7 +830,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     s5l8900_set_direct_ram_writes(&_machine, true);
     /* IR_OPTIMIZED and JIT are retired names kept for saved settings; the
      * core runs both on the cached interpreter (see soc.h). */
-    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "reference interpreter" :
+    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "standard (reference interpreter + compact engine where built)" :
                         (backend == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached interpreter" :
                         "cached interpreter (older setting)";
     [self appendConsole:[NSString stringWithFormat:@"[vm] CPU execution backend: %s\n", bname]];
@@ -2202,7 +2202,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
         (void)arm_ci_describe_stats(&stats, retired, engine, sizeof engine);
     else
         (void)snprintf(engine, sizeof engine,
-                       "Reference interpreter in use (no engine counters).\n");
+                       "Standard backend in use (no cached-interpreter counters).\n");
     (void)s5l_unmodelled_describe(accesses, S5L_UNMODELLED_LOG, 12u,
                                   hardware, sizeof hardware);
     return [NSString stringWithFormat:

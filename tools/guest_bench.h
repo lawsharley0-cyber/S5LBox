@@ -37,6 +37,12 @@ typedef struct {
      * workload's checksum is unaffected; the FIQ timing is visible in the
      * state digest (LR_fiq, SPSR_fiq, the handler's counter). */
     uint32_t              fiq_period;
+    /* Run with the app's interactive clock: guest time follows the host's
+     * monotonic clock (s5l8900_set_active_host_clock), which is how the iOS
+     * app runs a machine. Device refreshes then happen per host-clock sample
+     * rather than at every timebase edge. The workloads never read time, so
+     * results and state digests are unchanged; only the cost profile moves. */
+    bool                  active_clock;
 } gb_config_t;
 
 typedef struct {
