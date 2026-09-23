@@ -203,6 +203,15 @@ arm_ir_block_t *arm_ir_compile_block(arm_ir_cache_t *cache, arm_cpu_t *cpu,
             break;
         }
 
+        if (di.op == ARM_OP_FALLBACK) {
+            if (decoded_insn_count == 0) {
+                return NULL;
+            }
+            block->exit_type = ARM_EXIT_FALLBACK;
+            block->fallthrough_target = cur_va;
+            break;
+        }
+
         unsigned written = 0;
         if (!arm_ir_lift_instruction(&di, &block->insns[ir_insn_idx],
                                      ARM_IR_MAX_INSNS - ir_insn_idx, &written)) {
@@ -211,12 +220,6 @@ arm_ir_block_t *arm_ir_compile_block(arm_ir_cache_t *cache, arm_cpu_t *cpu,
 
         ir_insn_idx += written;
         decoded_insn_count++;
-
-        if (di.op == ARM_OP_FALLBACK) {
-            block->exit_type = ARM_EXIT_FALLBACK;
-            block->fallthrough_target = cur_va;
-            break;
-        }
 
         if (di.op == ARM_OP_SVC) {
             block->exit_type = ARM_EXIT_SVC;

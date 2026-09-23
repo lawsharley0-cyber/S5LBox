@@ -36,6 +36,7 @@ static NSString *const kVMInstructionCapKey = @"vm.diag.instructionCap";
 static NSString *const kVMPauseInBackground = @"vm.diag.pauseInBackground";
 static NSString *const kVMDeveloperMode = @"VMDeveloperMode";
 static NSString *const kVMInlineConsole = @"VMInlineConsole";
+static NSString *const kVMCpuBackendKey = @"vm.cpu.backend";
 
 /*
  * The instruction caps the screen cycles through. 0 first because no limit is
@@ -277,6 +278,20 @@ static const uint64_t kVMInstructionCaps[] = {
     [self publishChange];
 }
 
+- (NSString *)cpuBackend {
+    NSString *val = [[self defaults] stringForKey:kVMCpuBackendKey];
+    if (!val || val.length == 0) {
+        return @"interp";
+    }
+    return val;
+}
+
+- (void)setCpuBackend:(NSString *)backend {
+    if (!backend || backend.length == 0) backend = @"interp";
+    [[self defaults] setObject:backend forKey:kVMCpuBackendKey];
+    [self publishChange];
+}
+
 #pragma mark - Firmware
 
 - (NSString *)documentsDirectory {
@@ -465,6 +480,7 @@ static const uint64_t kVMInstructionCaps[] = {
     }
     [defaults removeObjectForKey:kVMInstructionCapKey];
     [defaults removeObjectForKey:kVMPauseInBackground];
+    [defaults removeObjectForKey:kVMCpuBackendKey];
     [self publishChange];
 }
 

@@ -299,6 +299,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
             case IR_LOAD32: {
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val = ir_read32(cpu, base + insn->imm);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 write_vreg(cpu, tmps, insn->dst, val, thumb);
                 break;
             }
@@ -306,6 +310,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
             case IR_LOAD16: {
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val = ir_read16(cpu, base + insn->imm);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 write_vreg(cpu, tmps, insn->dst, val, thumb);
                 break;
             }
@@ -313,6 +321,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
             case IR_LOAD8: {
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val = ir_read8(cpu, base + insn->imm);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 write_vreg(cpu, tmps, insn->dst, val, thumb);
                 break;
             }
@@ -321,6 +333,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val  = read_vreg(cpu, tmps, insn->src2, insn->imm, insn->guest_pc, thumb);
                 ir_write32(block, cpu, base + insn->imm, val);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 break;
             }
 
@@ -328,6 +344,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val  = read_vreg(cpu, tmps, insn->src2, insn->imm, insn->guest_pc, thumb);
                 ir_write16(block, cpu, base + insn->imm, (uint16_t)val);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 break;
             }
 
@@ -335,6 +355,10 @@ arm_status_t arm_ir_exec(arm_cpu_t *cpu, arm_ir_block_t *block, unsigned *retire
                 uint32_t base = read_vreg(cpu, tmps, insn->src1, insn->imm, insn->guest_pc, thumb);
                 uint32_t val  = read_vreg(cpu, tmps, insn->src2, insn->imm, insn->guest_pc, thumb);
                 ir_write8(block, cpu, base + insn->imm, (uint8_t)val);
+                if (cpu->abort_pending) {
+                    cpu->r[15] = insn->guest_pc;
+                    goto done;
+                }
                 break;
             }
 

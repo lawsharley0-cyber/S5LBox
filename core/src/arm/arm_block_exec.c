@@ -281,6 +281,11 @@ arm_status_t arm_block_exec(arm_cpu_t *cpu, arm_basic_block_t *block, unsigned *
             uint32_t base = (di->rn == 15) ? ((di->pc + (di->is_thumb ? 4 : 8)) & ~3u) : cpu->r[di->rn];
             uint32_t addr = base + di->imm;
             uint32_t val = read32(cpu, addr);
+            if (cpu->abort_pending) {
+                cpu->r[15] = di->pc;
+                if (retired_out) *retired_out = retired;
+                return ARM_OK;
+            }
             if (di->rd == 15) {
                 cpu->r[15] = val & (di->is_thumb ? ~1u : ~3u);
                 retired++;
@@ -298,15 +303,26 @@ arm_status_t arm_block_exec(arm_cpu_t *cpu, arm_basic_block_t *block, unsigned *
             uint32_t addr = base + di->imm;
             uint32_t val = (di->rd == 15) ? (di->pc + 8) : cpu->r[di->rd];
             write32(block, cpu, addr, val);
+            if (cpu->abort_pending) {
+                cpu->r[15] = di->pc;
+                if (retired_out) *retired_out = retired;
+                return ARM_OK;
+            }
             cpu->r[15] = di->next_pc;
             retired++;
             continue;
         }
 
         if (di->op == ARM_OP_LDRB_IMM) {
-            uint32_t base = (di->rn == 15) ? (di->pc + (di->is_thumb ? 4 : 8)) : cpu->r[di->rn];
+            uint32_t base = (di->rn == 15) ? ((di->pc + (di->is_thumb ? 4 : 8)) & ~3u) : cpu->r[di->rn];
             uint32_t addr = base + di->imm;
-            cpu->r[di->rd] = read8(cpu, addr);
+            uint8_t val = read8(cpu, addr);
+            if (cpu->abort_pending) {
+                cpu->r[15] = di->pc;
+                if (retired_out) *retired_out = retired;
+                return ARM_OK;
+            }
+            cpu->r[di->rd] = val;
             cpu->r[15] = di->next_pc;
             retired++;
             continue;
@@ -316,6 +332,11 @@ arm_status_t arm_block_exec(arm_cpu_t *cpu, arm_basic_block_t *block, unsigned *
             uint32_t base = cpu->r[di->rn];
             uint32_t addr = base + di->imm;
             write8(block, cpu, addr, (uint8_t)cpu->r[di->rd]);
+            if (cpu->abort_pending) {
+                cpu->r[15] = di->pc;
+                if (retired_out) *retired_out = retired;
+                return ARM_OK;
+            }
             cpu->r[15] = di->next_pc;
             retired++;
             continue;

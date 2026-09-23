@@ -161,6 +161,9 @@ typedef NS_ENUM(NSInteger, VMGraphicsMode) {
 - (BOOL)pausesInBackground;
 - (void)setPausesInBackground:(BOOL)pauses;
 
+- (NSString *)cpuBackend;
+- (void)setCpuBackend:(NSString *)backend;
+
 #pragma mark - Firmware (reported only: none is shipped and none is downloaded)
 
 /* Where the app looks. Returned whether or not it exists, because the point of

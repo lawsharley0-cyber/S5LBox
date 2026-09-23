@@ -77,6 +77,7 @@ typedef NS_ENUM(NSInteger, VMFirmwareRow) {
 
 typedef NS_ENUM(NSInteger, VMDiagnosticsRow) {
     VMDiagnosticsRowInstructionCap = 0,
+    VMDiagnosticsRowCpuBackend,
     VMDiagnosticsRowPauseInBackground,
     VMDiagnosticsRowInlineConsole,
     /* Explicit, never automatic. See VMJitProbe.h -- this is the one control in
@@ -122,6 +123,8 @@ static NSString *VMStringFromC(const char *text) {
 - (void)inlineConsoleChanged:(UISwitch *)sender;
 - (void)developerModeToggled:(UISwitch *)sender;
 - (void)chooseGraphicsMode;
+- (NSString *)describeCpuBackend:(NSString *)backend;
+- (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView;
 /* These two were missing, which the comment above says cannot happen: clang
  * late-parses method bodies inside an @implementation, so a call before the
  * definition compiles anyway and the invariant this block exists to hold was
@@ -442,8 +445,8 @@ titleForFooterInSection:(NSInteger)section {
                     [_settings firmwareDirectory] ?: @"(no documents directory)",
                     [VMEngine firmwareReadinessSummary]];
         case VMSettingsSectionDiagnostics:
-            return @"The instruction cap, background pause and inline console "
-                    "are applied by the app. The JIT row is an explicit host "
+            return @"The CPU execution backend, instruction cap, background pause and "
+                    "inline console are applied by the app. The JIT row is an explicit host "
                     "capability test, not an emulator speed switch.";
         case VMSettingsSectionCommandLine:
             return @"What these switches would spell on a tools/bootkernel "
@@ -664,6 +667,18 @@ titleForFooterInSection:(NSInteger)section {
                 return cell;
             }
 
+            if (indexPath.row == VMDiagnosticsRowCpuBackend) {
+                UITableViewCell *cell = [self cellWithIdentifier:kVMValueCell
+                                                           style:UITableViewCellStyleSubtitle];
+                cell.textLabel.text = @"CPU Execution Backend";
+                cell.detailTextLabel.text = [NSString stringWithFormat:
+                    @"%@  ·  applied on boot  ·  tap to change",
+                    [self describeCpuBackend:[_settings cpuBackend]]];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+                return cell;
+            }
+
             if (indexPath.row == VMDiagnosticsRowJitProbe) {
                 UITableViewCell *cell = [self cellWithIdentifier:kVMValueCell
                                                            style:UITableViewCellStyleSubtitle];
@@ -809,6 +824,10 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
         case VMSettingsSectionDiagnostics:
             if (indexPath.row == VMDiagnosticsRowJitProbe) {
                 [self confirmAndRunJitProbeAt:indexPath inTable:tableView];
+                return;
+            }
+            if (indexPath.row == VMDiagnosticsRowCpuBackend) {
+                [self chooseCpuBackendAt:indexPath inTable:tableView];
                 return;
             }
             if (indexPath.row != VMDiagnosticsRowInstructionCap) return;
@@ -1002,6 +1021,75 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [picker addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                                style:UIAlertActionStyleCancel
                                              handler:nil]];
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (NSString *)describeCpuBackend:(NSString *)backend {
+    if ([backend isEqualToString:@"cached"] || [backend isEqualToString:@"block"] || [backend isEqualToString:@"cached-block"])
+        return @"Cached Blocks (Fastmem)";
+    if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"])
+        return @"Micro-Op IR (Optimized)";
+    if ([backend isEqualToString:@"jit"])
+        return @"ARM64 Native JIT";
+    return @"Reference Interpreter (Safe)";
+}
+
+- (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView {
+    NSString *current = [_settings cpuBackend];
+    NSString *message =
+        @"Choose CPU execution tier for the S5L8900 ARM CPU. "
+        @"Reference Interpreter provides 100% compliant execution. "
+        @"Cached Blocks and Micro-Op IR provide substantial speedups on device.";
+    UIAlertController *picker = [UIAlertController
+        alertControllerWithTitle:@"CPU Execution Backend"
+                         message:message
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSArray<NSDictionary<NSString *, NSString *> *> *backends = @[
+        @{ @"id": @"interp", @"name": @"Reference Interpreter (Safe, Exact)" },
+        @{ @"id": @"cached", @"name": @"Cached Blocks (Fastmem Dispatcher)" },
+        @{ @"id": @"ir",     @"name": @"Micro-Op IR (Optimized Pipeline)" },
+        @{ @"id": @"jit",    @"name": @"ARM64 Native JIT" },
+    ];
+
+    __weak VMSettingsViewController *weakSelf = self;
+    __weak UITableView *weakTable = tableView;
+
+    for (NSDictionary<NSString *, NSString *> *item in backends) {
+        NSString *bid = item[@"id"];
+        NSString *name = item[@"name"];
+        NSString *title = name;
+        if ([bid isEqualToString:current] ||
+            ([current isEqualToString:@"interpreter"] && [bid isEqualToString:@"interp"])) {
+            title = [@"✓ " stringByAppendingString:name];
+        }
+        [picker addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            (void)action;
+            VMSettingsViewController *self_ = weakSelf;
+            if (!self_) return;
+            [self_->_settings setCpuBackend:bid];
+            [weakTable reloadRowsAtIndexPaths:@[indexPath]
+                             withRowAnimation:UITableViewRowAnimationNone];
+        }]];
+    }
+
+    [picker addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+    UIPopoverPresentationController *popover = picker.popoverPresentationController;
+    if (popover && cell) {
+        popover.sourceView = cell;
+        popover.sourceRect = cell.bounds;
+    } else if (popover) {
+        popover.sourceView = self.view;
+        popover.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                        CGRectGetMidY(self.view.bounds), 1.0, 1.0);
+        popover.permittedArrowDirections = 0;
+    }
     [self presentViewController:picker animated:YES completion:nil];
 }
 

@@ -2660,6 +2660,12 @@ static arm_status_t thumb_step(arm_cpu_t *c, uint32_t pc, uint16_t insn,
 arm_status_t arm_step(arm_cpu_t *c) {
     uint32_t pc   = c->r[15];
 
+    /* Complete any pending data abort latched from accelerated tiers before fetching */
+    if (c->abort_pending) {
+        take_pending_data_abort(c, pc);
+        return ARM_OK;
+    }
+
     /* A corrupted snapshot or malformed exception frame must not turn an
      * unimplemented CPSR mode into privileged User-bank execution. */
     if (!arm_mode_is_valid(c->cpsr)) return ARM_UNDEFINED;

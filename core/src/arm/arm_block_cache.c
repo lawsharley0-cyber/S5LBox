@@ -227,14 +227,17 @@ arm_basic_block_t *arm_block_compile(arm_block_cache_t *cache,
             break;
         }
 
-        insn_idx++;
-
         /* Handle block termination */
         if (di->op == ARM_OP_FALLBACK) {
+            if (insn_idx == 0) {
+                return NULL;
+            }
             block->exit_type = ARM_EXIT_FALLBACK;
             block->fallthrough_target = cur_va;
             break;
         }
+
+        insn_idx++;
 
         if (di->op == ARM_OP_SVC) {
             block->exit_type = ARM_EXIT_SVC;

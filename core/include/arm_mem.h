@@ -123,6 +123,13 @@ static inline void dwrite_fill(arm_cpu_t *c, uint32_t va, uint32_t pa,
 /*
  * Fastmem memory access helpers for accelerated backends.
  */
+static inline void arm_mem_note_abort(arm_cpu_t *c, uint32_t fsr, uint32_t va) {
+    if (!c || c->abort_pending) return;
+    c->abort_pending = true;
+    c->abort_fsr = fsr;
+    c->abort_far = va;
+}
+
 static inline uint32_t arm_fastmem_read32(arm_cpu_t *c, uint32_t va, bool priv) {
     const uint8_t *dh = dread_hit(c, va, 4, priv);
     if (dh) {
@@ -131,7 +138,8 @@ static inline uint32_t arm_fastmem_read32(arm_cpu_t *c, uint32_t va, bool priv) 
         return v;
     }
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram) {
             uint8_t *blk = c->bus->host_ram(c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK,
                                             ARM_DREAD_BLK_MASK + 1u);
@@ -148,7 +156,8 @@ static inline uint32_t arm_fastmem_read32(arm_cpu_t *c, uint32_t va, bool priv) 
         }
         return c->bus->read32(c->bus->ctx, pa);
     }
-    return c->bus->read32(c->bus->ctx, va);
+    arm_mem_note_abort(c, fsr, va);
+    return 0;
 }
 
 static inline uint16_t arm_fastmem_read16(arm_cpu_t *c, uint32_t va, bool priv) {
@@ -159,7 +168,8 @@ static inline uint16_t arm_fastmem_read16(arm_cpu_t *c, uint32_t va, bool priv) 
         return v;
     }
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram) {
             uint8_t *blk = c->bus->host_ram(c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK,
                                             ARM_DREAD_BLK_MASK + 1u);
@@ -176,14 +186,16 @@ static inline uint16_t arm_fastmem_read16(arm_cpu_t *c, uint32_t va, bool priv) 
         }
         return c->bus->read16(c->bus->ctx, pa);
     }
-    return c->bus->read16(c->bus->ctx, va);
+    arm_mem_note_abort(c, fsr, va);
+    return 0;
 }
 
 static inline uint8_t arm_fastmem_read8(arm_cpu_t *c, uint32_t va, bool priv) {
     const uint8_t *dh = dread_hit(c, va, 1, priv);
     if (dh) return *dh;
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_READ, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram) {
             uint8_t *blk = c->bus->host_ram(c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK,
                                             ARM_DREAD_BLK_MASK + 1u);
@@ -198,7 +210,8 @@ static inline uint8_t arm_fastmem_read8(arm_cpu_t *c, uint32_t va, bool priv) {
         }
         return c->bus->read8(c->bus->ctx, pa);
     }
-    return c->bus->read8(c->bus->ctx, va);
+    arm_mem_note_abort(c, fsr, va);
+    return 0;
 }
 
 static inline void arm_fastmem_write32(arm_cpu_t *c, uint32_t va, uint32_t val, bool priv) {
@@ -208,7 +221,8 @@ static inline void arm_fastmem_write32(arm_cpu_t *c, uint32_t va, uint32_t val, 
         return;
     }
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram_write) {
             uint8_t *blk = c->bus->host_ram_write(
                 c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK, ARM_DREAD_BLK_MASK + 1u);
@@ -225,7 +239,7 @@ static inline void arm_fastmem_write32(arm_cpu_t *c, uint32_t va, uint32_t val, 
         c->bus->write32(c->bus->ctx, pa, val);
         return;
     }
-    c->bus->write32(c->bus->ctx, va, val);
+    arm_mem_note_abort(c, fsr, va);
 }
 
 static inline void arm_fastmem_write16(arm_cpu_t *c, uint32_t va, uint16_t val, bool priv) {
@@ -235,7 +249,8 @@ static inline void arm_fastmem_write16(arm_cpu_t *c, uint32_t va, uint16_t val, 
         return;
     }
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram_write) {
             uint8_t *blk = c->bus->host_ram_write(
                 c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK, ARM_DREAD_BLK_MASK + 1u);
@@ -252,7 +267,7 @@ static inline void arm_fastmem_write16(arm_cpu_t *c, uint32_t va, uint16_t val, 
         c->bus->write16(c->bus->ctx, pa, val);
         return;
     }
-    c->bus->write16(c->bus->ctx, va, val);
+    arm_mem_note_abort(c, fsr, va);
 }
 
 static inline void arm_fastmem_write8(arm_cpu_t *c, uint32_t va, uint8_t val, bool priv) {
@@ -262,7 +277,8 @@ static inline void arm_fastmem_write8(arm_cpu_t *c, uint32_t va, uint8_t val, bo
         return;
     }
     uint32_t pa = 0;
-    if (arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa) == 0) {
+    uint32_t fsr = arm_mmu_translate(c, va, ARM_ACCESS_WRITE, priv, &pa);
+    if (fsr == 0) {
         if (c->bus && c->bus->host_ram_write) {
             uint8_t *blk = c->bus->host_ram_write(
                 c->bus->ctx, pa & ~ARM_DREAD_BLK_MASK, ARM_DREAD_BLK_MASK + 1u);
@@ -279,7 +295,7 @@ static inline void arm_fastmem_write8(arm_cpu_t *c, uint32_t va, uint8_t val, bo
         c->bus->write8(c->bus->ctx, pa, val);
         return;
     }
-    c->bus->write8(c->bus->ctx, va, val);
+    arm_mem_note_abort(c, fsr, va);
 }
 
 #endif /* S5LBOX_ARM_MEM_H */
