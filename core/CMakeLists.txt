@@ -373,6 +373,15 @@ target_include_directories(test_vmguest PRIVATE ../app/Sources)
 target_link_libraries(test_vmguest PRIVATE emucore)
 add_test(NAME app_vmguest_bridge COMMAND test_vmguest)
 
+# The Full Test Report's kext dump names the kernel functions a driver calls;
+# finding those references is plain C over the kext's bytes.
+add_executable(test_vmdriverdump
+    ../app/Tests/test_vmdriverdump.c
+    ../app/Sources/VMDriverDump.c
+)
+target_include_directories(test_vmdriverdump PRIVATE ../app/Sources)
+add_test(NAME app_vmdriverdump COMMAND test_vmdriverdump)
+
 # Frame telemetry is kept in portable C so its cross-thread counter and the
 # intentionally sampled change definition are host-tested. The Objective-C
 # view supplies only the two facts UIKit knows: whether CGImage construction

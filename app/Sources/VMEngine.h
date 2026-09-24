@@ -153,6 +153,12 @@ typedef void (^VMEngineStopCompletion)(void);
  * thread; `completion` is called on the main queue. */
 - (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion;
 
+/* Opt-in, for the Full Test Report: the whole kext whose code touched the
+ * audio block, base64, with the kernel functions it references named from
+ * the imported kernelcache. Guest RAM is copied before this returns; the rest
+ * runs off the calling thread and `completion` is called on the main queue. */
+- (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion;
+
 /*
  * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
  * the build-time compact AArch64 engine compiled in, this forces every guest

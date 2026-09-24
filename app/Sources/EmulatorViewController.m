@@ -1085,6 +1085,10 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf showPerformanceReport];
         }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Save Full Test Report"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf saveFullTestReport];
+        }]];
     for (NSNumber *key in @[@(VMButtonVolumeUp), @(VMButtonVolumeDown)]) {
         [menu addAction:[UIAlertAction actionWithTitle:[VMEngine nameForButton:key.unsignedIntegerValue]
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
@@ -1182,8 +1186,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     return tail.length ? tail : @"(nothing printed yet)";
 }
 
-- (void)showPerformanceReport {
-    [self setPerformanceVisible:YES];
+/* The Performance & Sound text, without the console tail. */
+- (NSString *)performanceReportText {
     vm_frame_telemetry_snapshot_t state;
     vm_frame_telemetry_snapshot(&state);
     double seconds = state.scanout_last_host_ns > state.scanout_first_host_ns
@@ -1211,6 +1215,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         state.layer_attempts ? (double)state.layer_total_work_ns / state.layer_attempts / 1e6 : 0,
         [_engine audioStatusDescription] ?: @"Audio status unavailable",
         [_engine diagnosticsDescription] ?: @"Diagnostics unavailable"];
+    return report;
+}
+
+- (void)showPerformanceReport {
+    [self setPerformanceVisible:YES];
+    NSString *report = [self performanceReportText];
     /* The guest console is where the kernel says why it stopped a process
      * (a code-signing kill, for one), and it is collected even when the
      * console view is hidden, so the report carries its tail. */
@@ -1248,6 +1258,85 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+/*
+ * EVERYTHING ONE TEST SESSION CAN TELL US, in one file: the Performance &
+ * Sound text, which machine and graphics mode this is, the whole console
+ * scrollback, the guest profile since the last copy, and the whole audio
+ * kext with the kernel functions it calls. Written to Documents/Reports (the
+ * Files app shows it under S5LBox) and offered to the share sheet; nothing is
+ * sent anywhere unless the user sends it.
+ */
+- (void)saveFullTestReport {
+    VMEngine *engine = _engine;
+    if (!engine) return;
+    [self appendConsole:[engine takePendingConsoleText]];
+    NSString *machine = @"(unknown machine)";
+    NSString *graphics = nil;
+    VMInstanceStore *store = [VMInstanceStore sharedStore];
+    for (NSUInteger i = 0; i < store.count; i++) {
+        NSDictionary *row = [store instanceAtIndex:i];
+        if (![row[@"id"] isEqual:self.instanceID]) continue;
+        machine = row[@"name"] ?: machine;
+        graphics = [store graphicsSummaryForInstanceWithID:self.instanceID];
+    }
+    NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+    stamp.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    stamp.dateFormat = @"yyyy-MM-dd'T'HH-mm-ss";
+    NSString *when = [stamp stringFromDate:[NSDate date]];
+    NSMutableString *full = [NSMutableString stringWithFormat:
+        @"S5LBox full test report %@\nMachine: %@ (%@)\n\n=== PERFORMANCE & SOUND ===\n%@\n\n=== GUEST CONSOLE (all kept lines) ===\n%@\n\n",
+        when, machine, graphics ?: @"graphics not recorded",
+        [self performanceReportText], [self consoleTail:NSUIntegerMax]];
+
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Saving Test Report"
+        message:@"Naming the guest profile and the audio driver. This takes a few seconds."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:working animated:YES completion:nil];
+    __weak EmulatorViewController *weakSelf = self;
+    [engine guestProfileReportWithCompletion:^(NSString *profile) {
+        [full appendFormat:@"=== GUEST PROFILE ===\n%@\n\n", profile];
+        [engine audioDriverDumpWithCompletion:^(NSString *audio) {
+            [full appendFormat:@"=== %@", audio];
+            EmulatorViewController *vc = weakSelf;
+            if (!vc) return;
+            NSString *documents = NSSearchPathForDirectoriesInDomains(
+                NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+            NSString *dir = [documents stringByAppendingPathComponent:@"Reports"];
+            NSString *path = [dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"S5LBox-test-%@.txt", when]];
+            NSError *error = nil;
+            BOOL saved = [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                    withIntermediateDirectories:YES attributes:nil error:&error] &&
+                [full writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error];
+            void (^finish)(void) = ^{
+                if (!saved) {
+                    UIPasteboard.generalPasteboard.string = full;
+                    UIAlertController *failed = [UIAlertController alertControllerWithTitle:@"Report Not Saved"
+                        message:[NSString stringWithFormat:@"%@\n\nThe report was copied to the clipboard instead.",
+                                 error.localizedDescription ?: @"The file could not be written."]
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [failed addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                    [vc presentViewController:failed animated:YES completion:nil];
+                    return;
+                }
+                UIActivityViewController *share = [[UIActivityViewController alloc]
+                    initWithActivityItems:@[ [NSURL fileURLWithPath:path] ] applicationActivities:nil];
+                /* iPad presents this as a popover and throws without an anchor. */
+                share.popoverPresentationController.sourceView = vc.view;
+                share.popoverPresentationController.sourceRect =
+                    CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
+                [vc presentViewController:share animated:YES completion:nil];
+            };
+            /* The progress alert may not have been shown (something else was
+             * on screen); dismissing it then would never call back. */
+            if (working.presentingViewController)
+                [working dismissViewControllerAnimated:YES completion:finish];
+            else
+                finish();
+        }];
+    }];
 }
 
 #pragma mark - Presentation

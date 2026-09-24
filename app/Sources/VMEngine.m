@@ -42,6 +42,7 @@
 #import "VMAudioOutput.h"
 #import "arm_ci.h"
 #import "guest_profile.h"
+#import "VMDriverDump.h"
 #import "ksyms.h"
 #import "rootfs_work.h"
 
@@ -2339,7 +2340,11 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
  * user; it is their firmware and it is never stored by S5LBox. Code pages do
  * not change while the guest runs, so reading them from this thread is safe.
  */
-- (NSString *)audioDriverExcerpt {
+/* The lowest and highest kernel pc seen touching the audio block (AMC
+ * registers or its SRAM): the machine's permanent record, widened by the
+ * rolling access logs. NO when no kernel code has touched it. */
+- (BOOL)audioPcRangeLo:(uint32_t *)outLo hi:(uint32_t *)outHi
+              accesses:(uint64_t *)outAccesses {
     s5l_access_entry_t logs[2 * S5L_ACCESS_LOG];
     pthread_mutex_lock(&_lock);
     memcpy(logs, _diagMmio, sizeof _diagMmio);
@@ -2360,7 +2365,17 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
         if (e->pc < lo) lo = e->pc;
         if (e->pc > hi) hi = e->pc;
     }
-    if (lo > hi) return @"No kernel code has touched the audio block yet in this run. Play a sound (Settings > Sounds), then try again.";
+    *outLo = lo;
+    *outHi = hi;
+    *outAccesses = accesses;
+    return lo <= hi;
+}
+
+- (NSString *)audioDriverExcerpt {
+    uint32_t lo = 0, hi = 0;
+    uint64_t accesses = 0;
+    if (![self audioPcRangeLo:&lo hi:&hi accesses:&accesses])
+        return @"No kernel code has touched the audio block yet in this run. Play a sound (Settings > Sounds), then try again.";
     /* The register accessors are small leaf functions; the driver logic that
      * calls them (firmware load, start sequence, the "could not start DMA"
      * decision) lies before them in the same kext, so take 16 KiB before the
@@ -2400,6 +2415,27 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
  * (the guest went idle, or the run stopped) are counted, not sampled: this is
  * a profile of busy time.
  */
+/* The imported kernelcache's symbols and kext map, or NULL. ksyms points into
+ * *keep, which the caller must hold for as long as it uses the result. */
+static ksyms_t *VMLoadKernelSymbols(NSString *firmwareDir, NSData **keep) {
+    *keep = nil;
+    if (!firmwareDir.length) return NULL;
+    NSData *kernel = [NSData dataWithContentsOfFile:
+                         [firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_KERNEL_FILE]
+                                            options:NSDataReadingMappedIfSafe error:NULL];
+    ksyms_t *ks = kernel.length ? calloc(1, sizeof *ks) : NULL;
+    if (!ks) return NULL;
+    (void)ksyms_load(ks, kernel.bytes, kernel.length);
+    *keep = kernel;
+    return ks;
+}
+
+static void VMFreeKernelSymbols(ksyms_t *ks) {
+    if (!ks) return;
+    ksyms_free(ks);
+    free(ks);
+}
+
 static NSString *VMProfileBlock(uint32_t pc) {
     return [NSString stringWithFormat:@"code @0x%08x (256 B)", pc & ~0xffu];
 }
@@ -2441,18 +2477,8 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
      * so they must outlive every ksyms call below, not just the last use ARC
      * can see. */
     NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
-    ksyms_t *ks = NULL;
-    BOOL ksLoaded = NO;
-    if (firmwareDir.length) {
-        kernel = [NSData dataWithContentsOfFile:
-                     [firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_KERNEL_FILE]
-                                        options:NSDataReadingMappedIfSafe error:NULL];
-        ks = kernel.length ? calloc(1, sizeof *ks) : NULL;
-        if (ks) {
-            (void)ksyms_load(ks, kernel.bytes, kernel.length);
-            ksLoaded = YES;
-        }
-    }
+    ksyms_t *ks = VMLoadKernelSymbols(firmwareDir, &kernel);
+    const BOOL ksLoaded = ks != NULL;
     if (ksLoaded)
         [out appendFormat:@"Kernel names: %u symbols (%s), %u kexts (%s)\n",
             ks->nsym, ksyms_strerror(ks->sym_status), ks->nkext,
@@ -2567,8 +2593,7 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
 
     if (cacheOpen) gprof_cache_close(&cache);
     free(cacheBytes);
-    if (ksLoaded) ksyms_free(ks);
-    free(ks);
+    VMFreeKernelSymbols(ks);
     return out;
 }
 
@@ -2607,6 +2632,131 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
         gprof_free(window);
         free(window);
         dispatch_async(dispatch_get_main_queue(), ^{ completion(text); });
+    });
+}
+
+/*
+ * The whole kext (or kexts) whose code touched the audio block, from this
+ * machine's RAM, with the kernel functions it references named. The window
+ * is copied here, on the caller's thread, so nothing reads guest RAM after
+ * this returns; trimming it to the kext and naming run in the background.
+ */
+static const uint32_t kVMDriverWindow = 0x40000u;   /* each side of the pcs */
+
+static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t len,
+                                  const char *label, const ksyms_t *ks) {
+    NSMutableString *out = [NSMutableString string];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes, (CC_LONG)len, digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+    [out appendFormat:@"--- %s va=0x%08x len=0x%x sha256=%@\n", label, va, len, hex];
+
+    enum { kMaxRefs = 16384 };
+    vm_driver_ref_t *refs = calloc(kMaxRefs, sizeof *refs);
+    size_t total = 0, n = 0;
+    if (refs && ks)
+        n = vm_driver_collect_refs(bytes, va, len, 0xc0000000u, 0xc1000000u,
+                                   refs, kMaxRefs, &total);
+    NSMutableString *named = [NSMutableString string];
+    unsigned kept = 0;
+    for (size_t i = 0; i < n; i++) {
+        const vm_driver_ref_t *r = &refs[i];
+        const char *kind = r->kinds == (VM_DRIVER_REF_CALL | VM_DRIVER_REF_WORD) ? "c+w"
+                         : r->kinds == VM_DRIVER_REF_CALL ? "call" : "word";
+        char name[256];
+        const kext_t *other = ksyms_kext_at(ks, r->target);
+        if (other) {
+            /* Other kexts have no symbols; a call into one is still worth
+             * knowing (IOAudioFamily, say), a data word usually is not. */
+            if (!(r->kinds & VM_DRIVER_REF_CALL)) continue;
+            snprintf(name, sizeof name, "%s+0x%x", other->bundle, r->target - other->addr);
+        } else {
+            const char *resolved = ksyms_resolve(ks, r->target, name, sizeof name);
+            /* Only an exact function entry: decoding every alignment turns
+             * data into "branches" that land mid-function. */
+            if (resolved[0] == '?' || strstr(resolved, "+0x") || !strncmp(resolved, "__PRELINK", 9))
+                continue;
+        }
+        [named appendFormat:@"0x%08x %-4s x%u %s\n", r->target, kind, r->count, name];
+        kept++;
+    }
+    free(refs);
+    [out appendFormat:@"kernel references named: %u (of %zu distinct candidates)\n%@",
+        kept, total, named];
+    NSData *data = [NSData dataWithBytes:bytes length:len];
+    [out appendFormat:@"base64:\n%@\n",
+        [data base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+    return out;
+}
+
+- (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion {
+    if (!completion) return;
+    uint32_t lo = 0, hi = 0;
+    uint64_t accesses = 0;
+    if (![self audioPcRangeLo:&lo hi:&hi accesses:&accesses]) {
+        completion(@"AUDIO DRIVER: no kernel code has touched the audio block in this run "
+                   @"(play a ringtone in Settings > Sounds first).\n");
+        return;
+    }
+    const uint32_t kbase = 0xc0000000u, pbase = 0x08000000u;
+    uint32_t start = lo > kbase + kVMDriverWindow ? lo - kVMDriverWindow : kbase;
+    uint32_t end = hi < 0xffffffffu - kVMDriverWindow ? hi + kVMDriverWindow : 0xffffffffu;
+    start &= ~0xfffu;
+    end = (end + 0xfffu) & ~0xfffu;
+    const uint64_t ramLo = _machine.ram_base, ramHi = ramLo + _machine.ram_size;
+    uint64_t pa = (uint64_t)start - kbase + pbase;
+    if (pa < ramLo) { start += (uint32_t)(ramLo - pa); pa = ramLo; }
+    if ((uint64_t)end - kbase + pbase > ramHi) end = (uint32_t)(ramHi - pbase + kbase);
+    if (!_machine.ram || end <= start || lo < start || hi >= end) {
+        completion(@"AUDIO DRIVER: the kernel is not where this build expects it in guest RAM.\n");
+        return;
+    }
+    NSData *window = [NSData dataWithBytes:_machine.ram + (pa - ramLo) length:end - start];
+    NSString *firmwareDir = [[VMSettings sharedSettings] firmwareDirectory];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableString *out = [NSMutableString string];
+        @autoreleasepool {
+            [out appendFormat:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"
+                              @"audio pcs=0x%08x..0x%08x accesses=%llu\n",
+                lo, hi, (unsigned long long)accesses];
+            NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
+            ksyms_t *ks = VMLoadKernelSymbols(firmwareDir, &kernel);
+            const kext_t *kexts[2] = {
+                ks ? ksyms_kext_at(ks, lo) : NULL, ks ? ksyms_kext_at(ks, hi) : NULL,
+            };
+            if (kexts[1] == kexts[0]) kexts[1] = NULL;
+            BOOL any = NO;
+            for (int i = 0; i < 2; i++) {
+                const kext_t *k = kexts[i];
+                if (!k) continue;
+                uint32_t ks0 = k->addr, ks1 = k->addr + k->size;
+                BOOL clipped = ks0 < start || ks1 > end;
+                if (ks0 < start) ks0 = start;
+                if (ks1 > end) ks1 = end;
+                if (ks1 <= ks0) continue;
+                char label[160];
+                snprintf(label, sizeof label, "%s%s", k->bundle,
+                         clipped ? " (clipped to the copied window)" : "");
+                [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (ks0 - start),
+                                                   ks0, ks1 - ks0, label, ks)];
+                any = YES;
+            }
+            if (!any) {
+                /* No kext map: the old excerpt's window, named as such. */
+                uint32_t w0 = (lo - 0x4000u) & ~0xfu, w1 = (hi + 0x2000u + 0xfu) & ~0xfu;
+                if (w0 < start) w0 = start;
+                if (w1 > end) w1 = end;
+                if (w1 - w0 > 0x8000u) w1 = w0 + 0x8000u;
+                [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (w0 - start),
+                                                   w0, w1 - w0,
+                                                   ks ? "window (no kext owns these pcs)"
+                                                      : "window (no kernel.macho to map kexts)",
+                                                   ks)];
+            }
+            VMFreeKernelSymbols(ks);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
     });
 }
 

@@ -134,15 +134,48 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
 
 #pragma mark - Actions
 
+/*
+ * The renderer is fixed when a machine's work image is made, so it is chosen
+ * here, per machine, instead of by flipping the app-wide Settings rows before
+ * creating one. The middle choice is the one for 3D games: the PowerVR driver
+ * is matched (OpenGL ES has a GPU to talk to) while SpringBoard keeps Apple's
+ * CPU compositor, the configuration the home screen is known to run with.
+ */
 - (void)addTapped {
-    [self promptWithTitle:@"New Machine"
-                     text:@""
-                   accept:@"Create"
-                  handler:^(NSString *name) {
-        NSError *err = nil;
-        if (![[VMInstanceStore sharedStore] createInstanceNamed:name error:&err])
-            [self showError:err doing:@"Could not create the machine"];
-    }];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"New Machine"
+                         message:@"Graphics are fixed when the machine first starts."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak VMInstanceListViewController *weakSelf = self;
+    void (^choose)(NSString *, NSString *, BOOL, BOOL) =
+        ^(NSString *title, NSString *suggested, BOOL mbx, BOOL software) {
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            VMInstanceListViewController *self_ = weakSelf;
+            [self_ promptWithTitle:title
+                              text:suggested
+                            accept:@"Create"
+                           handler:^(NSString *name) {
+                NSError *err = nil;
+                if (![[VMInstanceStore sharedStore] createInstanceNamed:name
+                                                            mbxEnabled:mbx
+                                               softwareRendererEnabled:software
+                                                                 error:&err])
+                    [self_ showError:err doing:@"Could not create the machine"];
+            }];
+        }]];
+    };
+    choose(@"CPU graphics (stable)", @"iPhone OS 3.1.3", NO, YES);
+    choose(@"GPU for apps and games (experimental)", @"iPhone OS 3.1.3 GPU apps", YES, YES);
+    choose(@"Full GPU (experimental)", @"iPhone OS 3.1.3 GPU", YES, NO);
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    /* An action sheet on iPad needs an anchor; the + button is it. */
+    sheet.popoverPresentationController.barButtonItem =
+        self.navigationItem.rightBarButtonItems.firstObject;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)settingsTapped {
@@ -351,7 +384,12 @@ titleForFooterInSection:(NSInteger)section {
         ? @""
         : [NSString stringWithFormat:@" · %.2f B instructions",
            (double)retired / 1e9];
-    cell.detailTextLabel.text = [when stringByAppendingString:work];
+    NSString *graphics = row[@"id"]
+        ? [[VMInstanceStore sharedStore] graphicsSummaryForInstanceWithID:row[@"id"]]
+        : nil;
+    cell.detailTextLabel.text = graphics
+        ? [NSString stringWithFormat:@"%@ · %@%@", graphics, when, work]
+        : [when stringByAppendingString:work];
     cell.detailTextLabel.font =
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
     cell.detailTextLabel.adjustsFontForContentSizeCategory = YES;

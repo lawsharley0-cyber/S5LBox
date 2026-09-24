@@ -475,6 +475,48 @@ static NSString *VMGraphicsRecordText(BOOL mbxEnabled,
     return identifier;
 }
 
+- (NSString *)createInstanceNamed:(NSString *)name
+                       mbxEnabled:(BOOL)mbxEnabled
+          softwareRendererEnabled:(BOOL)softwareRendererEnabled
+                            error:(NSError **)error {
+    /* The plain path has already refused an incomplete option table. */
+    NSString *identifier = [self createInstanceNamed:name error:error];
+    if (!identifier) return nil;
+    int row = [self indexOfID:identifier];
+    int mbx = vm_option_index("mbx");
+    int ca = vm_option_index("ca-software-render");
+    NSError *graphicsError = nil;
+    if (row < 0 || mbx < 0 || ca < 0 ||
+        ![self writeRecordedGraphicsForInstanceWithID:identifier
+                                           mbxEnabled:mbxEnabled
+                              softwareRendererEnabled:softwareRendererEnabled
+                                                error:&graphicsError]) {
+        if (row >= 0) (void)vm_instance_remove(&_list, (unsigned)row);
+        NSString *dir = [[self containerDirectory]
+            stringByAppendingPathComponent:identifier];
+        (void)[[NSFileManager defaultManager] removeItemAtPath:dir error:NULL];
+        [self changed];
+        if (error)
+            *error = graphicsError ?: [self errorFor:VM_INSTANCE_ERR_RANGE];
+        return nil;
+    }
+    _list.slot[row].options[mbx] = mbxEnabled ? true : false;
+    _list.slot[row].options[ca] = softwareRendererEnabled ? true : false;
+    [self changed];
+    return identifier;
+}
+
+- (NSString *)graphicsSummaryForInstanceWithID:(NSString *)identifier {
+    BOOL mbxEnabled = NO, softwareRendererEnabled = NO;
+    if (!identifier.length ||
+        ![self recordedGraphicsForInstanceWithID:identifier
+                                      mbxEnabled:&mbxEnabled
+                         softwareRendererEnabled:&softwareRendererEnabled])
+        return nil;
+    if (!mbxEnabled) return softwareRendererEnabled ? @"CPU graphics" : @"GPU off, MBX2D on";
+    return softwareRendererEnabled ? @"GPU for apps" : @"GPU graphics";
+}
+
 - (BOOL)renameInstanceAtIndex:(NSUInteger)index
                            to:(NSString *)name
                         error:(NSError **)error {

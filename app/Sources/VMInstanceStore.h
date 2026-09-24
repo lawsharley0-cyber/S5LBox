@@ -46,6 +46,22 @@ extern NSString *const VMInstanceStoreDidChangeNotification;
 - (nullable NSString *)createInstanceNamed:(NSString *)name
                                      error:(NSError **)error;
 
+/*
+ * Create a machine whose renderer pair is chosen NOW rather than at first
+ * open: the versioned graphics record is written before this returns, so the
+ * choice does not depend on the app-wide new-machine setting at all. Any of
+ * the four pairs is accepted; the record is what first open provisions from.
+ */
+- (nullable NSString *)createInstanceNamed:(NSString *)name
+                                mbxEnabled:(BOOL)mbxEnabled
+                   softwareRendererEnabled:(BOOL)softwareRendererEnabled
+                                     error:(NSError **)error;
+
+/* A short description of a machine's recorded renderer pair ("CPU graphics",
+ * "GPU for apps", "GPU graphics", "GPU off, MBX2D on"), or nil when it has no
+ * trustworthy record yet. For display only. */
+- (nullable NSString *)graphicsSummaryForInstanceWithID:(NSString *)identifier;
+
 /* Rename, duplicate and delete. Each returns NO with `error` set on refusal,
  * and none of them changes anything when they refuse. */
 - (BOOL)renameInstanceAtIndex:(NSUInteger)index
