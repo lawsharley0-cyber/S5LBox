@@ -407,6 +407,15 @@ static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
 /* The all-device table: every access that reaches the device paths. */
 static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
                       unsigned bytes, bool is_write) {
+    if (addr - S5L8900_AMC_BASE < S5L8900_AMC_SIZE ||
+        addr - S5L8900_SRAM_BASE < S5L8900_SRAM_SIZE) {
+        const uint32_t pc = m->cpu.r[15];
+        if (pc >= 0xc0000000u) {
+            if (!m->audio_accesses || pc < m->audio_pc_lo) m->audio_pc_lo = pc;
+            if (!m->audio_accesses || pc > m->audio_pc_hi) m->audio_pc_hi = pc;
+            m->audio_accesses++;
+        }
+    }
     bool fresh;
     s5l_access_entry_t *e = log_access(m->mmio_recent, &m->mmio_seq,
                                        m->cpu.r[15], addr, val, bytes, is_write,

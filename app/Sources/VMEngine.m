@@ -304,6 +304,10 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     /* Where the emulator thread's time went since this run started: inside
      * s5l8900_run, of which asleep in guest idle (paced WFI), and in total. */
     uint64_t                _diagRunNs, _diagIdleNs, _diagThreadNs;
+    /* The machine's permanent record of kernel pcs that touched the audio
+     * block (s5l8900_t::audio_pc_lo/hi), for -audioDriverExcerpt. */
+    uint32_t                _diagAudioPcLo, _diagAudioPcHi;
+    uint64_t                _diagAudioAccesses;
     NSString               *_diagBackendNote;  /* why the cached interpreter is off */
 }
 
@@ -2239,6 +2243,9 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _diagThreadNs = threadNs;
     memcpy(_diagUnmodelled, _machine.unmodelled, sizeof _diagUnmodelled);
     memcpy(_diagMmio, _machine.mmio_recent, sizeof _diagMmio);
+    _diagAudioPcLo = _machine.audio_pc_lo;
+    _diagAudioPcHi = _machine.audio_pc_hi;
+    _diagAudioAccesses = _machine.audio_accesses;
     pthread_mutex_unlock(&_lock);
 }
 
@@ -2300,9 +2307,12 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     pthread_mutex_lock(&_lock);
     memcpy(logs, _diagMmio, sizeof _diagMmio);
     memcpy(logs + S5L_ACCESS_LOG, _diagUnmodelled, sizeof _diagUnmodelled);
+    const uint64_t accesses = _diagAudioAccesses;
+    const uint32_t seenLo = _diagAudioPcLo, seenHi = _diagAudioPcHi;
     pthread_mutex_unlock(&_lock);
 
-    uint32_t lo = UINT32_MAX, hi = 0u;
+    /* The machine's permanent record first; the rolling logs only add to it. */
+    uint32_t lo = accesses ? seenLo : UINT32_MAX, hi = accesses ? seenHi : 0u;
     for (size_t i = 0; i < 2u * S5L_ACCESS_LOG; i++) {
         const s5l_access_entry_t *e = &logs[i];
         if (!e->count) continue;
@@ -2329,8 +2339,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
     return [NSString stringWithFormat:
         @"S5LBox audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"
-        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x\n%@\n",
-        start, end - start, hex, lo, hi,
+        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x accesses=%llu\n%@\n",
+        start, end - start, hex, lo, hi, (unsigned long long)accesses,
         [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
 }
 

@@ -4228,6 +4228,16 @@ typedef struct {
      * refresh (guest accesses and host inputs force one before any run), so
      * the cache is valid while `refresh_count` has not moved.
      */
+    /*
+     * The range of kernel pcs that have ever accessed the audio block (the
+     * AMC registers or its SRAM), and how many accesses: kept apart from the
+     * rolling access logs, whose 32 entries the clock-gating loop evicts, so
+     * the driver's code can still be located after it has given up.
+     * Diagnostics only, never serialised.
+     */
+    uint32_t                  audio_pc_lo;
+    uint32_t                  audio_pc_hi;
+    uint64_t                  audio_accesses;
     uint64_t                  refresh_count;
     uint64_t                  ci_horizon_key;   /* refresh_count + 1; 0 = none */
     uint32_t                  ci_horizon_edges;

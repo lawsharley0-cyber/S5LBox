@@ -217,10 +217,12 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * ci_horizon_off, ci_run_caught, and the refresh-keyed horizon cache):
  * per-run bookkeeping and a cache of derived state, and no run is open
  * between s5l8900_run() calls, so it is outside snap_mach() as well.
+ * 128408 adds the host-only audio-block pc range (lo, hi, count), a
+ * diagnostic like the access logs, outside snap_mach().
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         128392, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         128408, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
