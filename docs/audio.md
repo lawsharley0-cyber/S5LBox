@@ -775,3 +775,32 @@ default, so the ~60 recorded desktop runs keep their meaning.
 - Guest time ran at 0.77x wall time in this report. The app plays at 44.1 kHz
   of wall time, so it will underrun whenever the guest runs slower than real
   time. That is a speed limit, not an audio-model one.
+
+## 2026-09-24 The AMC hidden, and still silence (build 27d084d)
+
+With `/arm-io/amc` hidden: no AMC assertions, and AppleAMC_r1 touched nothing.
+DMA ran as before: 2,158,150 16-bit stores, 1,079,075 frames to the app,
+**0 non-zero**. So the AMC was not the only cause, and maybe not the cause
+at all.
+
+In the profile, `mediaserverd` used 2.03% of the window, and no audio code is
+among its functions: no AudioToolbox, no decoder, no mixer. The audio engine
+started and stopped about 41 times (83 writes to +0x08), so something asks
+for output. But the audio server renders nothing into it. The emulator is
+not losing samples; the guest is producing none.
+
+The user checked the volume: the guest's volume display appears, and maximum
+volume changes nothing.
+
+**Open question, being tested next: the Ring/Silent switch.** Silent mode
+mutes keyboard clicks, lock sounds and ringtone previews, which is this
+pattern. The model presents the pin level that AppleM68Buttons reports as
+"not muted". But the driver reports only *changes* (its debounce timer
+compares all five pins with a shadow bitmap). So an unmoved switch has never
+been reported, and what SpringBoard assumes at boot is not known. The
+controls menu now has a latching "Ring/Silent Switch" item: moving it gives
+the guest real events, and SpringBoard's own Ring/Silent display shows how
+it reads them.
+
+The report's PCM section now also lists the WM8991 registers the driver
+wrote, and the switch position set in the app.

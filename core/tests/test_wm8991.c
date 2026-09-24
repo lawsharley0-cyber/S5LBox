@@ -523,6 +523,27 @@ static void test_i2s_describe_shows_storage_and_strays(void) {
     CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
 }
 
+static void test_codec_describe_lists_written_registers(void) {
+    s5l_wm8991_t codec;
+    s5l_wm8991_reset(&codec);
+    char text[512];
+    size_t n = s5l_wm8991_describe(&codec, text, sizeof text);
+    CHECK(n == strlen(text) && strstr(text, "written registers: none") != NULL,
+          "empty codec:\n%s", text);
+    codec.regs[0x0b] = 0x01c0u; codec.written[0x0b] = 1u;
+    codec.regs[0x1c] = 0x0179u; codec.written[0x1c] = 1u;
+    codec.reg_writes = 2u;
+    n = s5l_wm8991_describe(&codec, text, sizeof text);
+    CHECK(strstr(text, "2 register writes") != NULL &&
+          strstr(text, "R0b=01c0 R1c=0179") != NULL &&
+          strstr(text, "R00=") == NULL, "written registers:\n%s", text);
+    char tiny[10];
+    n = s5l_wm8991_describe(&codec, tiny, sizeof tiny);
+    CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
+    CHECK(s5l_wm8991_describe(NULL, text, sizeof text) == 0u && text[0] == 0,
+          "NULL codec");
+}
+
 /* -------------------------------------------------------- the machine --- */
 
 static void test_machine_routes_the_codec_and_both_windows(void) {
@@ -725,6 +746,7 @@ int main(void) {
     test_reset_is_total();
     test_i2s_stores_the_seven_and_shows_the_rest();
     test_i2s_describe_shows_storage_and_strays();
+    test_codec_describe_lists_written_registers();
     test_machine_routes_the_codec_and_both_windows();
     test_snapshot_carries_the_codec_and_windows();
     test_snapshot_rejects_impossible_codec_state();

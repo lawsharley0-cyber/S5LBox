@@ -1101,6 +1101,17 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                     dispatch_get_main_queue(), ^{ [engine setButton:button pressed:NO]; });
             }]];
     }
+    /* The ringer is a two-position slider, not a key: it stays where it is put.
+     * AppleM68Buttons only reports a change, so until it has been moved once
+     * the guest has never been told which position it is in. */
+    BOOL silent = [_engine isButtonPressed:VMButtonRingerSilent];
+    [menu addAction:[UIAlertAction actionWithTitle:
+        (silent ? @"Ring/Silent Switch: Silent (switch to Ring)"
+                : @"Ring/Silent Switch: Ring (switch to Silent)")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (vc) [vc->_engine setButton:VMButtonRingerSilent pressed:!silent];
+        }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Settings"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf settingsTapped:nil];

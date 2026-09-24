@@ -323,6 +323,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     uint64_t                _diagPcmAccesses;
     s5l_pl080_t             _diagDmac[S5L8900_DMAC_COUNT];
     s5l_i2s_t               _diagI2s[S5L8900_I2S_COUNT];
+    s5l_wm8991_t            _diagCodec;
     NSString               *_diagBackendNote;  /* why the cached interpreter is off */
     /*
      * The guest profile (guest_profile.h): the guest pc after every full
@@ -2305,6 +2306,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _diagPcmAccesses = _machine.pcm_accesses;
     memcpy(_diagDmac, _machine.dmac, sizeof _diagDmac);
     memcpy(_diagI2s, _machine.i2s, sizeof _diagI2s);
+    memcpy(&_diagCodec, &_machine.codec, sizeof _diagCodec);
     pthread_mutex_unlock(&_lock);
 }
 
@@ -3070,16 +3072,19 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
 
 /* What the PCM output path's devices hold, formatted from the copies the
  * emulator thread published: the I2S access log, both PL080s, both I2S
- * windows. */
+ * windows, the codec's written registers and the Ring/Silent switch. */
 - (NSString *)pcmPathStateText {
     s5l_access_entry_t log[S5L_ACCESS_LOG];
     s5l_pl080_t dmac[S5L8900_DMAC_COUNT];
     s5l_i2s_t i2s[S5L8900_I2S_COUNT];
+    s5l_wm8991_t codec;
     pthread_mutex_lock(&_lock);
     memcpy(log, _diagPcm, sizeof log);
     memcpy(dmac, _diagDmac, sizeof dmac);
     memcpy(i2s, _diagI2s, sizeof i2s);
+    memcpy(&codec, &_diagCodec, sizeof codec);
     const uint64_t accesses = _diagPcmAccesses;
+    const BOOL silent = _buttons[VMButtonRingerSilent];
     pthread_mutex_unlock(&_lock);
     NSMutableString *out = [NSMutableString stringWithFormat:
         @"PCM PATH STATE (the I2S windows and the DMA controllers that feed them)\n"
@@ -3098,6 +3103,13 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
         (void)s5l_i2s_describe(&i2s[i], i2sNames[i], text, sizeof text);
         [out appendFormat:@"%s", text];
     }
+    /* The codec the samples go to, and the switch that silences system
+     * sounds: the two things between "the engine runs" and "a sound plays"
+     * that a report can see. */
+    (void)s5l_wm8991_describe(&codec, text, sizeof text);
+    [out appendFormat:@"%s", text];
+    [out appendFormat:@"Ring/Silent switch as set in the app: %@\n",
+        silent ? @"Silent" : @"Ring (or never moved)"];
     return out;
 }
 

@@ -2318,6 +2318,10 @@ void s5l_wm8991_bind(s5l_wm8991_t *codec, s5l_i2c_slave_t *slave);
 /* The value a guest read of `reg` would return, without disturbing transfer
  * state. Exposed so the tests can assert the register file directly. */
 uint16_t s5l_wm8991_peek(const s5l_wm8991_t *codec, uint8_t reg);
+/* A diagnostic summary of `codec`: every register the driver has written, with
+ * its current value, and the access counts. Same contract as
+ * s5l_pl080_describe(). */
+size_t   s5l_wm8991_describe(const s5l_wm8991_t *codec, char *out, size_t cap);
 
 /* ----------------------------------------------------------------- I2S ---
  * The two S5L8900 I2S controllers. Their windows are derived at the top of this

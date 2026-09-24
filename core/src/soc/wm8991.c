@@ -14,6 +14,8 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 void s5l_wm8991_reset(s5l_wm8991_t *codec) {
@@ -229,4 +231,38 @@ void s5l_wm8991_bind(s5l_wm8991_t *codec, s5l_i2c_slave_t *slave) {
     slave->write = codec_write;
     slave->read = codec_read;
     slave->stop = codec_stop;
+}
+
+/* snprintf onto the end of out[0..cap), keeping it terminated; returns the new
+ * length, which stays below cap. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 4, 5)))
+#endif
+static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...) {
+    if (len + 1u >= cap) return len;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(out + len, cap - len, fmt, ap);
+    va_end(ap);
+    if (w < 0) return len;
+    return (size_t)w >= cap - len ? cap - 1u : len + (size_t)w;
+}
+
+size_t s5l_wm8991_describe(const s5l_wm8991_t *codec, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!codec) return 0;
+    size_t len = append(out, cap, 0,
+        "wm8991: %llu register writes, %llu reads, %llu refused; written registers:",
+        (unsigned long long)codec->reg_writes, (unsigned long long)codec->reg_reads,
+        (unsigned long long)codec->refused_writes);
+    unsigned shown = 0;
+    for (unsigned r = 0; r < WM8991_NREG; r++) {
+        if (!codec->written[r]) continue;
+        len = append(out, cap, len, "%sR%02x=%04x", shown % 8u ? " " : "\n  ",
+                     r, codec->regs[r]);
+        shown++;
+    }
+    if (!shown) len = append(out, cap, len, " none");
+    return append(out, cap, len, "\n");
 }
