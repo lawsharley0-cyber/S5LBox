@@ -35,11 +35,12 @@ These are correct (the reference code runs them) but not fast:
 - **Single-stepped through `arm_step` (block stop)**: `SVC`, `BKPT`, CP14/CP15
   (including `WFI` and all cache/TLB maintenance), undefined encodings, and
   any instruction that faults on fetch.
-- **Engine exits at every timebase edge** (≈68 instructions at 412:6 MHz) and
-  on any device access, because device time stays exact. The device refresh
-  at each edge is now ~18–24 % of host time in engine mode (callgrind,
-  `BENCHMARK_RESULTS.md` §4). Making it cheaper is device-model work, not
-  engine work, and has not been started.
+- **Engine exits at the next enabled interrupt edge** (the event horizon,
+  `BENCHMARK_RESULTS.md` §9; at most 16,384 instructions), at every non-timer
+  device access, and at every timebase edge while a DMA transfer or SPI word
+  is in flight, because device time stays exact. A device that gains a time
+  driven interrupt must declare it in the wake-source table (machine.c) or
+  the horizon, like WFI, would run past it.
 - **Page-walk-bound code** (`mmu` workload) gains ~1.4×: the engine's host
   TLB is 1 KiB-granular with 512 entries per privilege, so a miss costs a
   full `arm_mmu_translate` through `bus_read`.

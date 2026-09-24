@@ -213,10 +213,14 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * about what the guest touched, not machine state, outside snap_mach().
  * 128360 adds the host-only all-device access log (another 32 x 40 + 8),
  * likewise outside snap_mach().
+ * 128392 adds the host-only cached-interpreter horizon state (ci_run_open,
+ * ci_horizon_off, ci_run_caught, and the refresh-keyed horizon cache):
+ * per-run bookkeeping and a cache of derived state, and no run is open
+ * between s5l8900_run() calls, so it is outside snap_mach() as well.
  * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         128360, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         128392, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */

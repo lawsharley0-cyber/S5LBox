@@ -195,6 +195,12 @@ struct arm_ci {
     uint32_t seen_epoch;
     bool     seen_mmu;
 
+    /* Instructions retired in this arm_ci_run() before the current block,
+     * and before the instruction now on the reference path
+     * (arm_ci_run_position). */
+    unsigned run_block_base;
+    unsigned run_position;
+
     arm_ci_stats_t st;
 };
 

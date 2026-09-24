@@ -897,6 +897,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             const uint32_t pc = PC_OF(op);
             const uint32_t ctrl = c->cpsr & CI_CTRL_MASK;
             c->cycles += (uint64_t)(op - flushed);
+            ci->run_position = ci->run_block_base + (unsigned)(op - base);
             R[15] = pc;
             arm_status_t st = op->kind == CI_K_VFP ? arm_exec_vfp_insn(c, pc, op->raw)
                             : b->thumb ? arm_exec_thumb_insn(c, pc, (uint16_t)op->raw)
@@ -1052,6 +1053,7 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
 
         unsigned n = 0;
         ci->st.block_execs++;
+        ci->run_block_base = retired;
         exec_result_t r = exec_block(ci, c, b, budget - retired, priv, &n,
                                      &stop_local, &st_local);
         retired += n;
@@ -1079,6 +1081,10 @@ static const char *qty(char buf[16], uint64_t v) {
     else if (v < UINT64_C(10000000000)) snprintf(buf, 16, "%.1fM", (double)v / 1e6);
     else snprintf(buf, 16, "%.1fG", (double)v / 1e9);
     return buf;
+}
+
+unsigned arm_ci_run_position(const arm_ci_t *ci) {
+    return ci ? ci->run_position : 0u;
 }
 
 size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,

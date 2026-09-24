@@ -4208,6 +4208,31 @@ typedef struct {
      * backend is selected; its blocks are derived from guest RAM and are
      * never serialised. */
     struct arm_ci            *ci;
+
+    /*
+     * The cached interpreter's event horizon (s5l8900_run). While an engine
+     * run that may cross timebase edges is open, device time lags the CPU;
+     * every device access first ticks the devices up to the instruction
+     * making it (arm_ci_run_position), and `ci_run_caught` is how much of
+     * the run has been ticked that way, so the run's own tick covers only
+     * the rest. Host-only, never serialised; no run is open between
+     * s5l8900_run() calls. `ci_horizon_off` restores the per-edge runs.
+     */
+    bool                      ci_run_open;
+    bool                      ci_horizon_off;
+    unsigned                  ci_run_caught;
+    /*
+     * The horizon's device half, cached: whether the DMA controllers and SPI
+     * ports are idle, and the next wake edge (kind and timebase edges from
+     * the refresh it was computed after). Device state moves only in a
+     * refresh (guest accesses and host inputs force one before any run), so
+     * the cache is valid while `refresh_count` has not moved.
+     */
+    uint64_t                  refresh_count;
+    uint64_t                  ci_horizon_key;   /* refresh_count + 1; 0 = none */
+    uint32_t                  ci_horizon_edges;
+    uint8_t                   ci_horizon_kind;  /* s5l_wake_kind_t */
+    bool                      ci_horizon_idle;
 } s5l8900_t;
 
 /*
@@ -4220,6 +4245,18 @@ typedef struct {
  */
 bool s5l8900_add_stub(s5l8900_t *m, uint32_t base, uint32_t size,
                       const char *name);
+
+/*
+ * The cached interpreter's event horizon, on by default. With it, an engine
+ * run is no longer cut at every timebase edge (~68 instructions at 412:6 MHz)
+ * but continues to the next edge at which an enabled interrupt source can
+ * fire (the wake-source table WFI uses), while no device is dirty and the DMA
+ * controllers and SPI ports are idle; device accesses inside the run first
+ * bring device time up to the accessing instruction. The device timeline the
+ * guest can observe is the per-edge one. Off: every run stops at the next
+ * edge, as before. Returns false only for a NULL machine.
+ */
+bool s5l8900_set_ci_horizon(s5l8900_t *m, bool enabled);
 
 /*
  * Same contract as s5l8900_add_stub(), except every byte of backing storage

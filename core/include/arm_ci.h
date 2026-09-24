@@ -123,6 +123,12 @@ void      arm_ci_destroy(arm_ci_t *ci);
 unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *cpu, unsigned budget,
                     arm_status_t *status, arm_ci_stop_t *stop);
 
+/* How many instructions the current arm_ci_run() call had retired before the
+ * instruction now executing through the reference semantics. Meaningful only
+ * while such an instruction runs -- from inside a bus access it makes -- which
+ * is where the machine brings device time up to that instruction exactly. */
+unsigned arm_ci_run_position(const arm_ci_t *ci);
+
 /* Guest RAM at [pa, pa+len) was written by something other than the CPU's
  * own store paths (DMA done without the bus, host memcpy, loaders). */
 void arm_ci_note_ram_write(arm_ci_t *ci, uint32_t pa, uint32_t len);

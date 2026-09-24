@@ -143,10 +143,17 @@ The arm64 runner is the closest available proxy for an iPhone's CPU core; a
 phone measurement is still required (`MAC_VALIDATION.md` §4) and nothing here
 is a frame rate.
 
-## 6. In the app's timing mode (`--active-clock`)
+## 6. With the active host clock (`--active-clock`)
 
-The iOS app runs the machine with an interactive clock
-(`s5l8900_set_active_host_clock`): guest time follows the host's monotonic
+> **Correction (2026-09-24).** This section first said the iOS app runs this
+> way. It does not: `app/project.yml` deliberately leaves
+> `S5LBOX_IOS_ACTIVE_REALTIME_CLOCK` undefined (a same-checkpoint A/B showed
+> slow unlock work losing a race with the guest's own sleep deadline), so the
+> app runs **exact** device time plus WFI pacing, the mode of §3, and a device
+> report confirmed it: 114.6 M engine runs of 68 instructions on average. The
+> numbers below are what the active clock gives; §9 is what the app now gets.
+
+`s5l8900_set_active_host_clock` makes guest time follow the host's monotonic
 clock, the engine's batches are up to 256 instructions, and the device graph
 is refreshed per host-clock sample (every 4,096 instructions) or on a device
 access, instead of at every timebase edge. `cpubench --active-clock` runs
@@ -215,3 +222,43 @@ row within ±5 %, which is this host's run-to-run noise (`mmu` moved ±10 % in
 both directions on reruns). `vfp` measured about 7 % lower on reruns with
 an identical host instruction count (callgrind 648.50 M vs 648.54 M Ir), so
 that is code placement in this binary, not added work.
+
+## 9. The event horizon: exact device time without a stop at every edge
+
+In exact mode (the app's) every engine run ended at the next 6 MHz timebase
+edge, about every 68 instructions, and each edge paid a full device refresh
+plus an engine re-entry: about 22 % and 14 % of host time (callgrind, calls
+and sha1, before this change). `s5l8900_run` now lets a cached-interpreter
+run continue to the next edge at which an **enabled** interrupt source can
+fire (the wake-source table WFI already uses; its devices advance
+algebraically), while no device is dirty and the PL080s and SPI ports are
+idle, capped at 16,384 instructions. Inside the run, every device access
+first ticks the devices up to the accessing instruction
+(`arm_ci_run_position`), so every read and write sees the per-edge timeline;
+non-timer accesses still end the run. `s5l8900_set_ci_horizon(m, false)`
+restores the old runs.
+
+Proof: `test_ci_timeline` runs a program with a periodic timer interrupt
+through the VIC (handler acknowledges, logs the counter it reads,
+reprograms the period), tick-counter and down-count reads mid-loop, VIC reads,
+WFI, and interrupt masking, on the reference interpreter (tick per
+instruction), the engine per edge, and the engine with the horizon, comparing
+registers, RAM, timer, VIC and timebase state after every 100,000
+instructions: identical over 3 M instructions and 770 interrupts, with runs
+of 847 instructions instead of 64.5. Five deliberate bugs are each caught (no
+catch-up; horizon ignoring wake sources; horizon one instruction long;
+catch-up including the accessing instruction; run tick repeating caught-up
+time). The fuzzer, guest workloads, strict and sanitizer suites pass.
+
+`cpubench --backend cached --reps 3 --mode user,svc` (exact mode), best of
+two medians, previous commit -> this one, same host: **geomean 1.62x over 40
+rows, failures=0**; e.g. bignum ARM User 158.5 -> 297.3, sha1 ARM User 178.0
+-> 331.6, raster ARM User 195.4 -> 396.3, calls ARM User 127.5 -> 196.3,
+interp Thumb User 132.7 -> 237.9, vfp ARM User 52.5 -> 64.0, mmu 1.07-1.58x.
+The `svc` rows first measured 0.87x (the horizon was recomputed on every
+short run); the device half is now cached per refresh and they are
+unchanged (74.3 -> 74.0, 80.9 -> 83.9). These workloads enable no interrupt,
+so their runs reach the cap; a real guest's are bounded by its timer
+deadline and display refresh and end at each non-timer device access, so the
+gain on the phone will be smaller and has to be measured there (the report's
+`Runs:` line shows the new run length).

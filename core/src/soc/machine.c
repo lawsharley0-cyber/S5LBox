@@ -475,6 +475,25 @@ static uint8_t *machine_host_ram_write(void *ctx, uint32_t pa, uint32_t len) {
     return machine_host_ram(ctx, pa, len);
 }
 
+/*
+ * Inside a cached-interpreter run that may cross timebase edges (the event
+ * horizon in s5l8900_run), device time lags the CPU. Before any device sees
+ * an access, tick it up to the instruction making the access -- exactly the
+ * per-instruction ticks the literal loop would have delivered by then -- so
+ * every read and write observes the per-edge timeline. `ci_run_caught` moves
+ * before the tick, so a device the tick drives back onto the bus does not
+ * catch up twice. Runs before this access marks the machine dirty: the tick
+ * must refresh the state the access finds, and the access must stay dirty.
+ */
+static inline void ci_run_catch_up(s5l8900_t *m) {
+    if (!m->ci_run_open) return;
+    const unsigned at = arm_ci_run_position(m->ci);
+    if (at <= m->ci_run_caught) return;
+    const unsigned ticks = at - m->ci_run_caught;
+    m->ci_run_caught = at;
+    s5l8900_tick(m, ticks);
+}
+
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -483,6 +502,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         memcpy(&v, &m->ram[addr - m->ram_base], bytes);   /* little-endian host */
         return v;
     }
+    ci_run_catch_up(m);
     /*
      * Past the RAM aperture is a device, and this is the ONE place every guest
      * device access passes through — which is what makes `level_dirty` a
@@ -619,6 +639,7 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         if (m->ci) arm_ci_note_ram_write(m->ci, addr, bytes);
         return;
     }
+    ci_run_catch_up(m);
     m->level_dirty = true;      /* a device store; see bus_read() */
     note_mmio(m, addr, val, bytes, true);
     if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
@@ -1863,6 +1884,7 @@ bool s5l8900_set_button(s5l8900_t *m, unsigned which, bool pressed) {
  * entire device graph into the interpreter loop. */
 static void s5l8900_refresh(s5l8900_t *m, uint32_t tb) {
     m->level_dirty = false;
+    m->refresh_count++;
 
     /* Devices advance, then the controllers recompute what the CPU sees. */
     bool timer_irq = s5l_timer_tick(&m->timer, tb);
@@ -2044,6 +2066,79 @@ static unsigned run_retirement_batch_limit(const s5l8900_t *m,
     if (remaining > S5L8900_ACTIVE_CLOCK_BATCH_INSNS)
         remaining = S5L8900_ACTIVE_CLOCK_BATCH_INSNS;
     return remaining;
+}
+
+/*
+ * The cached interpreter's event horizon. The per-edge bound above exists so
+ * that no execution path defers the device graph across an edge; it cuts
+ * every engine run at ~68 instructions and makes the device refresh and the
+ * engine's re-entry a large share of host time. But an edge at which nothing
+ * can happen needs no refresh at that instant, provided that
+ *
+ *   - no enabled interrupt can be raised before the run ends: the run stops
+ *     exactly at the instruction whose tick crosses the next edge any enabled
+ *     wake source names (the table WFI already relies on, whose devices all
+ *     advance algebraically, so one tick of N edges is N ticks of one);
+ *   - nothing advances per refresh rather than per edge: the PL080s and SPI
+ *     ports move data on every refresh while a transfer is in flight, so a
+ *     run only extends while both are idle (they finish in the refresh after
+ *     the guest store that starts them);
+ *   - everything the guest observes is caught up first: every device access
+ *     ticks the devices to the accessing instruction (ci_run_catch_up), and
+ *     every non-timer access ends the run after it (level_dirty), exactly as
+ *     today. Host inputs arrive between s5l8900_run() calls.
+ *
+ * The run is also bounded, to keep host-side latency (frames, touches) as it
+ * was at the chunk level. Anything unknown falls back to the next edge.
+ */
+#define S5L8900_CI_HORIZON_MAX_INSNS 16384u
+
+static bool horizon_devices_idle(const s5l8900_t *m) {
+    for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
+        const s5l_pl080_t *d = &m->dmac[i];
+        if (!(d->config & PL080_CONFIG_EN)) continue;
+        for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++)
+            if ((d->ch[c].cfg & (PL080_CFG_EN | PL080_CFG_HALT)) == PL080_CFG_EN)
+                return false;
+    }
+    for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++)
+        if (m->spi[i].tx_level) return false;
+    return true;
+}
+
+static unsigned ci_horizon_batch_limit(s5l8900_t *m, unsigned remaining) {
+    const unsigned edge = retirement_batch_limit(m, remaining);
+    if (!edge || edge >= remaining || m->ci_horizon_off) return edge;
+    if (m->ci_horizon_key != m->refresh_count + 1u) {
+        uint32_t at = 0u;
+        m->ci_horizon_idle = horizon_devices_idle(m);
+        m->ci_horizon_kind = (uint8_t)s5l8900_next_wake(m, WAKE_SOURCES,
+                                                        NWAKE_SOURCES, &at);
+        m->ci_horizon_edges = at;
+        m->ci_horizon_key = m->refresh_count + 1u;
+    }
+    const s5l_wake_kind_t kind = (s5l_wake_kind_t)m->ci_horizon_kind;
+    const uint32_t edges = m->ci_horizon_edges;
+    if (!m->ci_horizon_idle || kind == S5L_WAKE_UNKNOWN) return edge;
+    uint64_t limit = remaining;
+    if (kind == S5L_WAKE_AT) {
+        /* The first instruction count whose ticks cross `edges` edges:
+         * floor((tb_accum + k * tb_hz) / cpu_hz) >= edges. For one edge this
+         * is retirement_batch_limit()'s own `until_edge`. */
+        const uint64_t need = ((uint64_t)edges * m->cpu_hz - m->tb_accum +
+                               m->tb_hz - 1u) / m->tb_hz;
+        if (need < limit) limit = need;
+    }
+    if (limit > S5L8900_CI_HORIZON_MAX_INSNS)
+        limit = S5L8900_CI_HORIZON_MAX_INSNS;
+    return limit > edge ? (unsigned)limit : edge;
+}
+
+bool s5l8900_set_ci_horizon(s5l8900_t *m, bool enabled) {
+    if (!m) return false;
+    m->ci_horizon_off = !enabled;
+    m->ci_horizon_key = 0u;
+    return true;
 }
 
 /*
@@ -2370,19 +2465,30 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
          */
         bool single_step = false;
         if (m->ci && !m->pre_step_hook) {
-            unsigned batch = run_retirement_batch_limit(m, max_steps - n,
-                                                        active_clock);
+            unsigned batch = active_clock
+                ? run_retirement_batch_limit(m, max_steps - n, true)
+                : ci_horizon_batch_limit(m, max_steps - n);
             if (batch) {
                 arm_ci_stop_t why = ARM_CI_STOP_BUDGET;
                 arm_status_t est = ARM_OK;
+                /* Open for the exact-time horizon only: in active-clock mode
+                 * device time is sampled from the host, not per instruction. */
+                m->ci_run_open = !active_clock;
+                m->ci_run_caught = 0u;
                 unsigned ran = arm_ci_run(m->ci, &m->cpu, batch, &est, &why);
+                m->ci_run_open = false;
                 if (ran) {
+                    /* Whatever device accesses inside the run already ticked,
+                     * the run's own tick does not repeat. */
+                    const unsigned rest = ran > m->ci_run_caught
+                                        ? ran - m->ci_run_caught : 0u;
                     n += ran;
-                    run_clock_retired(m, &active_clock,
-                                      &active_pending_retired, ran,
-                                      est != ARM_OK,
-                                      m->level_dirty ||
-                                      ext_inputs(m) != m->ext_seen);
+                    if (rest)
+                        run_clock_retired(m, &active_clock,
+                                          &active_pending_retired, rest,
+                                          est != ARM_OK,
+                                          m->level_dirty ||
+                                          ext_inputs(m) != m->ext_seen);
                 }
                 if (est != ARM_OK) { st = est; break; }
                 if (why != ARM_CI_STOP_STEP) continue;
