@@ -2,6 +2,7 @@
 #import "VMUserAppInstall.h"
 #import "VMInstanceStore.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static BOOL CopyString(id value, char *destination, size_t capacity) {
@@ -53,6 +54,90 @@ static bool ParseAppPlist(void *context, const uint8_t *bytes, size_t size,
         snprintf(detail, capacity, "UIRequiredDeviceCapabilities has an invalid type."); return false;
     }
     return true;
+}
+
+/*
+ * SQUARE ICONS. iPhone OS 3's SpringBoard rounds the corners and adds the
+ * gloss for App Store apps it installs itself, but shows an app in
+ * /Applications -- where this importer puts one -- exactly as its icon file
+ * is: square. So the importer does what SpringBoard would have done: round
+ * the corners, and add the gloss unless the app says its icon is already
+ * rendered (UIPrerenderedIcon). The result is an ordinary 8-bit sRGB PNG,
+ * which the guest's UIKit reads like any other. Anything unexpected leaves
+ * the app's own icon untouched; this never blocks an install.
+ */
+static NSString *RoundAppIcon(vm_user_app_plan_t *plan) {
+    const uint8_t *bytes = NULL;
+    size_t size = 0u;
+    if (!vm_user_app_plan_file(plan, "Info.plist", &bytes, &size)) return @"no Info.plist";
+    id decoded = [NSPropertyListSerialization
+        propertyListWithData:[NSData dataWithBytes:bytes length:size]
+                     options:NSPropertyListImmutable format:NULL error:NULL];
+    if (![decoded isKindOfClass:NSDictionary.class]) return @"unreadable Info.plist";
+    NSDictionary *info = decoded;
+    /* iPhone OS 3.1 reads CFBundleIconFile, then Icon.png. */
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    id iconFile = info[@"CFBundleIconFile"];
+    if ([iconFile isKindOfClass:NSString.class] && [(NSString *)iconFile length]) {
+        [names addObject:iconFile];
+        if (![(NSString *)iconFile pathExtension].length)
+            [names addObject:[(NSString *)iconFile stringByAppendingPathExtension:@"png"]];
+    }
+    [names addObject:@"Icon.png"];
+    id flag = info[@"UIPrerenderedIcon"];
+    const BOOL prerendered = [flag isKindOfClass:NSNumber.class] && [(NSNumber *)flag boolValue];
+
+    for (NSString *name in names) {
+        const char *relative = name.UTF8String;
+        if (!relative || !vm_user_app_plan_file(plan, relative, &bytes, &size)) continue;
+        /* Apple-crushed (CgBI) PNGs decode here too; ImageIO knows them. */
+        UIImage *icon = [UIImage imageWithData:[NSData dataWithBytes:bytes length:size]];
+        const CGSize px = icon ? CGSizeMake(round(icon.size.width * icon.scale),
+                                            round(icon.size.height * icon.scale)) : CGSizeZero;
+        if (px.width < 16.0 || px.height < 16.0 || px.width > 1024.0 || px.height > 1024.0)
+            return [NSString stringWithFormat:@"%@ could not be read as an image", name];
+        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+        format.scale = 1.0;
+        format.opaque = NO;
+        format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;   /* 8-bit sRGB */
+        UIGraphicsImageRenderer *renderer =
+            [[UIGraphicsImageRenderer alloc] initWithSize:px format:format];
+        UIImage *rounded = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+            const CGRect r = { CGPointZero, px };
+            /* A 57-pixel iPhone OS 3 icon has corners of about 10 pixels. */
+            [[UIBezierPath bezierPathWithRoundedRect:r
+                                        cornerRadius:MIN(px.width, px.height) * (10.0 / 57.0)] addClip];
+            [icon drawInRect:r];
+            if (prerendered) return;
+            /* The gloss: a white wash over the top half, its lower edge an
+             * arc that dips towards the middle. */
+            CGContextRef cg = context.CGContext;
+            CGContextSaveGState(cg);
+            [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(-0.5 * px.width, -0.62 * px.height,
+                                                               2.0 * px.width, 1.14 * px.height)] addClip];
+            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+            const CGFloat components[8] = { 1, 1, 1, 0.50, 1, 1, 1, 0.12 };
+            const CGFloat locations[2] = { 0, 1 };
+            CGGradientRef gradient = space
+                ? CGGradientCreateWithColorComponents(space, components, locations, 2) : NULL;
+            if (gradient)
+                CGContextDrawLinearGradient(cg, gradient, CGPointZero,
+                                            CGPointMake(0, 0.52 * px.height), 0);
+            CGGradientRelease(gradient);
+            CGColorSpaceRelease(space);
+            CGContextRestoreGState(cg);
+        }];
+        NSData *png = UIImagePNGRepresentation(rounded);
+        uint8_t *copy = png.length ? malloc(png.length) : NULL;
+        if (!copy) return @"out of memory for the icon";
+        memcpy(copy, png.bytes, png.length);
+        if (!vm_user_app_plan_replace_file(plan, relative, copy, png.length)) {
+            free(copy);
+            return [NSString stringWithFormat:@"%@ could not be replaced", name];
+        }
+        return nil;
+    }
+    return @"no icon file";
 }
 
 static size_t ReadIPA(void *context, uint64_t offset, uint8_t *bytes, size_t size) {
@@ -194,6 +279,8 @@ static void AppInstallProgress(void *context, uint64_t done, uint64_t total) {
         vm_user_app_plan_t *plan = data ? vm_user_app_plan_open(ReadIPA, (__bridge void *)data,
             data.length, ParseAppPlist, NULL, detail, sizeof detail) : NULL;
         if (scoped) [url stopAccessingSecurityScopedResource];
+        NSString *iconNote = plan ? RoundAppIcon(plan) : nil;
+        if (iconNote) NSLog(@"[apps] icon left as shipped: %@", iconNote);
         NSString *failure = detail[0] ? [NSString stringWithUTF8String:detail]
             : (error.localizedDescription ?: @"The IPA could not be read or is larger than 128 MiB.");
         dispatch_async(dispatch_get_main_queue(), ^{

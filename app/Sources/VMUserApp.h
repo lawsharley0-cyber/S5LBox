@@ -42,6 +42,22 @@ size_t vm_user_app_plan_entry_count(const vm_user_app_plan_t *plan);
 uint64_t vm_user_app_plan_content_bytes(const vm_user_app_plan_t *plan);
 bool vm_user_app_plan_digest(const vm_user_app_plan_t *plan, uint8_t digest[32]);
 
+/*
+ * A regular file of the bundle by its path relative to the .app (for example
+ * "Icon.png"), matched without regard to ASCII case the way the guest's
+ * HFS+ volume looks names up. The bytes stay owned by the plan.
+ */
+bool vm_user_app_plan_file(const vm_user_app_plan_t *plan, const char *relative,
+                           const uint8_t **bytes, size_t *size);
+/*
+ * Replace that file's bytes with `content` (malloc'd; the plan takes it only
+ * when this returns true) and recompute the plan's size and digest, so the
+ * install transaction records what is actually written. Used to give an icon
+ * the rounded corners iPhone OS 3 does not add to apps in /Applications.
+ */
+bool vm_user_app_plan_replace_file(vm_user_app_plan_t *plan, const char *relative,
+                                   uint8_t *content, size_t size);
+
 /* Public for focused tests and future non-UIKit frontends. */
 bool vm_user_app_validate_macho(const uint8_t *bytes, size_t size, bool main_executable,
                                char *detail, size_t detail_capacity);
