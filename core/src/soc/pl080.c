@@ -412,8 +412,9 @@ bool s5l_pl080_run(s5l_pl080_t *d, const arm_bus_t *bus,
 
 /* snprintf onto the end of out[0..cap), keeping it terminated; returns the new
  * length, which stays below cap. */
-static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...)
-    __attribute__((format(printf, 4, 5)));
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 4, 5)))
+#endif
 static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...) {
     if (len + 1u >= cap) return len;
     va_list ap;
