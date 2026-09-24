@@ -2324,10 +2324,12 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
         if (e->pc > hi) hi = e->pc;
     }
     if (lo > hi) return @"No kernel code has touched the audio block yet in this run. Play a sound (Settings > Sounds), then try again.";
-    /* Before the first pc for the function start, after the last for the
-     * rest of the function and its literal pool; bounded. */
-    uint32_t start = (lo - 0x400u) & ~0xfu, end = (hi + 0x800u + 0xfu) & ~0xfu;
-    if (end - start > 0x4000u) end = start + 0x4000u;
+    /* The register accessors are small leaf functions; the driver logic that
+     * calls them (firmware load, start sequence, the "could not start DMA"
+     * decision) lies before them in the same kext, so take 16 KiB before the
+     * first pc and 8 KiB after the last; bounded at 32 KiB. */
+    uint32_t start = (lo - 0x4000u) & ~0xfu, end = (hi + 0x2000u + 0xfu) & ~0xfu;
+    if (end - start > 0x8000u) end = start + 0x8000u;
     const uint64_t pa = (uint64_t)start - 0xc0000000u + 0x08000000u;
     if (!_machine.ram || pa < _machine.ram_base ||
         pa + (end - start) > (uint64_t)_machine.ram_base + _machine.ram_size)

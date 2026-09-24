@@ -478,3 +478,46 @@ AMC fetching samples itself rather than the PL080 feeding I2S0; if the next
 report shows the driver waiting on +0x0b18/+0x0010 for progress, that is a
 real DMA model to build (AMC -> audio sink), with its registers read from
 the driver's own accesses.
+
+## Third device report (build 9382179) and the driver's own register protocol
+
+The BSU lock now succeeds (`+0x400` reads back the 1 written), and the next
+failure is `AppleEmbeddedAudioDevice: could not start DMA: operation was
+aborted`. The user copied the kernel code around every pc that touched the
+AMC (opt-in "Copy Audio Driver Code", VA 0xc07170c0, 0x12b0 bytes, SHA-256
+f74fa5bc...95f9; disassembled here, not stored in the repository). What it
+establishes, as register semantics read from the driver (inference is marked):
+
+| Offset | Access | Driver use |
+|---|---|---|
+| +0x000, +0x004, +0x008, +0x00c | W 1 | separate "go" strobes (small leaf setters) |
+| +0x010 | R | compared with 1; when equal the driver writes +0x00c = 1 and then waits for +0xb18 bit 8 (up to 10 x 1 ms) |
+| +0x100 | W | mailbox 0 push (used to restore saved entries) |
+| +0x180/+0x184/+0x188 + 16n | W 1 / RW / R | per-mailbox control, data, pending count |
+| +0x204 | W 1 | enable |
+| +0x340 | W 0/1 | written 0 before the SRAM is cleared and 1 after a copy loop that precedes the excerpt: INFERRED "run" of something that executes from the SRAM |
+| +0x400 | W 1 / W 0, R | the BSU lock: write 1 and read back until non-zero (10 ms), write 0 to release |
+| +0x404 | R | status returned by every locked save/restore |
+| +0x410..+0x428 | RW | seven words saved and restored around a reset, with the mailbox 0 contents (+0x47c read while +0x188 > 0) |
+| +0xa00 + 4n | W | per-channel enable |
+| +0xb04, +0xb0c, +0xb10 | W | configuration (0x2000; 0x400 or 0x2000; 0x400 or 0x7fff) |
+| +0xb18 | R | status: bit 8 awaited after start, bit 9 awaited by a second routine (10 x 1 ms each); the storage stub returns 0, which matches the 44 polls in the report |
+| +0xb1c | R | status |
+| +0xd00 / +0xd04 | R / W 0,1 | |
+| +0xf00, +0xf04 | W | the same value to both |
+| +0x1000 | W | channel enable |
+| +0x1004 / +0x1008 | W | DRAM start address / length in words |
+| +0x100c | W | start (1) / stop (0) |
+| +0x1010 | R | current read pointer: the driver computes words remaining as length - (current - start) / 4 |
+| +0x1014 | W 1 | abort (with +0xa00 = 0 and +0x1000 = 0) |
+| +0x1018 | W 0/1 | INFERRED interrupt enable |
+| +0x101c | R bit 0 / W 1 | done status, write 1 to acknowledge |
+| +0x2000 | W | n - 1 (a divider) |
+| SRAM +0x5000, +0x14000, +0x1c000..+0x28000, +0x28000 | | cleared at init; two 24 KiB sample buffers at +0x1c000 and +0x22000 (0x6000 apart); a halfword read at +0x28000 |
+
+If the SRAM does hold code that the block executes (the +0x340 reading),
+then status bits 8/9 and the mailbox replies come from that code, and a
+correct model has to reproduce its protocol rather than set bits. The calling
+logic sits before this excerpt, so the excerpt window was widened to 16 KiB
+before the first accessing pc (and 8 KiB after the last) to capture it.
+Nothing is modelled from this yet.
