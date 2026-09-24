@@ -65,8 +65,11 @@ void gprof_note_in(gprof_t *p, uint32_t pc, bool user, uint16_t proc) {
     if (proc >= p->nproc) proc = 0;
     p->samples++;
     if (user) p->user++;
-    p->proc[proc].samples++;
-    if (user) p->proc[proc].user++;
+    gprof_proc_t *e = &p->proc[proc];
+    if (!e->samples) e->first = p->samples;
+    e->last = p->samples;
+    e->samples++;
+    if (user) e->user++;
     pc &= ~1u;
     const uint32_t mask = p->cap - 1u;
     uint32_t i = hash_key(pc, proc) & mask;
@@ -167,6 +170,7 @@ uint16_t gprof_proc_intern(gprof_t *p, uint32_t ttbr0, const char *name) {
         e->ttbr0 = ttbr0;
         snprintf(e->name, sizeof e->name, "%s", name);
         e->samples = e->user = 0;
+        e->first = e->last = 0;
         found = (uint16_t)p->nproc++;
     }
     if (!found) p->proc_full++;

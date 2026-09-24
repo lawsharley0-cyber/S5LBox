@@ -56,6 +56,10 @@ typedef struct {
     char     name[GPROF_NAME_MAX];   /* exec path, or "" if unreadable        */
     uint64_t samples;
     uint64_t user;
+    /* The profile's sample count (gprof_t::samples, 1-based) at this
+     * process's first and latest sample: where in the window it ran, and
+     * whether it was still running at the end. 0 until it is sampled. */
+    uint64_t first, last;
 } gprof_proc_t;
 
 /*

@@ -229,6 +229,13 @@ static void test_processes(void) {
     CHECK(p.proc[a].samples == 2u && p.proc[a].user == 2u && p.proc[b].samples == 1u &&
           p.proc[b].user == 0u && p.proc[0].samples == 1u && p.samples == 4u,
           "per-process totals");
+    /* Where in the window each ran: samples 1-2 were a, 3 was b, 4 row 0;
+     * c was never sampled. */
+    CHECK(p.proc[a].first == 1u && p.proc[a].last == 2u && p.proc[b].first == 3u &&
+          p.proc[b].last == 3u && p.proc[0].first == 4u && p.proc[c].first == 0u &&
+          p.proc[c].last == 0u, "first/last a %llu-%llu b %llu-%llu",
+          (unsigned long long)p.proc[a].first, (unsigned long long)p.proc[a].last,
+          (unsigned long long)p.proc[b].first, (unsigned long long)p.proc[b].last);
     CHECK(gprof_init(&q, 6u) && gprof_copy(&q, &p) && q.nproc == p.nproc &&
           !strcmp(q.proc[b].name, p.proc[b].name) && q.proc[a].samples == 2u,
           "copy carries the process table");

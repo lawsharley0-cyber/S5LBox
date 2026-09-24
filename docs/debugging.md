@@ -234,6 +234,29 @@ reports put 45% and 62% of all samples in Security.framework's bignum code
 (`_mulg_common`, `_grammarSquare_common`). That is RSA-sized arithmetic. The
 process section exists to name who is doing it.
 
+The bc45a3f reports named it. `/usr/libexec/lockdownd` took 31% and 43% of
+two cached-interpreter boots (1.9 and 2.6 G instructions). Its call paths
+run from its own code into `SecKeyGeneratePair` -> `RSA_GenKeyPair` ->
+`rsaGenRandPrime` -> `isGiantPrime`: it is generating a key pair. Each of
+those reports was taken 55 to 102 s into a boot, while it was still going.
+The work image keeps what the guest writes, so a key saved once should not
+be generated again. It is generated again, so something prevents the save.
+
+**Inferred, to be tested on the device:** the generation takes longer than a
+session. Stopping the machine does not unmount the guest disk cleanly: the
+Guest Logs reader refuses the disk until iPhone OS is shut down with slide
+to power off. A key that was never finished, or finished but still in the
+guest's buffer cache, is lost, and the next boot starts again. Two things
+settle this:
+- the profile's "seen a-b%" column, where "-100%" means still running at the
+  end of the window;
+- one long session ended with slide to power off, followed by a boot that
+  either repeats the work or does not.
+
+Nothing is pre-provisioned for lockdownd. What it stores, and in what
+format, would have to come from its own code, as `data_ark.plist`'s
+contents did (`docs/derivations.md` 23.3).
+
 ### 2b. Everything from one session — "Save Full Test Report"
 
 The emulator menu's *Save Full Test Report* writes
@@ -267,7 +290,12 @@ audio section:
   the seven stored registers, any other offset touched and the TX FIFO word
   count;
 - the AMC registers the driver left non-zero, and the SRAM's non-empty 1 KiB
-  chunks by offset.
+  chunks by offset;
+- the kernel's SHA-1, from `_SHA1Init` to the first symbol after the last of
+  its entry points (at most 16 KiB). It is behind every code-signing page
+  check (`cs_validate_page`) and took about 14% of guest time in the bc45a3f
+  profiles. It is copied so that a native replacement can be checked against
+  the exact instructions it would stand in for.
 
 Binary images are raw DEFLATE in base64. To get the bytes back:
 

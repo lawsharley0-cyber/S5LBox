@@ -2516,16 +2516,26 @@ static NSString *VMProfileProcesses(const gprof_t *w,
             ? [NSString stringWithFormat:@"%@  (ttbr0 %08x)", name, w->proc[first].ttbr0]
             : [NSString stringWithFormat:@"%@  (%lu address spaces)", name, (unsigned long)members.count];
     };
-    [out appendFormat:@"\nBy process (the address spaces samples ran in, by exec path; %u seen%s)\n",
+    [out appendFormat:@"\nBy process (the address spaces samples ran in, by exec path; %u seen%s; "
+                      @"\"seen a-b%%\" is where in the window it was first and last sampled)\n",
         w->nproc - 1u, w->proc_full ? ", table full" : ""];
+    /* "seen a-b%": where in the window its first and latest samples fell,
+     * so a program still busy when the report was taken reads "...-100%". */
     for (NSUInteger k = 0; k < order.count && k < 16; k++) {
-        uint64_t n = 0, user = 0;
+        uint64_t n = 0, user = 0, first = UINT64_MAX, last = 0;
         for (NSNumber *i in groups[order[k]]) {
-            n += w->proc[i.unsignedIntValue].samples;
-            user += w->proc[i.unsignedIntValue].user;
+            const gprof_proc_t *e = &w->proc[i.unsignedIntValue];
+            n += e->samples;
+            user += e->user;
+            if (e->first && e->first < first) first = e->first;
+            if (e->last > last) last = e->last;
         }
-        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]\n", 100.0 * n / total,
-            label(order[k]), 100.0 * user / n];
+        NSString *span = w->samples && first <= last
+            ? [NSString stringWithFormat:@"  seen %.0f-%.0f%%", 100.0 * (first - 1u) / w->samples,
+                                         100.0 * last / w->samples]
+            : @"";
+        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]%@\n", 100.0 * n / total,
+            label(order[k]), 100.0 * user / n, span];
     }
     [out appendString:@"\nTop functions in the busiest processes\n"];
     for (NSUInteger k = 0; k < order.count && k < 6; k++) {
@@ -2936,6 +2946,41 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
 }
 
 /*
+ * The kernel's SHA-1, from _SHA1Init to the first symbol after the last of
+ * its entry points (capped at 16 KiB): the code-signing check behind every
+ * executable page-in (cs_validate_page -> SHA1UpdateUsePhysicalAddress) and
+ * about 14% of guest time in the bc45a3f profiles. Its static block
+ * transform has no symbol of its own; profiles name it _SHA1Init. Copied so
+ * a native implementation can be checked against the exact code it would
+ * replace. nil when the symbols are missing or outside the copied window.
+ */
+static NSString *VMKernelSha1Text(const ksyms_t *ks, const uint8_t *window,
+                                  uint32_t start, uint32_t end) {
+    static const char *const kNames[] = {
+        "_SHA1Init", "_SHA1Update", "_SHA1UpdateUsePhysicalAddress", "_SHA1Final",
+    };
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (size_t i = 0; i < sizeof kNames / sizeof kNames[0]; i++) {
+        const uint32_t v = ksyms_value(ks, kNames[i]) & ~1u;
+        if (!v) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (lo > hi) return nil;
+    uint32_t stop = hi + 0x400u;            /* no later symbol: a fixed tail */
+    for (unsigned i = 0; i < ks->nsym; i++) {
+        const uint32_t v = ks->sym[i].value & ~1u;
+        if (v > hi && v < stop) stop = v;
+    }
+    if (stop - lo > 0x4000u) stop = lo + 0x4000u;
+    if (lo < start || stop > end) return nil;
+    return [NSString stringWithFormat:
+        @"KERNEL CODE FOR SPEED WORK (this machine's own kernel, for analysis; not stored by S5LBox)\n"
+        @"SHA-1 behind code-signing page checks: _SHA1Init 0x%08x .. 0x%08x\n%@",
+        lo, stop, VMDriverKextText(window + (lo - start), lo, stop - lo, "mach_kernel SHA-1", ks)];
+}
+
+/*
  * The audio block's own storage as the driver left it. AMC and its SRAM are
  * storage stubs (machine.c), not device models, so this is exactly what the
  * kernel wrote: the AMC registers as a list of the non-zero ones, and the
@@ -3149,8 +3194,10 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
                 [out appendString:ks ? @"no audio kext found in the kernelcache's load map\n"
                                      : @"no kernel.macho to map kexts\n"];
             }
+            NSString *hot = ks ? VMKernelSha1Text(ks, (const uint8_t *)window.bytes, start, end) : nil;
             VMFreeKernelSymbols(ks);
             [out appendFormat:@"\n%@\n%@", pcmState, VMAudioBlockText(amcBytes, sramBytes)];
+            if (hot) [out appendFormat:@"\n=== %@", hot];
         }
         dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
     });
