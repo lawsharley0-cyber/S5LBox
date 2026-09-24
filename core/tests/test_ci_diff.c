@@ -99,7 +99,9 @@ static uint32_t interesting(void) {
 }
 
 static uint32_t operand_value(void) {
-    switch (rnd_n(6u)) {
+    switch (rnd_n(7u)) {
+        case 6: return chance(50) ? rnd_n(0x40u) * 4u                     /* table index */
+                                  : CODE_VA + (rnd_n(0x400u) & ~3u) + rnd_n(4u);
         case 0: return interesting();
         case 1: return rnd_n(64u);
         case 2: return DATA_VA + rnd_n(DATA_BYTES);                 /* any alignment */
@@ -132,7 +134,7 @@ static uint32_t arm_cond(void) {
 static uint32_t gen_arm(unsigned idx, unsigned len) {
     uint32_t c = arm_cond() << 28;
     unsigned rd = reg_field(), rn = reg_field(), rm = reg_field(), rs = reg_field();
-    switch (rnd_n(27u)) {
+    switch (rnd_n(29u)) {
         case 0: case 1: case 2:                                         /* DP imm */
             return c | 0x02000000u | (rnd_n(16u) << 21) | (rnd_n(2u) << 20) |
                    (rn << 16) | (rd << 12) | (rnd_n(16u) << 8) |
@@ -252,6 +254,28 @@ static uint32_t gen_arm(unsigned idx, unsigned len) {
                            (sz << 8) | (rnd_n(2u) << 5) | rnd_n(16u);
             }
         }
+        case 26: case 27:                                                /* PC writes */
+            /* The forms compiled code uses to jump through memory or a
+             * register (stubs, returns, switch tables) and the PIC address
+             * idiom, with the bases and data words (see the data fill) that
+             * make their targets land in code. */
+            switch (rnd_n(6u)) {
+                case 0: case 1: {                                        /* LDR pc, imm */
+                    unsigned P = chance(70) ? 1u : 0u, W = P && chance(30) ? 1u : 0u;
+                    unsigned base = chance(50) ? 13u : chance(50) ? 15u : rn;
+                    return c | 0x04100000u | (P << 24) | (rnd_n(2u) << 23) | (W << 21) |
+                           (base << 16) | (15u << 12) | (rnd_n(4u) * 4u);
+                }
+                case 2:                                                  /* LDR pc, [Rn, Rm, LSL #2] */
+                    return c | 0x07100000u | (rnd_n(2u) << 23) | ((chance(30) ? 15u : rn) << 16) |
+                           (15u << 12) | (2u << 7) | rm;
+                case 3:                                                  /* MOV pc, Rm */
+                    return c | 0x01a0f000u | rm;
+                case 4:                                                  /* ADD/SUB Rd, PC, Rm */
+                    return c | (chance(50) ? 0x008f0000u : 0x004f0000u) | (rd << 12) | rm;
+                default:                                                 /* ADD pc, pc, Rm, LSL #2 */
+                    return c | 0x008ff100u | rm;
+            }
         default:                                                         /* anything */
             return (rnd() & 0x0fffffffu) | c;
     }
@@ -465,6 +489,13 @@ int main(int argc, char **argv) {
             }
             for (uint32_t i = 0; i < sizeof data_init; i++)
                 data_init[i] = (uint8_t)(chance(30) ? interesting() : rnd());
+            /* Some words are code addresses (ARM, Thumb, or misaligned), so
+             * loads into the PC land somewhere meaningful. */
+            for (uint32_t i = 0; i < sizeof data_init; i += 4u) {
+                if (!chance(15)) continue;
+                uint32_t w = CODE_VA + (rnd_n(0x400u) & ~3u) + rnd_n(4u);
+                memcpy(data_init + i, &w, 4);
+            }
             for (uint32_t i = 0; i < sizeof data_init; i += 4u) {
                 uint32_t w;
                 memcpy(&w, data_init + i, 4);

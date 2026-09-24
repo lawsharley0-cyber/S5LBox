@@ -484,7 +484,7 @@ typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
     X(MUL) X(MULS) X(MLA) X(MLAS) X(UMULL) X(UMLAL) X(SMULL) X(SMLAL)         \
     X(NOP) X(CLREX) X(MRS_CPSR) X(CLZ) X(SXTB) X(SXTH) X(UXTB) X(UXTH)        \
     X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
-    X(MRC_TID) X(MCR_TID)                                                     \
+    X(MRC_TID) X(MCR_TID) X(LDR_PC) X(JMP)                                    \
     X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)
 
 /* The data-processing and memory families, shared by the handlers and the
@@ -833,6 +833,30 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             op++;
             goto out;
         }
+        CI_HK(LDR_PC) {
+            /* exec_single_transfer's LDR pc: aligned, RAM, a representable
+             * target; anything else (alignment fault, UNPREDICTABLE, device,
+             * translation fault) is the reference's. */
+            const uint32_t rnv = (op->rs & 8u) ? PC_OF(op) + 8u : R[op->rn];
+            const uint32_t off = (op->rs & 4u) ? mem_reg_off(op, R[op->rm], c->cpsr)
+                                               : op->imm;
+            const unsigned mode = op->rs & 3u;
+            const uint32_t a = mode == CI_M_POST ? rnv : rnv + off;
+            const uint8_t *h;
+            if ((a & 3u) || !(h = mem_rd(ci, c, a, priv))) goto ref;
+            const uint32_t t = ld32(h);
+            if ((t & 3u) == 2u) goto ref;
+            if (mode == CI_M_POST) R[op->rn] = rnv + off;
+            else if (mode == CI_M_PRE) R[op->rn] = a;
+            c->cpsr = (c->cpsr & ~ARM_CPSR_T) | ((t & 1u) << 5);
+            next_pc = t & ((t & 1u) ? ~1u : ~3u);
+            op++;
+            goto out;
+        }
+        CI_HK(JMP)
+            next_pc = (R[op->rm] + op->imm) & (b->thumb ? ~1u : ~3u);
+            op++;
+            goto out;
         CI_HK(BX) {
             uint32_t t = R[op->rm];
             if ((t & 3u) == 2u) goto ref;

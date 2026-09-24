@@ -117,7 +117,16 @@ static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return ref(op, false);        /* MSR, MRS SPSR, QADD..., MOVW/MOVT */
     }
 
-    if (dp_writes_result(opc) && rd == 15u) return ref(op, true);
+    if (dp_writes_result(opc) && rd == 15u) {
+        /* MOV pc, Rm: an ALU write of the PC, word aligned, no interworking
+         * (ARM state, S clear). Every other form stays reference. */
+        const unsigned rm = insn & 0xfu;
+        if (opc == 13u && !S && !I && (insn & 0xff0u) == 0u && rm != 15u) {
+            op->kind = CI_K_JMP; op->rm = (uint8_t)rm; op->imm = 0u;
+            return CI_DEC_END;
+        }
+        return ref(op, true);
+    }
 
     unsigned form;
     op->rd = (uint8_t)rd;
@@ -151,7 +160,19 @@ static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
             op->rm = (uint8_t)rm; op->rs = (uint8_t)rs; op->sh = (uint8_t)type;
         } else {
             if (rm == 15u) return ref(op, false);
-            if (rn == 15u && opc != 13u && opc != 15u) return ref(op, false);
+            if (rn == 15u && opc != 13u && opc != 15u) {
+                /* The PIC idiom ADD Rd, PC, Rm (and SUB) without flags or a
+                 * shift folds the PC to a constant: Rm + (pc+8), or
+                 * (pc+8) - Rm as RSB. Every other PC-based form stays
+                 * reference. */
+                if (!S && (opc == 4u || opc == 2u) && (insn & 0xff0u) == 0u) {
+                    op->kind = CI_DP_KIND(opc == 4u ? 4u : 3u, CI_F_IMM, 0u);
+                    op->rd = (uint8_t)rd; op->rn = (uint8_t)rm;
+                    op->imm = pc + 8u;
+                    return CI_DEC_OP;
+                }
+                return ref(op, false);
+            }
             op->rm = (uint8_t)rm;
             form = norm_imm_shift(type, (insn >> 7) & 0x1fu, &op->sh, &op->sa)
                        ? CI_F_SHI : CI_F_REG;
@@ -173,7 +194,26 @@ static ci_dec_t decode_single(uint32_t pc, uint32_t insn, ci_op_t *op) {
     if (!P && W) return ref(op, L && rd == 15u);       /* LDRT/STRT family */
     if (writeback && (rn == 15u || rn == rd)) return ref(op, false);
     if (I && rm == 15u) return ref(op, false);
-    if (rd == 15u) return ref(op, L);                  /* LDR pc / STR pc */
+    if (rd == 15u) {                                    /* LDR pc / STR pc */
+        if (!L || B) return ref(op, L);
+        /* Writeback with a PC base and a PC offset register were refused
+         * above, as the reference refuses them. */
+        const unsigned mode = P ? (W ? CI_M_PRE : CI_M_OFF) : CI_M_POST;
+        op->kind = CI_K_LDR_PC;
+        op->rn = (uint8_t)rn;
+        op->rs = (uint8_t)(mode | (I ? 4u : 0u) | (rn == 15u ? 8u : 0u));
+        if (!I) {
+            const uint32_t off = insn & 0xfffu;
+            op->imm = U ? off : 0u - off;
+        } else {
+            op->rm = (uint8_t)rm;
+            if (!norm_imm_shift((insn >> 5) & 3u, (insn >> 7) & 0x1fu, &op->sh, &op->sa)) {
+                op->sh = CI_SH_LSL; op->sa = 0u;
+            }
+            if (!U) op->sh |= CI_SH_SUB;
+        }
+        return CI_DEC_END;
+    }
 
     if (rn == 15u) {                                    /* PC base, no writeback */
         if (!I && L && !B) {
@@ -440,17 +480,35 @@ ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op) {
         if ((insn & 0xfc00u) == 0x4400u) {                 /* hi-register ops */
             unsigned rd = TB(0) | ((insn >> 4) & 8u);
             unsigned rs = TB(3) | ((insn >> 3) & 8u);
+            /* Reading the PC here gives the instruction's address + 4, not
+             * word aligned; writing it branches within Thumb state. */
             switch ((insn >> 8) & 3u) {
-                case 0:
-                    if (rd == 15u) return ref(op, true);
-                    if (rs == 15u) return ref(op, false);
+                case 0:                                     /* ADD */
+                    if (rd == 15u) {
+                        if (rs == 15u) {
+                            op->kind = CI_K_B; op->imm = (pc4 + pc4) & ~1u;
+                            return CI_DEC_END;
+                        }
+                        op->kind = CI_K_JMP; op->rm = (uint8_t)rs; op->imm = pc4;
+                        return CI_DEC_END;
+                    }
+                    if (rs == 15u)                           /* PIC: ADD Rd, PC */
+                        return thumb_dp(op, 4u, CI_F_IMM, 0u, rd, rd, 0u, pc4);
                     return thumb_dp(op, 4u, CI_F_REG, 0u, rd, rd, rs, 0u);
                 case 1:
                     if (rd == 15u || rs == 15u) return ref(op, false);
                     return thumb_dp(op, 10u, CI_F_REG, 1u, 0u, rd, rs, 0u);
-                case 2:
-                    if (rd == 15u) return ref(op, true);
-                    if (rs == 15u) return ref(op, false);
+                case 2:                                     /* MOV */
+                    if (rd == 15u) {
+                        if (rs == 15u) {
+                            op->kind = CI_K_B; op->imm = pc4 & ~1u;
+                            return CI_DEC_END;
+                        }
+                        op->kind = CI_K_JMP; op->rm = (uint8_t)rs; op->imm = 0u;
+                        return CI_DEC_END;
+                    }
+                    if (rs == 15u)
+                        return thumb_dp(op, 13u, CI_F_IMM, 0u, rd, 0u, 0u, pc4);
                     return thumb_dp(op, 13u, CI_F_REG, 0u, rd, 0u, rs, 0u);
                 default:
                     if (rs == 15u) return ref(op, true);

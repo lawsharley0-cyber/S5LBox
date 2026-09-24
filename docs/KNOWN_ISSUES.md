@@ -26,8 +26,9 @@ These are correct (the reference code runs them) but not fast:
   other than VFP, `LDM`/`STM` with the S bit (user-bank and exception return),
   `LDM`/`STM` crossing a 1 KiB boundary or missing the host TLB, `SWP`,
   exclusives, DSP multiplies, SIMD/saturating media, `MSR`, `MRS SPSR`, `CPS`,
-  `SETEND`, PC-relative forms the reference treats specially, and every
-  access to device memory. VFP runs the reference's VFP unit directly
+  `SETEND`, PC-relative forms the reference treats specially (other than
+  `LDR pc`, `MOV pc, Rm`, Thumb `ADD/MOV pc, Rm` and the PIC idioms, which
+  run in the engine), and every access to device memory. VFP runs the reference's VFP unit directly
   (`CI_K_VFP`, no decode tree) but the unit itself and its memory path are
   unspecialised, so the `vfp` workload gains ~1.6× (`BENCHMARK_RESULTS.md`
   §7).

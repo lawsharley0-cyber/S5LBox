@@ -191,3 +191,27 @@ of 7 (exact) and 5 (active clock), M instr/s:
 About +22–26 %. What remains per VFP instruction (~250 host instructions)
 is the unit itself: `vfp_execute_inner` 31 %, `f32_do` 7 %, and VLDR/VLDM
 reaching memory through `mem_r32_as` (9 %, no host-TLB fast path yet).
+
+## 8. Writes to the PC and the PIC idioms in-engine
+
+Four forms that compiled iPhone OS code uses constantly were reference
+records: `LDR pc, [...]` (library-call stubs, `ldr pc, [sp], #4` returns,
+`ldrls pc, [pc, rN, lsl #2]` switch tables), `MOV pc, Rm`, Thumb `ADD/MOV
+pc, Rm`, and the PIC address idioms ARM `ADD/SUB Rd, pc, Rm` and Thumb
+`ADD/MOV Rd, pc`. They now run in the engine (`CI_K_LDR_PC`, `CI_K_JMP`, and
+constant-operand data processing); alignment faults, UNPREDICTABLE targets,
+device or unmapped addresses and every other form still go to the reference.
+
+The fuzzer gained generators for these forms and seeds data and registers
+with code addresses so the loads land in code: 800,000 runs, 0 mismatches
+(computed-goto dispatch) and 100,000 with the `switch` dispatch. Eleven
+deliberate bugs in the new paths are each caught (54–425 mismatches per
+40,000 runs; two of them were missed before the generators were added).
+
+`cpubench --backend cached --reps 3 --mode user --active-clock`, best of two
+medians, before → after (M instr/s): **interp ARM 131.4 → 174.8 (1.33×),
+interp Thumb 155.1 → 210.2 (1.36×)**, calls Thumb 176.4 → 186.2; every other
+row within ±5 %, which is this host's run-to-run noise (`mmu` moved ±10 % in
+both directions on reruns). `vfp` measured about 7 % lower on reruns with
+an identical host instruction count (callgrind 648.50 M vs 648.54 M Ir), so
+that is code placement in this binary, not added work.

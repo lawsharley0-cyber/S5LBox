@@ -79,6 +79,12 @@ enum {
      * executor; sa carries ARM_CI_REF_VFP for the statistics. */
     CI_K_VFP,
     /* Control flow. All end the block. */
+    /* LDR pc (word, not LDRT): interworking load. rn = base, rs = mode
+     * (CI_M_*) | 4 for a register offset (rm, sh, sa as CI_S_REG) | 8 when
+     * the base is the PC (address of the instruction + 8, no writeback);
+     * imm = signed immediate offset. */
+    CI_K_LDR_PC,
+    CI_K_JMP,          /* target = rm + imm, bit 0 (Thumb) or bits 1:0 clear */
     CI_K_B,            /* imm = target                                       */
     CI_K_BL,           /* ARM: LR = pc + 4                                   */
     CI_K_TBL2,         /* Thumb BL suffix: target = LR + imm, LR = pc+2 | 1  */
