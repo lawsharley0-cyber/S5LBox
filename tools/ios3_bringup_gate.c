@@ -4,15 +4,11 @@
 #include <stdio.h>
 #include <string.h>
 
-bool ios3_bringup_gate(void *context,
-                       const uint8_t *kernel_file,
-                       size_t kernel_file_size,
-                       uint8_t *ram,
-                       size_t ram_size,
-                       uint64_t ram_base,
-                       uint32_t virt_base,
-                       char *detail,
-                       size_t detail_capacity) {
+static bool gate(void *context, const uint8_t *kernel_file,
+                 size_t kernel_file_size, uint8_t *ram, size_t ram_size,
+                 uint64_t ram_base, uint32_t virt_base,
+                 bool disable_codesign_page_kill, char *detail,
+                 size_t detail_capacity) {
     ios3_bringup_gate_report_t *out = (ios3_bringup_gate_report_t *)context;
     ios3_kernel_patch_request_t request;
     ios3_kernel_patch_report_t report;
@@ -26,6 +22,7 @@ bool ios3_bringup_gate(void *context,
     request.ram_size = ram_size;
     request.ram_base = ram_base;
     request.virt_base = virt_base;
+    request.disable_codesign_page_kill = disable_codesign_page_kill;
 
     status = ios3_kernel_patch_apply(&request, &report);
     if (out != NULL) {
@@ -53,10 +50,28 @@ bool ios3_bringup_gate(void *context,
     return false;
 }
 
+bool ios3_bringup_gate(void *context, const uint8_t *kernel_file,
+                       size_t kernel_file_size, uint8_t *ram, size_t ram_size,
+                       uint64_t ram_base, uint32_t virt_base, char *detail,
+                       size_t detail_capacity) {
+    return gate(context, kernel_file, kernel_file_size, ram, ram_size,
+                ram_base, virt_base, false, detail, detail_capacity);
+}
+
+bool ios3_bringup_gate_unsigned_code(void *context, const uint8_t *kernel_file,
+                                     size_t kernel_file_size, uint8_t *ram,
+                                     size_t ram_size, uint64_t ram_base,
+                                     uint32_t virt_base, char *detail,
+                                     size_t detail_capacity) {
+    return gate(context, kernel_file, kernel_file_size, ram, ram_size,
+                ram_base, virt_base, true, detail, detail_capacity);
+}
+
 void ios3_bringup_gate_configure(s5l_bringup_request_t *request,
                                  ios3_bringup_gate_report_t *gate_report) {
     if (request == NULL) return;
-    request->kernel_gate = ios3_bringup_gate;
+    request->kernel_gate = request->guest_codesign_disabled
+        ? ios3_bringup_gate_unsigned_code : ios3_bringup_gate;
     request->kernel_gate_context = gate_report;
     request->md_read_site_pc = IOS3_KERNEL_PATCH_MD_READ_VA;
     request->md_write_site_pc = IOS3_KERNEL_PATCH_MD_WRITE_VA;

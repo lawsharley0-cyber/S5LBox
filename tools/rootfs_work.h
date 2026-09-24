@@ -212,7 +212,10 @@ typedef enum rootfs_work_status {
     ROOTFS_WORK_FILE_REPAIR_MISMATCH,
     ROOTFS_WORK_RANGE_ERROR,
     ROOTFS_WORK_PUBLISH_FAILED,
-    ROOTFS_WORK_PUBLISH_DURABILITY_FAILED
+    ROOTFS_WORK_PUBLISH_DURABILITY_FAILED,
+    /* Read-only access: the path does not exist, or names the wrong kind of
+     * object (a file where a directory was asked for, or the reverse). */
+    ROOTFS_WORK_NOT_FOUND
 } rootfs_work_status_t;
 
 typedef enum rootfs_work_stage {
@@ -564,6 +567,48 @@ rootfs_work_status_t rootfs_work_create(const char *source_path,
                                         const char *destination_path,
                                         const rootfs_work_options_t *options,
                                         rootfs_work_result_t *result);
+
+/*
+ * Read-only access, for diagnostics such as the guest's own crash reports.
+ * The source is opened, validated and audited exactly as by the probe above
+ * (a volume that was not cleanly unmounted is refused), nothing is written,
+ * and a source that changes while it is read is a SOURCE_CHANGED failure.
+ * Paths are absolute and are not resolved through symlinks (use
+ * /private/var, not /var). Names are converted from HFS+ UTF-16 to UTF-8 as
+ * stored (decomposed); a name that does not fit is truncated at a character.
+ */
+#define ROOTFS_WORK_MAX_NAME_UTF8 768u
+
+typedef enum rootfs_work_node_kind {
+    ROOTFS_WORK_NODE_FILE = 0,
+    ROOTFS_WORK_NODE_DIRECTORY,
+    ROOTFS_WORK_NODE_SYMLINK,
+    ROOTFS_WORK_NODE_OTHER          /* devices, FIFOs, sockets */
+} rootfs_work_node_kind_t;
+
+typedef struct rootfs_work_dirent {
+    char name[ROOTFS_WORK_MAX_NAME_UTF8];
+    rootfs_work_node_kind_t kind;
+    uint64_t size;          /* data fork bytes; for a directory, its valence */
+    uint32_t modify_time;   /* contentModDate: seconds since 1904-01-01 UTC */
+} rootfs_work_dirent_t;
+
+/* List `directory_path` in catalog (binary name) order. Up to `capacity`
+ * entries are stored; *count is how many were stored and *total how many
+ * the directory holds. */
+rootfs_work_status_t rootfs_work_list_directory(
+    const char *source_path, const char *directory_path,
+    rootfs_work_dirent_t *entries, size_t capacity, size_t *count,
+    size_t *total, rootfs_work_result_t *result);
+
+/* Read the first min(capacity, size) bytes of the regular file `file_path`
+ * into `buffer`. *length is the number stored and *file_size the file's
+ * logical size. A file whose data fork continues in the extents-overflow
+ * tree is PROVISION_UNSUPPORTED. */
+rootfs_work_status_t rootfs_work_read_file(
+    const char *source_path, const char *file_path, uint8_t *buffer,
+    size_t capacity, size_t *length, uint64_t *file_size,
+    rootfs_work_result_t *result);
 
 const char *rootfs_work_status_name(rootfs_work_status_t status);
 const char *rootfs_work_stage_name(rootfs_work_stage_t stage);

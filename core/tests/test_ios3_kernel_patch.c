@@ -897,6 +897,59 @@ static void test_raw_and_patch_site_mismatches(fixture_t *fixture) {
     }
 }
 
+/*
+ * The optional sixth site. Opted in, a wrong byte there is a named site
+ * mismatch and nothing is written anywhere (the other five sites keep their
+ * original bytes). Not opted in, the address is no patch site at all: the
+ * same corruption is caught only as loaded bytes differing from the file.
+ */
+static void test_codesign_page_kill_site(fixture_t *fixture) {
+    const size_t offset =
+        ram_offset_for_va(IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA);
+    size_t byte_index;
+
+    CHECK(IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA == UINT32_C(0xc020daac) &&
+          IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA - UINT32_C(0xc020d000) +
+                  UINT32_C(0x00205000) == UINT32_C(0x00205aac),
+          "_cs_enforcement_disable is no longer __DATA file offset 0x205aac");
+    for (byte_index = 0u; byte_index < 4u; byte_index++) {
+        ios3_kernel_patch_report_t report;
+        uint8_t corrupted;
+
+        prepare_synthetic_fixture(fixture);
+        fixture->request.disable_codesign_page_kill = true;
+        fixture->ram[offset + byte_index] ^= 0x80u;
+        corrupted = fixture->ram[offset + byte_index];
+        CHECK(ios3_kernel_patch_apply(&fixture->request, &report) ==
+                  IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED &&
+              report.site == IOS3_KERNEL_PATCH_SITE_CS_ENFORCEMENT &&
+              report.byte_index == byte_index &&
+              report.virtual_address ==
+                  (uint64_t)IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA + byte_index &&
+              report.guest_patch_status ==
+                  GUEST_PATCH_STATUS_EXPECTED_MISMATCH,
+              "cs_enforcement_disable byte %u mismatch lost its site report",
+              (unsigned)byte_index);
+        CHECK(fixture->ram[offset + byte_index] == corrupted &&
+              memcmp(fixture->ram +
+                         ram_offset_for_va(IOS3_KERNEL_PATCH_IORTC_VA),
+                     expected_sites[0].expected, expected_sites[0].length) == 0,
+              "a refused cs_enforcement_disable site changed RAM");
+    }
+    {
+        ios3_kernel_patch_report_t report;
+
+        prepare_synthetic_fixture(fixture);
+        fixture->ram[offset] ^= 0x80u;
+        CHECK(ios3_kernel_patch_apply(&fixture->request, &report) ==
+                  IOS3_KERNEL_PATCH_STATUS_LOADED_SEGMENT_MISMATCH &&
+              report.site == IOS3_KERNEL_PATCH_NO_SITE &&
+              report.virtual_address ==
+                  (uint64_t)IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA,
+              "without the flag the address became a patch site");
+    }
+}
+
 static FILE *open_read_only(const char *path) {
 #ifdef _MSC_VER
     FILE *file = NULL;
@@ -1015,6 +1068,34 @@ static void test_private_kernel_positive(fixture_t *fixture,
           report.site == IOS3_KERNEL_PATCH_SITE_IORTC &&
           report.guest_patch_status == GUEST_PATCH_STATUS_EXPECTED_MISMATCH,
           "second application did not fail on the full IORTC instruction");
+
+    /* The shipped global is 0 in the file and stays 0 unless asked for. */
+    {
+        static const uint8_t zero[4] = {0u, 0u, 0u, 0u};
+        static const uint8_t one[4] = {1u, 0u, 0u, 0u};
+        const size_t offset =
+            ram_offset_for_va(IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA);
+
+        CHECK(memcmp(g_kernel_storage.bytes + 0x205aacu, zero, 4u) == 0,
+              "the private kernel's _cs_enforcement_disable is not 0");
+        CHECK(memcmp(fixture->ram + offset, zero, 4u) == 0,
+              "the default manifest wrote _cs_enforcement_disable");
+        bind_fixture(fixture);
+        fixture->request.disable_codesign_page_kill = true;
+        CHECK(ios3_kernel_patch_apply(&fixture->request, &report) ==
+                  IOS3_KERNEL_PATCH_STATUS_OK &&
+              memcmp(fixture->ram + offset, one, 4u) == 0,
+              "the opted-in manifest did not set _cs_enforcement_disable");
+        for (site_index = 0u;
+             site_index < sizeof expected_sites / sizeof expected_sites[0];
+             site_index++) {
+            const expected_site_t *site = &expected_sites[site_index];
+            CHECK(memcmp(fixture->ram + ram_offset_for_va(site->va),
+                         site->replacement, site->length) == 0,
+                  "the opted-in manifest missed site %u",
+                  (unsigned)site_index);
+        }
+    }
 }
 
 static void test_status_and_site_strings(void) {
@@ -1034,7 +1115,7 @@ static void test_status_and_site_strings(void) {
                  "unknown iOS 3 kernel patch status") == 0,
           "unknown status string changed");
     for (site = IOS3_KERNEL_PATCH_SITE_IORTC;
-         site <= IOS3_KERNEL_PATCH_SITE_RAW_WATCHER; site++) {
+         site <= IOS3_KERNEL_PATCH_SITE_CS_ENFORCEMENT; site++) {
         const char *name = ios3_kernel_patch_site_string(site);
         CHECK(name != NULL && name[0] != '\0',
               "site %u has no stable name", (unsigned)site);
@@ -1058,6 +1139,7 @@ int main(int argc, char **argv) {
     test_overlap_rules_precede_report_writes(&fixture);
     test_loaded_segment_relationship(&fixture);
     test_raw_and_patch_site_mismatches(&fixture);
+    test_codesign_page_kill_site(&fixture);
     test_status_and_site_strings();
 
     if (argc == 2) {

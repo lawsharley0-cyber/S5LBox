@@ -9,6 +9,7 @@
 #import "VMEngine.h"
 #import "VMGuestInstallViewController.h"
 #import "VMUserAppViewController.h"
+#import "VMGuestLogsViewController.h"
 #import "VMInstanceStore.h"
 #import "VMInstances.h"
 #import "VMSettings.h"
@@ -204,7 +205,18 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
         done(YES);
     }];
     add.backgroundColor = UIColor.systemIndigoColor;
-    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[add]];
+    UIContextualAction *logs = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+        title:@"Crash Logs" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+        (void)action; (void)view;
+        if (self.navigationController.topViewController == self && row) {
+            VMGuestLogsViewController *screen = [[VMGuestLogsViewController alloc]
+                initWithInstanceID:row[@"id"] machineName:row[@"name"]];
+            [self.navigationController pushViewController:screen animated:YES];
+        }
+        done(YES);
+    }];
+    logs.backgroundColor = UIColor.systemOrangeColor;
+    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[add, logs]];
     configuration.performsFirstActionWithFullSwipe = NO;
     return configuration;
 }

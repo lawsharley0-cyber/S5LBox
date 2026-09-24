@@ -601,6 +601,7 @@ const char *rootfs_work_status_name(rootfs_work_status_t status) {
     case ROOTFS_WORK_PUBLISH_FAILED: return "publish-failed";
     case ROOTFS_WORK_PUBLISH_DURABILITY_FAILED:
         return "publish-durability-failed";
+    case ROOTFS_WORK_NOT_FOUND: return "not-found";
     }
     return "unknown";
 }
@@ -6873,6 +6874,375 @@ done:
             result->cleanup_system_error = error;
     }
     free(buffer);
+    return result->status;
+}
+
+/* ------------------------------------------------------ read-only access */
+
+typedef struct readonly_session {
+    host_file_t source;
+    file_stamp_t before;
+    hfs_volume_t volume;
+    catalog_ctx_t catalog;
+    uint8_t *buffer;
+} readonly_session_t;
+
+/* The probe's opening sequence: open, HFS validation, catalog open and the
+ * full catalog audit, so a damaged catalog is never read as "absent". */
+static bool readonly_open(readonly_session_t *session, const char *source_path,
+                          rootfs_work_result_t *result) {
+    memset(session, 0, sizeof(*session));
+    host_file_init(&session->source);
+    session->buffer = (uint8_t *)malloc(ROOTFS_WORK_MAX_IO_BUFFER);
+    if (!session->buffer) {
+        result_fail(result, ROOTFS_WORK_NO_MEMORY, ROOTFS_WORK_STAGE_ARGUMENTS,
+                    0, "cannot allocate %u-byte bounded I/O buffer",
+                    ROOTFS_WORK_MAX_IO_BUFFER);
+        return false;
+    }
+#ifdef _WIN32
+    if (!windows_open_source(source_path, &session->source, &session->before,
+                             result))
+        return false;
+#else
+    if (!posix_open_source(source_path, &session->source, &session->before,
+                           result))
+        return false;
+#endif
+    result->source_size = session->before.size;
+    return hfs_validate(&session->source, session->before.size,
+                        &session->volume, session->buffer,
+                        ROOTFS_WORK_MAX_IO_BUFFER,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result) &&
+           catalog_open(&session->catalog, &session->source,
+                        session->before.size, &session->volume,
+                        ROOTFS_WORK_DEFAULT_MAC_TIME, result) &&
+           catalog_audit(&session->catalog, session->catalog.leaf_records,
+                         ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result);
+}
+
+/* What was read is only an answer if the source did not change under it. */
+static void readonly_close(readonly_session_t *session,
+                           rootfs_work_result_t *result) {
+    file_stamp_t after;
+    int error = 0;
+
+    if (result->status == ROOTFS_WORK_OK &&
+        host_file_is_open(&session->source)) {
+        if (!host_file_stamp(&session->source, &after, &error))
+            result_fail(result, ROOTFS_WORK_SOURCE_CHANGED,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, error,
+                        "cannot revalidate source identity after reading");
+        else if (!stamp_equal(&session->before, &after))
+            result_fail(result, ROOTFS_WORK_SOURCE_CHANGED,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                        "the source changed while it was read");
+    }
+    catalog_close(&session->catalog);
+    if (host_file_is_open(&session->source) &&
+        !host_file_close(&session->source, &error)) {
+        if (result->status == ROOTFS_WORK_OK)
+            result_fail(result, ROOTFS_WORK_SOURCE_CHANGED,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, error,
+                        "source close failed after reading");
+        else if (result->cleanup_system_error == 0)
+            result->cleanup_system_error = error;
+    }
+    free(session->buffer);
+    session->buffer = NULL;
+}
+
+/* HFS+ names are UTF-16 code units; surrogate pairs are joined, a lone
+ * surrogate or NUL becomes U+FFFD, and output stops at a whole character. */
+static void units_to_utf8(const uint8_t *units, uint16_t count, char *out,
+                          size_t capacity) {
+    size_t used = 0u;
+    uint16_t index;
+
+    for (index = 0u; index < count; index++) {
+        uint32_t code = read_be16(units + (size_t)index * 2u);
+        char bytes[4];
+        size_t length;
+
+        if (code >= 0xd800u && code <= 0xdbffu && index + 1u < count) {
+            uint32_t low = read_be16(units + ((size_t)index + 1u) * 2u);
+            if (low >= 0xdc00u && low <= 0xdfffu) {
+                code = 0x10000u + ((code - 0xd800u) << 10) + (low - 0xdc00u);
+                index++;
+            }
+        }
+        if (code == 0u || (code >= 0xd800u && code <= 0xdfffu))
+            code = 0xfffdu;
+        if (code < 0x80u) {
+            bytes[0] = (char)code;
+            length = 1u;
+        } else if (code < 0x800u) {
+            bytes[0] = (char)(0xc0u | (code >> 6));
+            bytes[1] = (char)(0x80u | (code & 0x3fu));
+            length = 2u;
+        } else if (code < 0x10000u) {
+            bytes[0] = (char)(0xe0u | (code >> 12));
+            bytes[1] = (char)(0x80u | ((code >> 6) & 0x3fu));
+            bytes[2] = (char)(0x80u | (code & 0x3fu));
+            length = 3u;
+        } else {
+            bytes[0] = (char)(0xf0u | (code >> 18));
+            bytes[1] = (char)(0x80u | ((code >> 12) & 0x3fu));
+            bytes[2] = (char)(0x80u | ((code >> 6) & 0x3fu));
+            bytes[3] = (char)(0x80u | (code & 0x3fu));
+            length = 4u;
+        }
+        if (used + length >= capacity)
+            break;
+        memcpy(out + used, bytes, length);
+        used += length;
+    }
+    if (capacity)
+        out[used] = '\0';
+}
+
+/* The CNID of the folder at `path`, "/" included. */
+static bool readonly_folder(catalog_ctx_t *ctx, const char *path,
+                            uint32_t *cnid, rootfs_work_result_t *result) {
+    uint32_t leaf;
+    uint16_t position;
+    bool found;
+    uint8_t *data = NULL;
+
+    if (path && strcmp(path, "/") == 0) {
+        *cnid = HFS_ROOT_FOLDER_CNID;
+        return true;
+    }
+    if (!catalog_find_path_record(ctx, path, &leaf, &position, &found, &data,
+                                  ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result))
+        return false;
+    if (!found || !data || read_be16(data) != HFS_CAT_FOLDER_RECORD) {
+        result_fail(result, ROOTFS_WORK_NOT_FOUND,
+                    ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                    "%.200s is not a directory on this volume", path);
+        return false;
+    }
+    *cnid = read_be32(data + 8u);
+    return true;
+}
+
+rootfs_work_status_t rootfs_work_list_directory(
+    const char *source_path, const char *directory_path,
+    rootfs_work_dirent_t *entries, size_t capacity, size_t *count,
+    size_t *total, rootfs_work_result_t *result) {
+    readonly_session_t session;
+    catalog_ctx_t *ctx = &session.catalog;
+    uint32_t cnid = 0u;
+    uint32_t leaf = 0u;
+    uint16_t position = 0u;
+    bool found = false;
+    uint32_t hops = 0u;
+
+    if (!result)
+        return ROOTFS_WORK_INVALID_ARGUMENT;
+    result_reset(result);
+    if (count) *count = 0u;
+    if (total) *total = 0u;
+    if (!source_path || !source_path[0] || !directory_path || !count ||
+        !total || (capacity && !entries))
+        return result_fail(result, ROOTFS_WORK_INVALID_ARGUMENT,
+                           ROOTFS_WORK_STAGE_ARGUMENTS, 0,
+                           "a source, a directory and count outputs are required");
+    if (!readonly_open(&session, source_path, result) ||
+        !readonly_folder(ctx, directory_path, &cnid, result) ||
+        /* (cnid, "") is the folder's thread record, which sorts before every
+         * child; its children follow it, contiguous in key order. */
+        !catalog_search(ctx, cnid, NULL, 0u, &leaf, &position, &found,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result))
+        goto done;
+    for (;;) {
+        uint8_t *node = NULL;
+        uint16_t records;
+        uint32_t next;
+
+        if (!catalog_node_load(ctx, leaf, &node,
+                               ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result) ||
+            !catalog_node_check(ctx, node, leaf, HFS_BT_LEAF_NODE, 1u,
+                                ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result))
+            goto done;
+        records = catalog_record_count(node);
+        for (; position < records; position++) {
+            uint16_t offset = catalog_slot(node, ctx->node_size, position);
+            uint16_t end = catalog_slot(node, ctx->node_size,
+                                        (uint16_t)(position + 1u));
+            const uint8_t *record = node + offset;
+            const uint8_t *data;
+            uint16_t data_offset;
+            uint16_t type;
+            bool valid = false;
+            rootfs_work_dirent_t entry;
+
+            (void)catalog_key_compare_raw(record, (uint16_t)(end - offset),
+                                          cnid, NULL, 0u, &valid);
+            if (!valid) {
+                result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                            ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                            "catalog node %u record %u has an unreadable key",
+                            leaf, position);
+                goto done;
+            }
+            if (read_be32(record + 2u) != cnid)
+                goto done;                      /* past the last child */
+            data_offset = catalog_record_data_offset(record);
+            if ((uint32_t)data_offset + 2u > (uint32_t)(end - offset)) {
+                result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                            ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                            "catalog node %u record %u has no data", leaf,
+                            position);
+                goto done;
+            }
+            data = record + data_offset;
+            type = read_be16(data);
+            if (type == HFS_CAT_FOLDER_THREAD || type == HFS_CAT_FILE_THREAD)
+                continue;
+            if ((type != HFS_CAT_FOLDER_RECORD && type != HFS_CAT_FILE_RECORD) ||
+                (uint32_t)data_offset +
+                        (type == HFS_CAT_FOLDER_RECORD ? HFS_CAT_FOLDER_DATA
+                                                       : HFS_CAT_FILE_DATA) >
+                    (uint32_t)(end - offset)) {
+                result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                            ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                            "catalog node %u record %u is not a whole "
+                            "folder or file record", leaf, position);
+                goto done;
+            }
+            memset(&entry, 0, sizeof(entry));
+            units_to_utf8(record + 8u, read_be16(record + 6u), entry.name,
+                          sizeof(entry.name));
+            entry.modify_time = read_be32(data + 16u);
+            if (type == HFS_CAT_FOLDER_RECORD) {
+                entry.kind = ROOTFS_WORK_NODE_DIRECTORY;
+                entry.size = read_be32(data + 4u);
+            } else {
+                uint16_t mode = (uint16_t)(read_be16(data + 42u) & HFS_MODE_IFMT);
+                entry.kind = mode == HFS_MODE_IFREG || mode == 0u
+                                 ? ROOTFS_WORK_NODE_FILE
+                           : mode == HFS_MODE_IFLNK ? ROOTFS_WORK_NODE_SYMLINK
+                                                    : ROOTFS_WORK_NODE_OTHER;
+                entry.size = read_be64(data + 88u);
+            }
+            if (*count < capacity)
+                entries[(*count)++] = entry;
+            (*total)++;
+        }
+        next = read_be32(node);                 /* fLink */
+        if (next == 0u)
+            goto done;
+        if (++hops > ctx->total_nodes) {
+            result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                        "the catalog leaf chain loops");
+            goto done;
+        }
+        leaf = next;
+        position = 0u;
+    }
+
+done:
+    readonly_close(&session, result);
+    if (result->status != ROOTFS_WORK_OK) {
+        *count = 0u;
+        *total = 0u;
+    }
+    return result->status;
+}
+
+rootfs_work_status_t rootfs_work_read_file(
+    const char *source_path, const char *file_path, uint8_t *buffer,
+    size_t capacity, size_t *length, uint64_t *file_size,
+    rootfs_work_result_t *result) {
+    readonly_session_t session;
+    catalog_ctx_t *ctx = &session.catalog;
+    uint32_t leaf;
+    uint16_t position;
+    bool found = false;
+    uint8_t *data = NULL;
+    uint64_t logical;
+    uint64_t want;
+    uint64_t copied = 0u;
+    uint32_t declared_blocks;
+    uint32_t inline_blocks = 0u;
+    unsigned extent;
+
+    if (!result)
+        return ROOTFS_WORK_INVALID_ARGUMENT;
+    result_reset(result);
+    if (length) *length = 0u;
+    if (file_size) *file_size = 0u;
+    if (!source_path || !source_path[0] || !file_path || !length ||
+        !file_size || (capacity && !buffer))
+        return result_fail(result, ROOTFS_WORK_INVALID_ARGUMENT,
+                           ROOTFS_WORK_STAGE_ARGUMENTS, 0,
+                           "a source, a file path and length outputs are required");
+    if (!readonly_open(&session, source_path, result) ||
+        !catalog_find_path_record(ctx, file_path, &leaf, &position, &found,
+                                  &data, ROOTFS_WORK_STAGE_SOURCE_VALIDATE,
+                                  result))
+        goto done;
+    if (!found || !data || read_be16(data) != HFS_CAT_FILE_RECORD ||
+        ((read_be16(data + 42u) & HFS_MODE_IFMT) != HFS_MODE_IFREG &&
+         (read_be16(data + 42u) & HFS_MODE_IFMT) != 0u)) {
+        result_fail(result, ROOTFS_WORK_NOT_FOUND,
+                    ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                    "%.200s is not a regular file on this volume", file_path);
+        goto done;
+    }
+    logical = read_be64(data + 88u);
+    declared_blocks = read_be32(data + 100u);
+    for (extent = 0u; extent < 8u; extent++) {
+        uint32_t start = read_be32(data + 104u + extent * 8u);
+        uint32_t blocks = read_be32(data + 108u + extent * 8u);
+        if (blocks == 0u)
+            break;
+        if ((uint64_t)start + blocks > ctx->total_blocks ||
+            UINT32_MAX - inline_blocks < blocks) {
+            result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                        ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                        "%.200s has an extent outside the volume", file_path);
+            goto done;
+        }
+        inline_blocks += blocks;
+    }
+    if (inline_blocks != declared_blocks) {
+        result_fail(result, ROOTFS_WORK_PROVISION_UNSUPPORTED,
+                    ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                    "%.200s continues in the extents-overflow tree", file_path);
+        goto done;
+    }
+    if (logical > (uint64_t)declared_blocks * ctx->block_size) {
+        result_fail(result, ROOTFS_WORK_PROVISION_CATALOG_CORRUPT,
+                    ROOTFS_WORK_STAGE_SOURCE_VALIDATE, 0,
+                    "%.200s is larger than its data extents", file_path);
+        goto done;
+    }
+    want = logical < capacity ? logical : (uint64_t)capacity;
+    for (extent = 0u; extent < 8u && copied < want; extent++) {
+        uint64_t offset = (uint64_t)read_be32(data + 104u + extent * 8u) *
+                          ctx->block_size;
+        uint64_t take = (uint64_t)read_be32(data + 108u + extent * 8u) *
+                        ctx->block_size;
+        if (take > want - copied)
+            take = want - copied;
+        if (take && !checked_read(ctx->file, ctx->file_size, offset,
+                                  buffer + copied, (size_t)take,
+                                  ROOTFS_WORK_STAGE_SOURCE_VALIDATE, result))
+            goto done;
+        copied += take;
+    }
+    *length = (size_t)copied;
+    *file_size = logical;
+
+done:
+    readonly_close(&session, result);
+    if (result->status != ROOTFS_WORK_OK) {
+        *length = 0u;
+        *file_size = 0u;
+    }
     return result->status;
 }
 

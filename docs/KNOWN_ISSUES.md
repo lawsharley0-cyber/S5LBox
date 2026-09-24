@@ -53,21 +53,34 @@ These are correct (the reference code runs them) but not fast:
 - `arm_ci_stats_t.mem_fast` is never incremented (the fast path is kept free
   of counters); it always reads 0.
 
-## 3. Guest app (IPA) install: probably not visible on the home screen yet
+## 3. Guest app (IPA) install: icon appears, launch fails (being fixed)
 
-`VMUserAppInstall.c` copies a validated, unencrypted legacy IPA into the
-guest disk at `/Applications/<bundle-id>.app`, and a machine with a user app
-boots with guest code-signing enforcement off (`VMFirmwareBoot.c`). Nothing
-refreshes SpringBoard's MobileInstallation cache
-(`/var/mobile/Library/Caches/com.apple.mobile.installation.plist`), which is
-what iPhone OS 3's SpringBoard builds its icon list from; the Cydia payload
-path does this by running `uicache` in the guest (`VMGuestRootfsPlan.c`),
-the user-app path does not, and a stock image has no `uicache` or shell to
-run. No real app has been installed end to end (`APP_COMPATIBILITY.md`: no
-test apps), so this is unconfirmed. To check: install one small, unencrypted
-iPhone OS 3-era app you own and see whether its icon appears after boot. If
-it does not, the fix is either a host-side rewrite of that cache in the disk
-image (the HFS writer is create-only today) or a guest-side refresh.
+First real test (device report on `6cf0ed2`, 2026-09-24): a user-supplied
+IPA that passed the importer's checks (ARMv6 slice, unencrypted, minimum OS
+<= 3.1.3) **appears on the guest home screen** (so SpringBoard does scan
+`/Applications`; the MobileInstallation cache concern did not bite), but:
+
+- **Opening it shows black, then returns to the home screen.** Most likely
+  cause, from `activation.md` A.3.1: the kernel's page-fault signature kill
+  (`_cs_enforcement_disable`, which the boot-arg does not reach) killed it at
+  its first code page. Fixed for machines with an installed app by an
+  optional kernel patch in the same verified transaction as the others.
+  Unconfirmed until the next device run. Other causes that would look the
+  same: an OpenGL ES game (MBX graphics are hidden from the guest by default,
+  so context creation fails), a missing framework or symbol, or the launch
+  watchdog on a slow launch.
+- **The icon is square.** Probably because apps in `/Applications` are
+  treated as system apps, whose icons SpringBoard shows as shipped (stock
+  icons are pre-rendered with rounded corners); a user app installed through
+  MobileInstallation would be masked. Cosmetic; not changed.
+
+Diagnostics added for exactly this: Performance & Sound Details now ends with
+the last 40 lines of the guest console (where the kernel prints a
+code-signing kill), and Machines -> swipe a machine -> **Crash Logs** lists
+and shows the guest's own crash reports (Apple's ReportCrash writes them to
+`/private/var/mobile/Library/Logs/CrashReporter`), read from the stopped
+disk with the new read-only HFS API (`rootfs_work_list_directory`,
+`rootfs_work_read_file`).
 
 ## 4. Pre-existing reference-interpreter gap found during this work
 

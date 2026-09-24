@@ -62,6 +62,7 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 // Scrollback kept in the console. The guest prints one short line per frame
 // forever, so this cannot be unbounded.
 static const NSUInteger kConsoleScrollback = 12000;
+static const NSUInteger kReportConsoleLines = 40;
 
 /*
  * iOS 26 added UINavigationController's content-wide interactive pop gesture
@@ -1169,6 +1170,18 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+/* The last `count` lines of the collected console, whole lines only. */
+- (NSString *)consoleTail:(NSUInteger)count {
+    NSString *text = [_consoleText copy];
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSUInteger end = lines.count;
+    while (end && lines[end - 1].length == 0) end--;
+    NSUInteger start = end > count ? end - count : 0;
+    NSString *tail = [[lines subarrayWithRange:NSMakeRange(start, end - start)]
+                      componentsJoinedByString:@"\n"];
+    return tail.length ? tail : @"(nothing printed yet)";
+}
+
 - (void)showPerformanceReport {
     [self setPerformanceVisible:YES];
     vm_frame_telemetry_snapshot_t state;
@@ -1198,6 +1211,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         state.layer_attempts ? (double)state.layer_total_work_ns / state.layer_attempts / 1e6 : 0,
         [_engine audioStatusDescription] ?: @"Audio status unavailable",
         [_engine diagnosticsDescription] ?: @"Diagnostics unavailable"];
+    /* The guest console is where the kernel says why it stopped a process
+     * (a code-signing kill, for one), and it is collected even when the
+     * console view is hidden, so the report carries its tail. */
+    [self appendConsole:[_engine takePendingConsoleText]];
+    report = [report stringByAppendingFormat:@"\n\nGuest console, last %lu lines (open the app that fails, then this report):\n%@",
+              (unsigned long)kReportConsoleLines, [self consoleTail:kReportConsoleLines]];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Performance & Sound"
         message:report preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Copy Report" style:UIAlertActionStyleDefault

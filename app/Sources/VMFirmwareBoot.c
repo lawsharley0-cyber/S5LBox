@@ -1011,6 +1011,11 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
     vm_boot_options_reconcile_jailbreak(
         &report->options, &request,
         guest_install_committed || user_app_policy == VM_GUEST_INSTALL_PROBE_VALID);
+    /* The gate follows the policy just decided: with guest code signing
+     * relaxed, the kernel's page-fault signature kill is switched off as
+     * well, or an app whose signature no longer matches its code is killed
+     * at its first page even though AMFI let it start. */
+    ios3_bringup_gate_configure(&request, NULL);
 
     s5l_bringup_status_t status =
         s5l_bringup(machine, &request, boot->bridges, &report->bringup);
