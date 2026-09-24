@@ -1221,6 +1221,11 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         message:report preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Copy Report" style:UIAlertActionStyleDefault
         handler:^(__unused UIAlertAction *action) { UIPasteboard.generalPasteboard.string = report; }]];
+    VMEngine *engine = _engine;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy Audio Driver Code" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) {
+            UIPasteboard.generalPasteboard.string = [engine audioDriverExcerpt] ?: @"No machine";
+        }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }

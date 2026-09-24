@@ -42,6 +42,7 @@
 #import "VMAudioOutput.h"
 #import "arm_ci.h"
 
+#import <CommonCrypto/CommonDigest.h>
 #import <mach/mach.h>
 #import <pthread.h>
 #import <time.h>
@@ -2285,6 +2286,55 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
         @"Recent accesses to unmodelled hardware (most recent first):\n%s",
         timing, engine, active || !note ? @"" : note, active || !note ? @"" : @"\n",
         devices, missing];
+}
+
+/*
+ * The kernel code around every guest pc that touched the audio block (AMC
+ * registers and SRAM), from this machine's own RAM: the kernel maps
+ * 0xc0000000 -> physical 0x08000000 linearly. Opt-in and copied by the
+ * user; it is their firmware and it is never stored by S5LBox. Code pages do
+ * not change while the guest runs, so reading them from this thread is safe.
+ */
+- (NSString *)audioDriverExcerpt {
+    s5l_access_entry_t logs[2 * S5L_ACCESS_LOG];
+    pthread_mutex_lock(&_lock);
+    memcpy(logs, _diagMmio, sizeof _diagMmio);
+    memcpy(logs + S5L_ACCESS_LOG, _diagUnmodelled, sizeof _diagUnmodelled);
+    pthread_mutex_unlock(&_lock);
+
+    uint32_t lo = UINT32_MAX, hi = 0u;
+    for (size_t i = 0; i < 2u * S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &logs[i];
+        if (!e->count) continue;
+        const BOOL amc = e->addr >= S5L8900_AMC_BASE && e->addr - S5L8900_AMC_BASE < S5L8900_AMC_SIZE;
+        const BOOL sram = e->addr >= S5L8900_SRAM_BASE && e->addr - S5L8900_SRAM_BASE < S5L8900_SRAM_SIZE;
+        if (!amc && !sram) continue;
+        if (e->pc < 0xc0000000u || e->pc >= 0xc0800000u) continue;
+        if (e->pc < lo) lo = e->pc;
+        if (e->pc > hi) hi = e->pc;
+    }
+    if (lo > hi) return @"No kernel code has touched the audio block yet in this run. Play a sound (Settings > Sounds), then try again.";
+    /* Before the first pc for the function start, after the last for the
+     * rest of the function and its literal pool; bounded. */
+    uint32_t start = (lo - 0x400u) & ~0xfu, end = (hi + 0x800u + 0xfu) & ~0xfu;
+    if (end - start > 0x4000u) end = start + 0x4000u;
+    const uint64_t pa = (uint64_t)start - 0xc0000000u + 0x08000000u;
+    if (!_machine.ram || pa < _machine.ram_base ||
+        pa + (end - start) > (uint64_t)_machine.ram_base + _machine.ram_size)
+        return @"The kernel is not where this build expects it in guest RAM.";
+    NSData *bytes = [NSData dataWithBytes:_machine.ram + (pa - _machine.ram_base) length:end - start];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+    return [NSString stringWithFormat:
+        @"S5LBox audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)
+"
+        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x
+%@
+",
+        start, end - start, hex, lo, hi,
+        [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
 }
 
 - (NSString *)audioStatusDescription {

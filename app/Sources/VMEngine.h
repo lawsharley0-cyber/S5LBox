@@ -141,6 +141,11 @@ typedef void (^VMEngineStopCompletion)(void);
  * with the status line; safe on any thread. */
 - (NSString *)diagnosticsDescription;
 
+/* Opt-in: the guest kernel's own code around every pc that accessed the
+ * audio block, base64 with its VA and SHA-256, for analysing the driver's
+ * register protocol. Read from guest RAM; nothing is stored. */
+- (NSString *)audioDriverExcerpt;
+
 /*
  * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
  * the build-time compact AArch64 engine compiled in, this forces every guest
