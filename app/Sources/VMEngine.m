@@ -2643,6 +2643,22 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
  */
 static const uint32_t kVMDriverWindow = 0x40000u;   /* each side of the pcs */
 
+/* Bytes for the report: raw DEFLATE (RFC 1951; zlib's wbits=-15 inflates it),
+ * then base64, since code compresses to about half and SRAM is mostly
+ * zeros. Plain base64 if compression is refused, and the header says which. */
+static NSString *VMPackedBase64(NSData *raw) {
+    NSError *error = nil;
+    NSData *packed = [raw compressedDataUsingAlgorithm:NSDataCompressionAlgorithmZlib
+                                                 error:&error];
+    if (packed.length)
+        return [NSString stringWithFormat:@"deflate-raw+base64 (%lu -> %lu bytes; inflate with zlib wbits=-15):\n%@\n",
+            (unsigned long)raw.length, (unsigned long)packed.length,
+            [packed base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+    return [NSString stringWithFormat:@"base64 (%lu bytes, uncompressed):\n%@\n",
+        (unsigned long)raw.length,
+        [raw base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+}
+
 static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t len,
                                   const char *label, const ksyms_t *ks) {
     NSMutableString *out = [NSMutableString string];
@@ -2684,9 +2700,7 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
     free(refs);
     [out appendFormat:@"kernel references named: %u (of %zu distinct candidates)\n%@",
         kept, total, named];
-    NSData *data = [NSData dataWithBytes:bytes length:len];
-    [out appendFormat:@"base64:\n%@\n",
-        [data base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+    [out appendString:VMPackedBase64([NSData dataWithBytes:bytes length:len])];
     return out;
 }
 
@@ -2694,9 +2708,10 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
  * The audio block's own storage as the driver left it. AMC and its SRAM are
  * storage stubs (machine.c), not device models, so this is exactly what the
  * kernel wrote: the AMC registers as a list of the non-zero ones, and the
- * SRAM as its non-empty 1 KiB chunks -- whatever the driver uploaded there,
- * firmware or samples. Copied under no lock: the emulator may be writing,
- * and for a diagnostic a torn word is acceptable.
+ * SRAM as the offsets of its non-empty 1 KiB chunks plus the whole image,
+ * compressed -- whatever the driver uploaded there, firmware or samples.
+ * Copied under no lock: the emulator may be writing, and for a diagnostic a
+ * torn word is acceptable.
  */
 static NSData *VMStubBytes(const s5l8900_t *m, uint32_t base) {
     for (unsigned i = 0; i < m->stub_count && i < S5L_STUB_MAX; i++) {
@@ -2744,12 +2759,12 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
             for (NSUInteger i = 0; i < len && !any; i++) any = b[off + i] != 0;
             if (!any) continue;
             kept++;
-            NSData *chunk = [NSData dataWithBytes:b + off length:len];
-            [chunks appendFormat:@"@+0x%05lx\n%@\n", (unsigned long)off,
-                [chunk base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+            [chunks appendFormat:@"%s+0x%05lx", kept == 1u ? "" : " ", (unsigned long)off];
         }
-        [out appendFormat:@"sram 0x%08x len 0x%lx: %u non-empty 1 KiB chunks (base64, each after its offset)\n%@",
-            S5L8900_SRAM_BASE, (unsigned long)sram.length, kept, chunks];
+        [out appendFormat:@"sram 0x%08x len 0x%lx: %u non-empty 1 KiB chunks%@%@\n",
+            S5L8900_SRAM_BASE, (unsigned long)sram.length, kept,
+            kept ? @" at " : @"", chunks];
+        if (kept) [out appendString:VMPackedBase64(sram)];
     }
     return out;
 }
