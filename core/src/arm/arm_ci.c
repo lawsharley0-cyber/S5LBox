@@ -373,6 +373,12 @@ static const uint8_t *fetch(arm_cpu_t *c, uint32_t pc, bool priv) {
 
 /* ------------------------------------------------------------ blocks --- */
 
+/* The fast table's index for a guest PC: arm_ci_run and exec_block's
+ * chaining must agree on it. */
+CI_INLINE uint32_t fast_slot(uint32_t pc) {
+    return ((pc >> 1) ^ (pc >> (CI_FAST_BITS + 1u))) & (CI_FAST_SIZE - 1u);
+}
+
 CI_INLINE uint32_t hash_slot(uint32_t pa_off, bool thumb) {
     uint32_t h = (pa_off >> 1) ^ (pa_off >> (CI_HASH_BITS + 1u)) ^ (thumb ? 0x5555u : 0u);
     return h & (CI_HASH_SIZE - 1u);
@@ -563,11 +569,12 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                                 unsigned budget, bool priv, unsigned *retired_out,
                                 arm_ci_stop_t *stop, arm_status_t *status) {
     uint32_t *const R = c->r;
-    const ci_op_t *const base = b->ops;
+    const ci_op_t *base = b->ops;
     const ci_op_t *op = base;
-    const ci_op_t *const end = base + (b->n < budget ? b->n : budget);
+    const ci_op_t *end = base + (b->n < budget ? b->n : budget);
     const ci_op_t *flushed = base;         /* cycles accounted up to here */
-    const unsigned shift = b->thumb ? 1u : 2u;
+    unsigned shift = b->thumb ? 1u : 2u;
+    unsigned done = 0;                     /* retired in earlier, chained blocks */
     uint32_t next_pc = 0;
     exec_result_t result = EXEC_CONTINUE;
 
@@ -599,6 +606,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
 #undef LOGIC
 #endif
 
+top:
     for (;;) {
         if (op->cond != CI_COND_AL && !cond_pass(c->cpsr, op->cond)) goto next;
 
@@ -948,7 +956,7 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             if (CI_UNLIKELY(st != ARM_OK)) {
                 *status = st;
                 *stop = ARM_CI_STOP_STATUS;
-                *retired_out = (unsigned)(op - base);
+                *retired_out = done + (unsigned)(op - base);
                 return EXEC_STOP;
             }
             ci->st.ref_retired++;
@@ -967,13 +975,13 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
                  (c->irq_line && !(c->cpsr & ARM_CPSR_I)) ||
                  (c->fiq_line && !(c->cpsr & ARM_CPSR_F)))) {
                 *stop = ARM_CI_STOP_EVENT;
-                *retired_out = (unsigned)(op - base);
+                *retired_out = done + (unsigned)(op - base);
                 return EXEC_STOP;
             }
             if (CI_UNLIKELY(ci->code_written ||
                             (ci->cfg.level_dirty && *ci->cfg.level_dirty))) {
                 *stop = ARM_CI_STOP_EVENT;
-                *retired_out = (unsigned)(op - base);
+                *retired_out = done + (unsigned)(op - base);
                 return EXEC_STOP;
             }
             /* Branched, or switched instruction set without branching (MSR
@@ -992,7 +1000,39 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
 out:
     c->cycles += (uint64_t)(op - flushed);
     R[15] = next_pc;
-    *retired_out = (unsigned)(op - base);
+    {
+        /*
+         * CHAINING. arm_ci_run's next step would be its fast-table lookup of
+         * next_pc; when that lookup would hit, take the block here instead of
+         * returning, and save the call, the set-up above and the loop's own
+         * bookkeeping at every block boundary. The test is arm_ci_run's,
+         * exactly (fast_slot, the same five fields, not verifying, not a
+         * stop block), and so are the statistics; anything else returns and
+         * arm_ci_run does what it always did.
+         */
+        const unsigned n = (unsigned)(op - base);
+        done += n;
+        budget -= n;
+        const bool thumb = (c->cpsr & ARM_CPSR_T) != 0u;
+        if (budget && !ci->verify && !(next_pc & (thumb ? 1u : 3u))) {
+            const ci_fast_t *f = &ci->fast[fast_slot(next_pc)];
+            const ci_block_t *nb = f->b;
+            if (nb && f->va == next_pc && f->ctx == ((thumb ? 1u : 0u) | (priv ? 2u : 0u)) &&
+                f->gen == c->tlb_gen && nb->gen == ci->region_gen[nb->pa_off >> 10] &&
+                nb->n != 0u) {
+                ci->st.lookups++;
+                ci->st.hits++;
+                ci->st.block_execs++;
+                ci->run_block_base += n;
+                b = nb;
+                base = op = flushed = b->ops;
+                end = base + (b->n < budget ? b->n : budget);
+                shift = b->thumb ? 1u : 2u;
+                goto top;
+            }
+        }
+    }
+    *retired_out = done;
     return result;
 #undef PC_OF
 }
@@ -1050,8 +1090,7 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         const uint32_t ctx = (thumb ? 1u : 0u) | (priv ? 2u : 0u);
 
         ci->st.lookups++;
-        ci_fast_t *f = &ci->fast[((pc >> 1) ^ (pc >> (CI_FAST_BITS + 1u))) &
-                                 (CI_FAST_SIZE - 1u)];
+        ci_fast_t *f = &ci->fast[fast_slot(pc)];
         ci_block_t *b = f->b;
         if (CI_LIKELY(b && f->va == pc && f->ctx == ctx && f->gen == c->tlb_gen &&
                       b->gen == ci->region_gen[b->pa_off >> 10] && !ci->verify)) {

@@ -299,3 +299,26 @@ each rounding step (`host_exceptions_clear`/`host_exceptions`), which
 callgrind counts as single instructions; the phone reads its flags from FPSR
 instead, which is why the instruction count, not this host's clock, is the
 better guide to the phone. All other rows unchanged within noise.
+
+## 11. Chaining blocks inside the executor
+
+Branchy code runs about four guest instructions per block (`calls` Thumb:
+988 K blocks for 3.9 M instructions), and every block boundary returned from
+`exec_block` to `arm_ci_run`, which looked the next PC up in its fast table
+and called `exec_block` again: prologue, set-up, epilogue and loop
+bookkeeping, about 20 host instructions per guest instruction at that block
+length (callgrind, line level). `exec_block` now performs that same fast-table
+test itself when a block ends normally (`fast_slot`, the same five fields, not
+verifying, not a stop block, budget left) and continues into the next block;
+anything else returns and `arm_ci_run` does what it always did. Statistics,
+`run_position` for the device catch-up, cycle accounting and the retired count
+carry across chained blocks.
+
+Proof: full suite; `test_ci_diff` 250,000 runs, 0 mismatches; `test_ci_timeline`
+identical on all three machines; the same three also pass with
+`S5LBOX_CI_SWITCH_DISPATCH` (the MSVC form) under `-Wall -Wextra -Werror`.
+
+`cpubench --backend cached --reps 3 --mode user`, previous commit and this one
+alternately, best of two medians each: **geomean 1.07x over 21 rows**, no row
+below 0.99x (svc Thumb, noise); e.g. calls ARM 192.8 -> 215.3, interp ARM
+192.7 -> 216.7, sort ARM 226.0 -> 247.4, sha1 ARM 349.1 -> 379.9.
