@@ -116,6 +116,54 @@ bool vfp_enabled(const arm_cpu_t *c);
 arm_status_t vfp_execute(arm_cpu_t *c, uint32_t pc, uint32_t insn,
                          const vfp_bus_t *bus);
 
+/* ------------------------------------------- the cached interpreter's path --
+ *
+ * The cached interpreter decodes a VFP instruction once, when it builds a
+ * block, and runs the common scalar forms without vfp_execute's decode tree.
+ * These are the only entry points it uses; everything they refuse goes to
+ * vfp_execute, which is the definition. A refusal changes nothing, so the
+ * fallback sees exactly the state the fast path saw.
+ */
+
+/* vfp_cpacr_permits() && vfp_enabled(), inline: the gate every fast form
+ * applies before touching VFP state. */
+static inline bool vfp_usable(const arm_cpu_t *c) {
+    unsigned cp10 = (c->cp15.cpacr >> ARM_CPACR_CP10_SHIFT) & 3u;
+    unsigned cp11 = (c->cp15.cpacr >> ARM_CPACR_CP11_SHIFT) & 3u;
+    unsigned acc  = cp10 < cp11 ? cp10 : cp11;
+    if ((c->vfp_fpexc & ARM_FPEXC_EN) == 0u) return false;
+    if (acc == 3u) return true;
+    return acc == 1u && (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+}
+
+/* Scalar data-processing forms (VFP_FAST_*), single or double precision. */
+enum {
+    VFP_FAST_ADD, VFP_FAST_SUB, VFP_FAST_MUL, VFP_FAST_NMUL, VFP_FAST_DIV,
+    VFP_FAST_MLA, VFP_FAST_MLS, VFP_FAST_NMLA, VFP_FAST_NMLS,
+    VFP_FAST_CPY, VFP_FAST_ABS, VFP_FAST_NEG, VFP_FAST_SQRT,
+    VFP_FAST_CMP, VFP_FAST_CMPE, VFP_FAST_CMPZ, VFP_FAST_CMPEZ,
+    VFP_FAST_COUNT
+};
+
+/*
+ * Decode `insn` (a CDP on cp10/cp11) into one of the forms above, with its
+ * register numbers (S numbers for single precision, D numbers for double).
+ * false for every other encoding and for every encoding vfp_execute would
+ * refuse, so a decoded form is always one the unit defines.
+ */
+bool vfp_fast_decode_dp(uint32_t insn, unsigned *form, bool *dbl,
+                        unsigned *d, unsigned *n, unsigned *m);
+
+/*
+ * Execute a decoded form. false, with nothing changed, unless VFP is usable
+ * and FPSCR selects no trap enable, no directed rounding and no short vector
+ * (LEN/STRIDE), or when flush-to-zero leaves the result ambiguous; the caller
+ * then runs vfp_execute. Results, FPSCR flags and NZCV are vfp_execute's own:
+ * the same f32_do/f64_do rounding steps and the same compare.
+ */
+bool vfp_fast_dp(arm_cpu_t *c, unsigned form, bool dbl,
+                 unsigned d, unsigned n, unsigned m);
+
 /*
  * Why the last refused access came back, as a short human-readable phrase, or
  * NULL if the last vfp_execute did not trap. Unsupported instructions are also

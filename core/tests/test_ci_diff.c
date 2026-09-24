@@ -131,10 +131,15 @@ static uint32_t arm_cond(void) {
     return rnd_n(15u);
 }
 
+/* The VFP-heavy phase: most instructions from the VFP generator, so the
+ * engine's decoded VFP forms meet NaNs, flush-to-zero, short vectors and trap
+ * enables thousands of times rather than a few. */
+static bool g_vfp_heavy;
+
 static uint32_t gen_arm(unsigned idx, unsigned len) {
     uint32_t c = arm_cond() << 28;
     unsigned rd = reg_field(), rn = reg_field(), rm = reg_field(), rs = reg_field();
-    switch (rnd_n(29u)) {
+    switch (g_vfp_heavy && chance(60) ? 24u : rnd_n(29u)) {
         case 0: case 1: case 2:                                         /* DP imm */
             return c | 0x02000000u | (rnd_n(16u) << 21) | (rnd_n(2u) << 20) |
                    (rn << 16) | (rd << 12) | (rnd_n(16u) << 8) |
@@ -229,8 +234,26 @@ static uint32_t gen_arm(unsigned idx, unsigned len) {
              * singles or a double), with fields random inside the group. */
             unsigned sz = rnd_n(2u), vd = rnd_n(16u), imm8 = rnd_n(256u);
             switch (rnd_n(6u)) {
-                case 0: case 1:                                          /* CDP */
+                case 0:                                                  /* CDP */
                     return c | 0x0e000a00u | (rnd() & 0x00fff0efu) | (sz << 8);
+                case 1: {
+                    /* The forms compiled code uses, with random registers:
+                     * the arithmetic (op 0-4, both alt forms), and in the
+                     * op-7 group VMOV/VABS/VNEG/VSQRT, VCMP/VCMPE against a
+                     * register or #0, and the conversions. */
+                    static const uint8_t opc2s[] = { 0u, 1u, 4u, 5u, 5u, 4u, 7u, 8u, 12u, 13u };
+                    uint32_t w = c | 0x0e000a00u | (sz << 8) | (rnd() & 0x0040f0afu);
+                    if (chance(55)) {
+                        unsigned op = rnd_n(5u);
+                        w |= ((op >> 2) & 1u) << 23 | ((op >> 1) & 1u) << 21 | (op & 1u) << 20 |
+                             (rnd() & 0x000f0000u) | (rnd_n(2u) << 6);
+                    } else {
+                        unsigned opc2 = opc2s[rnd_n(10u)];
+                        w |= 0x00b00040u | (opc2 << 16);
+                        if (opc2 == 5u && chance(80)) w &= ~0x0000002fu;   /* VCMP #0.0 */
+                    }
+                    return w;
+                }
                 case 2:                                                  /* VLDR/VSTR */
                     return c | 0x0d000a00u | (rnd_n(2u) << 23) | (rnd_n(2u) << 22) |
                            (rnd_n(2u) << 20) | (rn << 16) | (vd << 12) | (sz << 8) |
@@ -322,7 +345,7 @@ static uint16_t gen_thumb(unsigned idx, unsigned len, bool *pair) {
 
 typedef struct {
     uint32_t r[16], cpsr, spsr[ARM_BANK_COUNT], b13[ARM_BANK_COUNT], b14[ARM_BANK_COUNT];
-    uint32_t fiq[5], usr[5], sctlr_extra, fpscr, fpexc, s[32];
+    uint32_t fiq[5], usr[5], sctlr_extra, fpscr, fpexc, cpacr, s[32];
     uint64_t cycles;
     bool excl_valid;
     uint32_t excl_addr;
@@ -348,12 +371,35 @@ static void random_state(state_t *s, bool thumb) {
     }
     for (int i = 0; i < 5; i++) { s->fiq[i] = operand_value(); s->usr[i] = operand_value(); }
     s->sctlr_extra = chance(80) ? ARM_SCTLR_U : (chance(50) ? ARM_SCTLR_A : 0u);
-    for (int i = 0; i < 32; i++) s->s[i] = chance(50) ? rnd() : interesting();
+    /* VFP registers: random bits, the integer corner cases, and the
+     * floating-point ones -- signalling and quiet NaNs, infinities,
+     * denormals, signed zeros -- as singles and as the high word of a
+     * double, where the classification lives. */
+    static const uint32_t fp_special[] = {
+        0x7f800001u, 0xffa00000u, 0x7fc00000u, 0xffc00001u, 0x7f800000u, 0xff800000u,
+        0x00000001u, 0x807fffffu, 0x00800000u, 0x80000000u, 0x3f800000u, 0x7f7fffffu,
+        0x7ff00000u, 0x7ff40000u, 0x7ff80000u, 0xfff00000u, 0x00080000u, 0x80000000u,
+    };
+    for (int i = 0; i < 32; i++)
+        s->s[i] = chance(40) ? rnd() : chance(50) ? interesting()
+                : fp_special[rnd_n((uint32_t)(sizeof fp_special / sizeof fp_special[0]))];
     /* Mostly the default FP environment; sometimes flags, a directed
      * rounding mode, flush-to-zero or default NaN; rarely VFP switched off,
      * which takes the lazy-enable Undefined path. */
     s->fpscr = chance(60) ? 0u : (rnd() & (0xf0000000u | ARM_FPSCR_RMODE | (3u << 24)));
+    /* Occasionally a short vector, a stride or a trap enable, one at a time
+     * so each reaches the arithmetic on its own: the engine's decoded VFP
+     * forms must hand every one of these to the reference. */
+    if (chance(12)) switch (rnd_n(4u)) {
+        case 0:  s->fpscr |= rnd() & ARM_FPSCR_LEN; break;                 /* stride 1 */
+        case 1:  s->fpscr |= (rnd() & ARM_FPSCR_LEN) | (3u << 20); break;  /* stride 2 */
+        case 2:  s->fpscr |= rnd() & ARM_FPSCR_STRIDE; break;              /* no LEN   */
+        default: s->fpscr |= (1u << (8u + rnd_n(8u))) & ARM_FPSCR_ENABLES; break;
+    }
     s->fpexc = chance(90) ? ARM_FPEXC_EN : 0u;
+    /* Mostly full CP10/CP11 access; sometimes privileged-only, denied or
+     * the reserved encoding, in either half. */
+    s->cpacr = chance(90) ? 0xfu : rnd_n(16u);
     s->cycles = rnd();
     s->excl_valid = chance(30);
     s->excl_addr = DATA_VA + (rnd_n(DATA_BYTES) & ~3u);
@@ -378,7 +424,7 @@ static void apply_state(s5l8900_t *m, const state_t *s) {
     for (int i = 0; i < 5; i++) { c->usr_r8_12[i] = s->usr[i]; c->fiq_r8_12[i] = s->fiq[i]; }
     c->cp15.sctlr = ARM_SCTLR_M | ARM_SCTLR_XP | s->sctlr_extra;
     c->cp15.ttbr0 = L1_PA; c->cp15.ttbcr = 0; c->cp15.dacr = 0x1u;
-    c->cp15.cpacr = 0xfu << ARM_CPACR_CP10_SHIFT;
+    c->cp15.cpacr = s->cpacr << ARM_CPACR_CP10_SHIFT;
     c->vfp_fpexc = s->fpexc;
     c->vfp_fpscr = s->fpscr;
     for (int i = 0; i < 32; i++) c->vfp_s[i] = s->s[i];
@@ -450,9 +496,12 @@ int main(int argc, char **argv) {
     uint64_t retired_total = 0;
     uint8_t data_init[DATA_BYTES + 0x1000u];
 
-    for (int isa = 0; isa < 2; isa++) {
+    /* ARM, Thumb, then ARM again with the VFP-heavy mix (half as many). */
+    for (int isa = 0; isa < 3; isa++) {
         const bool thumb = isa == 1;
-        for (unsigned k = 0; k < cases; k++) {
+        g_vfp_heavy = isa == 2;
+        const unsigned count = g_vfp_heavy ? cases / 2u : cases;
+        for (unsigned k = 0; k < count; k++) {
             const uint64_t case_seed = g_rng;
             const unsigned len = 1u + rnd_n(12u);
             uint32_t words[64];
@@ -523,7 +572,7 @@ int main(int argc, char **argv) {
                 failures++;
                 if (failures <= 20u) {
                     printf("MISMATCH %s case %u seed=0x%016" PRIx64 " steps=%u: %s\n",
-                           thumb ? "thumb" : "arm", k, case_seed, steps, why);
+                           thumb ? "thumb" : g_vfp_heavy ? "arm-vfp" : "arm", k, case_seed, steps, why);
                     printf("  code @%08x:", pc0);
                     for (unsigned i = 0; i < nwords; i++) printf(" %08x", words[i]);
                     printf("\n  cpsr0=%08x sctlr+=%08x\n", st.cpsr, st.sctlr_extra);

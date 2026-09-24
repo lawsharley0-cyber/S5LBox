@@ -78,6 +78,19 @@ enum {
      * without the decode tree. Runs through the reference tail in the
      * executor; sa carries ARM_CI_REF_VFP for the statistics. */
     CI_K_VFP,
+    /* The common VFP forms, decoded once (vfp.h, "the cached interpreter's
+     * path"); each falls back to the CI_K_VFP reference tail whenever its
+     * gate refuses. VFP_DP: sa = VFP_FAST_* form, sh = 1 for double, rd/rn/rm
+     * the register numbers. VFP_MOV: VMOV between S rn and core rd, sh = 1
+     * for to-core. VFP_SYS: VMRS (sh = 1) of FPSCR to core rd or, rd == 15,
+     * to APSR NZCV; VMSR (sh = 0) FPSCR from rd. VFP_LS: VLDR/VSTR of S rd
+     * (the first of the pair for a double); sh = 1 load | 2 double | 4 PC
+     * base, imm = the absolute address for a PC base, else the signed
+     * offset from rn. */
+    CI_K_VFP_DP,
+    CI_K_VFP_MOV,
+    CI_K_VFP_SYS,
+    CI_K_VFP_LS,
     /* Control flow. All end the block. */
     /* LDR pc (word, not LDRT): interworking load. rn = base, rs = mode
      * (CI_M_*) | 4 for a register offset (rm, sh, sa as CI_S_REG) | 8 when

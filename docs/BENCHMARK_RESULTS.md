@@ -262,3 +262,40 @@ so their runs reach the cap; a real guest's are bounded by its timer
 deadline and display refresh and end at each non-timer device access, so the
 gain on the phone will be smaller and has to be measured there (the report's
 `Runs:` line shows the new run length).
+
+## 10. VFP decoded once
+
+Every VFP instruction used to go through `vfp_execute`'s decode tree on every
+execution: about 250 host instructions each in the `vfp` workload (callgrind),
+of which about 130 were decoding, and VFP loads took the interpreter's
+translating accessor rather than the engine's host TLB. The engine now
+decodes the common forms when it builds a block (`vfp_fast_decode_dp`,
+`CI_K_VFP_DP/MOV/SYS/LS`): scalar VADD/VSUB/VMUL/VNMUL/VDIV/VMLA/VMLS/VNMLA/
+VNMLS, VMOV/VABS/VNEG/VSQRT, VCMP/VCMPE (register and #0), single and double
+precision; VMOV between a core and a single register; VMRS/VMSR of FPSCR
+(including `VMRS APSR_nzcv`); and VLDR/VSTR, single or double, through the
+host TLB. The arithmetic calls the same `f32_do`/`f64_do` rounding steps as
+the reference. Every form falls back to `vfp_execute` whenever VFP is not
+usable (FPEXC.EN, CPACR per mode), FPSCR selects a trap enable, a directed
+rounding mode, a LEN or a STRIDE, flush-to-zero leaves the result ambiguous,
+or an access is unaligned, straddles a 1 KiB block or is not plain RAM.
+
+Proof: `test_ci_diff` gained a VFP-heavy phase (60 % of instructions from the
+VFP generator, which now also emits the arithmetic, compare, unary and
+conversion encodings compiled code uses), VFP registers seeded with NaNs,
+infinities, denormals and signed zeros, one-at-a-time LEN/STRIDE/trap-enable
+FPSCRs, and random CPACR access: 250,000 runs, 0 mismatches. Eight deliberate
+bugs are each caught (NMLA/NMLS sign; gate ignoring trap enables; gate
+ignoring LEN/STRIDE; VCMP quiet on a signalling NaN; double-load word order;
+literal base PC+4; VMRS APSR_nzcv dropping N; CPACR privileged-only access
+ignored in User mode); before the generator changes three of them survived.
+
+Measured, `vfp` ARM User, 4.2 M guest instructions under callgrind: 855.3 M ->
+389.3 M host instructions. Wall clock, `cpubench --backend cached --workload
+vfp --reps 3`, previous commit and this one run alternately three times on
+the same host: 62.8 / 60.9 / 63.7 -> 78.1 / 72.4 / 73.0 M insn/s (+17 %). On
+this x86-64 host most of what remains is reading and clearing MXCSR around
+each rounding step (`host_exceptions_clear`/`host_exceptions`), which
+callgrind counts as single instructions; the phone reads its flags from FPSR
+instead, which is why the instruction count, not this host's clock, is the
+better guide to the phone. All other rows unchanged within noise.

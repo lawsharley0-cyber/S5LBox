@@ -13,6 +13,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm_ci_priv.h"
+#include "vfp.h"
 #include <string.h>
 
 static uint32_t ror32(uint32_t v, unsigned n) {
@@ -303,6 +304,45 @@ static ci_dec_t decode_media(uint32_t insn, ci_op_t *op) {
     return ref(op, false);
 }
 
+/* A cp10/cp11 instruction: CI_K_VFP, upgraded to one of the decoded-once
+ * forms when it is one (see CI_K_VFP_DP). Every refusal the reference makes
+ * at decode time -- PC as a VMOV/VMSR register, d16-d31 -- stays CI_K_VFP,
+ * so the fast forms only ever gate on run-time state. */
+static ci_dec_t decode_vfp(uint32_t pc, uint32_t insn, ci_op_t *op) {
+    unsigned form, d, n, m;
+    bool dbl;
+    const unsigned rt = (insn >> 12) & 0xfu;
+    op->kind = CI_K_VFP;
+    if (vfp_fast_decode_dp(insn, &form, &dbl, &d, &n, &m)) {
+        op->kind = CI_K_VFP_DP;
+        op->sa = (uint8_t)form;
+        op->sh = dbl ? 1u : 0u;
+        op->rd = (uint8_t)d; op->rn = (uint8_t)n; op->rm = (uint8_t)m;
+    } else if ((insn & 0x0fe00f7fu) == 0x0e000a10u && rt != 15u) {     /* VMOV Sn, Rt */
+        op->kind = CI_K_VFP_MOV;
+        op->rd = (uint8_t)rt;
+        op->rn = (uint8_t)((((insn >> 16) & 0xfu) << 1) | ((insn >> 7) & 1u));
+        op->sh = (uint8_t)((insn >> 20) & 1u);
+    } else if ((insn & 0x0fef0fffu) == 0x0ee10a10u &&                  /* VMRS/VMSR FPSCR */
+               (((insn >> 20) & 1u) || rt != 15u)) {
+        op->kind = CI_K_VFP_SYS;
+        op->rd = (uint8_t)rt;
+        op->sh = (uint8_t)((insn >> 20) & 1u);
+    } else if ((insn & 0x0f200e00u) == 0x0d000a00u &&                  /* VLDR/VSTR */
+               !(((insn >> 8) & 1u) && ((insn >> 22) & 1u))) {
+        const bool wide = (insn >> 8) & 1u, up = (insn >> 23) & 1u;
+        const unsigned vd = (insn >> 12) & 0xfu, rn = (insn >> 16) & 0xfu;
+        const uint32_t off = (insn & 0xffu) * 4u;
+        op->kind = CI_K_VFP_LS;
+        op->rd = (uint8_t)(wide ? vd * 2u : (vd << 1) | ((insn >> 22) & 1u));
+        op->rn = (uint8_t)rn;
+        op->sh = (uint8_t)(((insn >> 20) & 1u) | (wide ? 2u : 0u) | (rn == 15u ? 4u : 0u));
+        if (rn == 15u) op->imm = up ? pc + 8u + off : pc + 8u - off;
+        else           op->imm = up ? off : 0u - off;
+    }
+    return CI_DEC_OP;
+}
+
 ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
     memset(op, 0, sizeof *op);
     op->raw = insn;
@@ -378,7 +418,7 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return CI_DEC_STOP;                               /* reserved: UNDEFINED */
     if ((insn & 0x0f000010u) == 0x0e000010u) {            /* MCR / MRC */
         unsigned cp = (insn >> 8) & 0xfu;
-        if (cp == 10u || cp == 11u) { op->kind = CI_K_VFP; return CI_DEC_OP; }
+        if (cp == 10u || cp == 11u) return decode_vfp(pc, insn, op);
         if (cp == 15u) {
             const bool L = (insn >> 20) & 1u;
             const unsigned opc1 = (insn >> 21) & 7u, crn = (insn >> 16) & 0xfu;
@@ -405,10 +445,8 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         return CI_DEC_STOP;
     }
     if ((insn & 0x0f000e10u) == 0x0e000a00u ||            /* VFP CDP */
-        (insn & 0x0e000e00u) == 0x0c000a00u) {            /* VFP LDC/STC/MCRR */
-        op->kind = CI_K_VFP;
-        return CI_DEC_OP;
-    }
+        (insn & 0x0e000e00u) == 0x0c000a00u)              /* VFP LDC/STC/MCRR */
+        return decode_vfp(pc, insn, op);
     if ((insn & 0x0f000000u) == 0x0f000000u) return CI_DEC_STOP;       /* SVC */
     if ((insn & 0x0c000000u) == 0x00000000u) return decode_dp(pc, insn, op);
     return CI_DEC_STOP;

@@ -14,6 +14,7 @@
  */
 #include "arm_ci_priv.h"
 #include "arm_internal.h"
+#include "vfp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -485,6 +486,7 @@ typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
     X(NOP) X(CLREX) X(MRS_CPSR) X(CLZ) X(SXTB) X(SXTH) X(UXTB) X(UXTH)        \
     X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
     X(MRC_TID) X(MCR_TID) X(LDR_PC) X(JMP)                                    \
+    X(VFP_DP) X(VFP_MOV) X(VFP_SYS) X(VFP_LS)                                 \
     X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)
 
 /* The data-processing and memory families, shared by the handlers and the
@@ -816,6 +818,44 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             CI_NEXT();
         }
 
+        /* ------------------------------------------------- VFP, decoded */
+        CI_HK(VFP_DP)
+            if (!vfp_fast_dp(c, op->sa, op->sh != 0u, op->rd, op->rn, op->rm)) goto ref;
+            CI_NEXT();
+        CI_HK(VFP_MOV)
+            if (!vfp_usable(c)) goto ref;
+            if (op->sh) R[op->rd] = c->vfp_s[op->rn];
+            else c->vfp_s[op->rn] = R[op->rd];
+            CI_NEXT();
+        CI_HK(VFP_SYS)
+            if (!vfp_usable(c)) goto ref;
+            if (!op->sh) c->vfp_fpscr = R[op->rd] & ARM_FPSCR_WMASK;
+            else if (op->rd == 15u)
+                c->cpsr = (c->cpsr & 0x0fffffffu) | (c->vfp_fpscr & ARM_FPSCR_NZCV);
+            else R[op->rd] = c->vfp_fpscr;
+            CI_NEXT();
+        CI_HK(VFP_LS) {
+            /* One host-TLB lookup for a whole double, when both words are in
+             * one 1 KiB block; anything else (unaligned, straddling, not
+             * plain RAM, a fault) is the reference's. */
+            if (!vfp_usable(c)) goto ref;
+            const uint32_t a = (op->sh & 4u) ? op->imm : R[op->rn] + op->imm;
+            const bool wide = (op->sh & 2u) != 0u;
+            if ((a & 3u) || (wide && (a & 0x3ffu) > 0x3f8u)) goto ref;
+            if (op->sh & 1u) {
+                const uint8_t *h = mem_rd(ci, c, a, priv);
+                if (!h) goto ref;
+                c->vfp_s[op->rd] = ld32(h);
+                if (wide) c->vfp_s[op->rd + 1u] = ld32(h + 4);
+            } else {
+                uint8_t *h = mem_wr(ci, c, a, priv);
+                if (!h) goto ref;
+                st32(h, c->vfp_s[op->rd]);
+                if (wide) st32(h + 4, c->vfp_s[op->rd + 1u]);
+            }
+            CI_NEXT();
+        }
+
         /* ------------------------------------------------- control flow */
         CI_HK(B)
             next_pc = op->imm;
@@ -899,7 +939,9 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
             c->cycles += (uint64_t)(op - flushed);
             ci->run_position = ci->run_block_base + (unsigned)(op - base);
             R[15] = pc;
-            arm_status_t st = op->kind == CI_K_VFP ? arm_exec_vfp_insn(c, pc, op->raw)
+            const bool vfp = op->kind == CI_K_VFP ||
+                             (op->kind >= CI_K_VFP_DP && op->kind <= CI_K_VFP_LS);
+            arm_status_t st = vfp ? arm_exec_vfp_insn(c, pc, op->raw)
                             : b->thumb ? arm_exec_thumb_insn(c, pc, (uint16_t)op->raw)
                                        : arm_exec_arm_insn(c, pc, op->raw);
             flushed = op + 1;

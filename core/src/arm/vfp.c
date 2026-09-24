@@ -1274,6 +1274,163 @@ static arm_status_t vfp_dp(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     return vfp_dp_arith(c, pc, insn, op);
 }
 
+/* =============================== the cached interpreter's scalar path ==
+ *
+ * vfp_dp_arith and vfp_dp_other with shape.count == 1, decoded once. The
+ * decode accepts exactly the encodings those two execute (the same field
+ * extraction, the same d16-d31 and VCMP #0 refusals); the execution gate
+ * sends everything that is not the plain scalar case -- a trap enable, a
+ * directed rounding mode, any LEN or STRIDE, VFP not usable -- back to
+ * vfp_execute. test_ci_diff runs both against each other.
+ */
+bool vfp_fast_decode_dp(uint32_t insn, unsigned *form, bool *dbl,
+                        unsigned *d, unsigned *n, unsigned *m) {
+    if ((insn & 0x0f000e10u) != 0x0e000a00u) return false;          /* CDP */
+    const bool wide = BIT(8), alt = BIT(6);
+    const unsigned op = (BIT(23) << 2) | (BIT(21) << 1) | BIT(20);
+    unsigned f;
+    if (op <= 4u) {
+        static const uint8_t pick[5][2] = {
+            { VFP_FAST_MLA,  VFP_FAST_MLS },  { VFP_FAST_NMLS, VFP_FAST_NMLA },
+            { VFP_FAST_MUL,  VFP_FAST_NMUL }, { VFP_FAST_ADD,  VFP_FAST_SUB },
+            { VFP_FAST_DIV,  0xffu },
+        };
+        f = pick[op][alt];
+        if (f == 0xffu) return false;
+        if (wide) {
+            if (BIT(22) || BIT(7) || BIT(5)) return false;
+            *d = FIELD(12); *n = FIELD(16); *m = insn & 0xfu;
+        } else {
+            *d = SREG(FIELD(12), BIT(22));
+            *n = SREG(FIELD(16), BIT(7));
+            *m = SREG(insn & 0xfu, BIT(5));
+        }
+    } else if (op == 7u && alt) {
+        const unsigned opc2 = FIELD(16), vd = FIELD(12), vm = insn & 0xfu;
+        const bool top = BIT(7), D = BIT(22), M = BIT(5);
+        switch (opc2) {
+            case 0u: f = top ? VFP_FAST_ABS : VFP_FAST_CPY; break;
+            case 1u: f = top ? VFP_FAST_SQRT : VFP_FAST_NEG; break;
+            case 4u: f = top ? VFP_FAST_CMPE : VFP_FAST_CMP; break;
+            case 5u:
+                if (vm != 0u || M) return false;       /* VCMP #0.0, Vm != 0 */
+                f = top ? VFP_FAST_CMPEZ : VFP_FAST_CMPZ;
+                break;
+            default: return false;
+        }
+        if (wide) {
+            if (D || M) return false;
+            *d = vd; *m = vm;
+        } else {
+            *d = SREG(vd, D); *m = SREG(vm, M);
+        }
+        *n = 0u;
+    } else {
+        return false;
+    }
+    *form = f;
+    *dbl = wide;
+    return true;
+}
+
+bool vfp_fast_dp(arm_cpu_t *c, unsigned form, bool dbl,
+                 unsigned d, unsigned n, unsigned m) {
+    const uint32_t fs = c->vfp_fpscr;
+    if (!vfp_usable(c) ||
+        (fs & (ARM_FPSCR_ENABLES | ARM_FPSCR_RMODE | ARM_FPSCR_LEN | ARM_FPSCR_STRIDE)))
+        return false;
+    uint32_t exc = 0;
+
+    if (form >= VFP_FAST_CMP) {                     /* vfp_dp_other, case 4/5 */
+        const bool zero = form >= VFP_FAST_CMPZ;
+        const bool signal_any = form == VFP_FAST_CMPE || form == VFP_FAST_CMPEZ;
+        int order;
+        bool nan_op, snan_op;
+        if (dbl) {
+            uint64_t ua = vfp_get_d(c, d);
+            uint64_t ub = zero ? 0ull : vfp_get_d(c, m);
+            double a = u2d(ua), b = u2d(ub);
+            if (fs & ARM_FPSCR_FZ) { a = fz_in64(a, &exc); b = fz_in64(b, &exc); }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan64(ua) || (!zero && snan64(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        } else {
+            uint32_t ua = vfp_get_s(c, d);
+            uint32_t ub = zero ? 0u : vfp_get_s(c, m);
+            float a = u2f(ua), b = u2f(ub);
+            if (fs & ARM_FPSCR_FZ) { a = fz_in32(a, &exc); b = fz_in32(b, &exc); }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan32(ua) || (!zero && snan32(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        }
+        if (snan_op || (signal_any && nan_op)) exc |= ARM_FPSCR_IOC;
+        c->vfp_fpscr = (fs & ~ARM_FPSCR_NZCV) | cmp_flags_ordered(order) | exc;
+        return true;
+    }
+
+    if (dbl) {
+        uint64_t result;
+        if (form >= VFP_FAST_CPY) {                 /* vfp_dp_other, case 0/1 */
+            const uint64_t s = vfp_get_d(c, m);
+            if (form == VFP_FAST_CPY)      result = s;
+            else if (form == VFP_FAST_ABS) result = d2u(fabs64(u2d(s)));
+            else if (form == VFP_FAST_NEG) result = d2u(fneg64(u2d(s)));
+            else result = d2u(f64_do(OP_SQRT, u2d(s), 0.0, fs, &exc));
+        } else {                                    /* vfp_dp_arith */
+            double x = u2d(vfp_get_d(c, n)), y = u2d(vfp_get_d(c, m)), r;
+            switch (form) {
+                case VFP_FAST_ADD:  r = f64_do(OP_ADD, x, y, fs, &exc); break;
+                case VFP_FAST_SUB:  r = f64_do(OP_SUB, x, y, fs, &exc); break;
+                case VFP_FAST_MUL:  r = f64_do(OP_MUL, x, y, fs, &exc); break;
+                case VFP_FAST_NMUL: r = fneg64(f64_do(OP_MUL, x, y, fs, &exc)); break;
+                case VFP_FAST_DIV:  r = f64_do(OP_DIV, x, y, fs, &exc); break;
+                default: {
+                    double acc = u2d(vfp_get_d(c, d));
+                    double p = f64_do(OP_MUL, x, y, fs, &exc);
+                    if (form == VFP_FAST_MLS  || form == VFP_FAST_NMLA) p = fneg64(p);
+                    if (form == VFP_FAST_NMLA || form == VFP_FAST_NMLS) acc = fneg64(acc);
+                    r = f64_do(OP_ADD, acc, p, fs, &exc);
+                    break;
+                }
+            }
+            result = d2u(r);
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return false;
+        vfp_set_d(c, d, result);
+    } else {
+        uint32_t result;
+        if (form >= VFP_FAST_CPY) {
+            const uint32_t s = vfp_get_s(c, m);
+            if (form == VFP_FAST_CPY)      result = s;
+            else if (form == VFP_FAST_ABS) result = f2u(fabs32(u2f(s)));
+            else if (form == VFP_FAST_NEG) result = f2u(fneg32(u2f(s)));
+            else result = f2u(f32_do(OP_SQRT, u2f(s), 0.0f, fs, &exc));
+        } else {
+            float x = u2f(vfp_get_s(c, n)), y = u2f(vfp_get_s(c, m)), r;
+            switch (form) {
+                case VFP_FAST_ADD:  r = f32_do(OP_ADD, x, y, fs, &exc); break;
+                case VFP_FAST_SUB:  r = f32_do(OP_SUB, x, y, fs, &exc); break;
+                case VFP_FAST_MUL:  r = f32_do(OP_MUL, x, y, fs, &exc); break;
+                case VFP_FAST_NMUL: r = fneg32(f32_do(OP_MUL, x, y, fs, &exc)); break;
+                case VFP_FAST_DIV:  r = f32_do(OP_DIV, x, y, fs, &exc); break;
+                default: {
+                    float acc = u2f(vfp_get_s(c, d));
+                    float p = f32_do(OP_MUL, x, y, fs, &exc);
+                    if (form == VFP_FAST_MLS  || form == VFP_FAST_NMLA) p = fneg32(p);
+                    if (form == VFP_FAST_NMLA || form == VFP_FAST_NMLS) acc = fneg32(acc);
+                    r = f32_do(OP_ADD, acc, p, fs, &exc);
+                    break;
+                }
+            }
+            result = f2u(r);
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return false;
+        vfp_set_s(c, d, result);
+    }
+    c->vfp_fpscr = fs | exc;
+    return true;
+}
+
 /* ============================================================ entry ====== */
 
 /*
