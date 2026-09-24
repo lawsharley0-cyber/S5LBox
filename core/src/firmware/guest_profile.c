@@ -19,6 +19,7 @@ bool gprof_init(gprof_t *p, unsigned cap_log2) {
     p->cap = 1u << cap_log2;
     p->slot = calloc(p->cap, sizeof *p->slot);
     if (!p->slot) { p->cap = 0; return false; }
+    p->nproc = 1u;                       /* proc[0]: not attributed */
     return true;
 }
 
@@ -33,33 +34,48 @@ void gprof_reset(gprof_t *p) {
     memset(p->slot, 0, (size_t)p->cap * sizeof *p->slot);
     p->used = 0;
     p->samples = p->user = p->dropped = 0;
+    memset(p->proc, 0, sizeof p->proc);
+    p->nproc = 1u;
+    p->proc_full = 0;
+    p->last_ttbr0 = 0;
+    p->last_proc = 0;
+    p->last_age = 0;
+    p->last_valid = false;
 }
 
-static uint32_t hash_pc(uint32_t pc) {
-    uint32_t h = pc * 0x9e3779b1u;
+static uint32_t hash_key(uint32_t pc, uint16_t proc) {
+    uint32_t h = (pc ^ (uint32_t)proc << 20) * 0x9e3779b1u;
     return h ^ (h >> 15);
 }
 
-void gprof_note(gprof_t *p, uint32_t pc, bool user) {
+void gprof_note_in(gprof_t *p, uint32_t pc, bool user, uint16_t proc) {
     if (!p || !p->slot) return;
+    if (proc >= p->nproc) proc = 0;
     p->samples++;
     if (user) p->user++;
+    p->proc[proc].samples++;
+    if (user) p->proc[proc].user++;
     pc &= ~1u;
     const uint32_t mask = p->cap - 1u;
-    uint32_t i = hash_pc(pc) & mask;
+    uint32_t i = hash_key(pc, proc) & mask;
     for (uint32_t probe = 0; probe < p->cap; probe++, i = (i + 1u) & mask) {
         gprof_slot_t *s = &p->slot[i];
-        if (s->count && s->pc == pc) { s->count++; return; }
+        if (s->count && s->pc == pc && s->proc == proc) { s->count++; return; }
         if (!s->count) {
             /* Keep a quarter free so probes stay short. */
             if (p->used >= p->cap - p->cap / 4u) break;
             s->pc = pc;
+            s->proc = proc;
             s->count = 1;
             p->used++;
             return;
         }
     }
     p->dropped++;
+}
+
+void gprof_note(gprof_t *p, uint32_t pc, bool user) {
+    gprof_note_in(p, pc, user, 0);
 }
 
 bool gprof_copy(gprof_t *to, const gprof_t *from) {
@@ -69,7 +85,131 @@ bool gprof_copy(gprof_t *to, const gprof_t *from) {
     to->samples = from->samples;
     to->user = from->user;
     to->dropped = from->dropped;
+    memcpy(to->proc, from->proc, sizeof to->proc);
+    to->nproc = from->nproc;
+    to->proc_full = from->proc_full;
+    to->last_ttbr0 = from->last_ttbr0;
+    to->last_proc = from->last_proc;
+    to->last_age = from->last_age;
+    to->last_valid = from->last_valid;
     return true;
+}
+
+bool gprof_proc_cached(gprof_t *p, uint32_t ttbr0, uint16_t reread, uint16_t *proc) {
+    if (!p || !proc || !p->last_valid || p->last_ttbr0 != ttbr0 || p->last_age >= reread)
+        return false;
+    p->last_age++;
+    *proc = p->last_proc;
+    return true;
+}
+
+uint16_t gprof_proc_intern(gprof_t *p, uint32_t ttbr0, const char *name) {
+    if (!p) return 0;
+    if (!name) name = "";
+    uint16_t found = 0;
+    for (uint32_t i = 1; i < p->nproc; i++) {
+        if (p->proc[i].ttbr0 == ttbr0 &&
+            !strncmp(p->proc[i].name, name, GPROF_NAME_MAX - 1u)) {
+            found = (uint16_t)i;
+            break;
+        }
+    }
+    if (!found && p->nproc < GPROF_MAX_PROCS) {
+        gprof_proc_t *e = &p->proc[p->nproc];
+        e->ttbr0 = ttbr0;
+        snprintf(e->name, sizeof e->name, "%s", name);
+        e->samples = e->user = 0;
+        found = (uint16_t)p->nproc++;
+    }
+    if (!found) p->proc_full++;
+    p->last_ttbr0 = ttbr0;
+    p->last_proc = found;
+    p->last_age = 0;
+    p->last_valid = true;
+    return found;
+}
+
+/* ------------------------------------------------- reading the guest RAM --- */
+
+static bool ram_word(const gprof_ram_t *m, uint32_t pa, uint32_t *w) {
+    if (!m || !m->ram || (pa & 3u) || pa < m->base || m->size < 4u ||
+        pa - m->base > m->size - 4u)
+        return false;
+    const uint8_t *b = m->ram + (pa - m->base);
+    *w = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+    return true;
+}
+
+bool gprof_va_to_pa(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                    uint32_t ttbcr, uint32_t va, uint32_t *pa) {
+    const uint32_t n = ttbcr & 7u;
+    uint32_t table;
+    if (n && (va >> (32u - n)))
+        table = ttbr1 & 0xffffc000u;
+    else
+        table = ttbr0 & (0xffffffffu << (14u - n));
+    uint32_t d1;
+    if (!ram_word(ram, table + ((va >> 20) << 2), &d1)) return false;
+    switch (d1 & 3u) {
+    case 1u: {                                           /* coarse table   */
+        uint32_t d2;
+        if (!ram_word(ram, (d1 & 0xfffffc00u) + (((va >> 12) & 0xffu) << 2), &d2))
+            return false;
+        if ((d2 & 3u) == 0u) return false;
+        if ((d2 & 3u) == 1u) *pa = (d2 & 0xffff0000u) | (va & 0xffffu);  /* 64 KiB */
+        else                 *pa = (d2 & 0xfffff000u) | (va & 0xfffu);   /* 4 KiB  */
+        return true;
+    }
+    case 2u:                                             /* section        */
+        if (d1 & (1u << 18)) *pa = (d1 & 0xff000000u) | (va & 0x00ffffffu);
+        else                 *pa = (d1 & 0xfff00000u) | (va & 0x000fffffu);
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* One page of guest memory, or NULL. */
+static const uint8_t *user_page(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                                uint32_t ttbcr, uint32_t va) {
+    uint32_t pa;
+    if (!gprof_va_to_pa(ram, ttbr0, ttbr1, ttbcr, va & ~0xfffu, &pa)) return NULL;
+    if (ram->size < 0x1000u || pa < ram->base || pa - ram->base > ram->size - 0x1000u)
+        return NULL;
+    return ram->ram + (pa - ram->base);
+}
+
+bool gprof_exec_path(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                     uint32_t ttbcr, uint32_t stack_top, char *out, size_t cap) {
+    if (!out || !cap) return false;
+    out[0] = 0;
+    if (!ram || !ram->ram || stack_top < 0x2000u || (stack_top & 0xfffu)) return false;
+    /* The two pages as one buffer, low page first, so a string may cross. */
+    uint8_t buf[0x2000];
+    const uint8_t *lo = user_page(ram, ttbr0, ttbr1, ttbcr, stack_top - 0x2000u);
+    const uint8_t *hi = user_page(ram, ttbr0, ttbr1, ttbcr, stack_top - 0x1000u);
+    if (!hi) return false;
+    size_t len = 0;
+    if (lo) { memcpy(buf, lo, 0x1000u); len = 0x1000u; }
+    memcpy(buf + len, hi, 0x1000u);
+    len += 0x1000u;
+    static const char kPrefix[] = "executable_path=";
+    for (size_t i = 1; i < len; i++) {
+        if (buf[i - 1u] != 0) continue;
+        size_t s = i;
+        if (len - s > sizeof kPrefix - 1u &&
+            !memcmp(buf + s, kPrefix, sizeof kPrefix - 1u))
+            s += sizeof kPrefix - 1u;
+        if (buf[s] != '/') continue;
+        size_t e = s;
+        while (e < len && buf[e] >= 0x20u && buf[e] < 0x7fu) e++;
+        if (e >= len || buf[e] != 0 || e - s < 2u) continue;
+        size_t n = e - s < cap - 1u ? e - s : cap - 1u;
+        memcpy(out, buf + s, n);
+        out[n] = 0;
+        return true;
+    }
+    return false;
 }
 
 /* ------------------------------------------------ dyld shared cache file --- */

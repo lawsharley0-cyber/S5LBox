@@ -31,8 +31,29 @@
 
 typedef struct {
     uint32_t pc;       /* Thumb bit cleared                                  */
+    uint16_t proc;     /* index into gprof_t::proc; 0 = not attributed       */
+    uint16_t pad;
     uint32_t count;    /* 0 = empty slot                                     */
 } gprof_slot_t;
+
+/*
+ * Which process a sample ran in. A process is an address space: the guest's
+ * TTBR0 while the sample was taken (XNU loads each task's own first-level
+ * table there), named by the executable path the kernel copied to the top of
+ * that task's user stack at exec. A TTBR0 is reused once its task exits, so
+ * a process is the PAIR (TTBR0, name); an address space whose name cannot be
+ * read (a kernel thread, a page not yet present) keeps an empty name and is
+ * still counted apart from the others.
+ */
+#define GPROF_MAX_PROCS 64u
+#define GPROF_NAME_MAX  96u
+
+typedef struct {
+    uint32_t ttbr0;
+    char     name[GPROF_NAME_MAX];   /* exec path, or "" if unreadable        */
+    uint64_t samples;
+    uint64_t user;
+} gprof_proc_t;
 
 typedef struct {
     gprof_slot_t *slot;     /* open addressing, power-of-two capacity         */
@@ -41,15 +62,66 @@ typedef struct {
     uint64_t      samples;  /* every sample, dropped ones included            */
     uint64_t      user;     /* taken in User mode                             */
     uint64_t      dropped;  /* the table was full                              */
+    /* proc[0] is the "not attributed" row; proc[1..nproc-1] are processes.  */
+    gprof_proc_t  proc[GPROF_MAX_PROCS];
+    uint32_t      nproc;
+    uint64_t      proc_full;     /* samples of processes past GPROF_MAX_PROCS */
+    /* The last lookup, so a name is read once per switch, not per sample. */
+    uint32_t      last_ttbr0;
+    uint16_t      last_proc;     /* may be 0: the table was full              */
+    uint16_t      last_age;      /* samples since that name was last read     */
+    bool          last_valid;
 } gprof_t;
 
-/* 1 << cap_log2 distinct pcs (cap_log2 4..22). false on allocation failure. */
+/* 1 << cap_log2 distinct (pc, process) pairs (cap_log2 4..22). false on
+ * allocation failure. */
 bool gprof_init(gprof_t *p, unsigned cap_log2);
 void gprof_free(gprof_t *p);
 void gprof_reset(gprof_t *p);
 void gprof_note(gprof_t *p, uint32_t pc, bool user);
+/* The same, attributed to process `proc` (from gprof_proc_intern). */
+void gprof_note_in(gprof_t *p, uint32_t pc, bool user, uint16_t proc);
 /* Copy `from` into an initialised `to` of the same capacity. */
 bool gprof_copy(gprof_t *to, const gprof_t *from);
+
+/*
+ * true, with *proc set, if the last lookup was of the same TTBR0 and its name
+ * was read within the last `reread` samples; false means "read the name and
+ * call gprof_proc_intern". Counts this call toward that age. *proc may be 0
+ * (the table was full), and that answer is cached like any other.
+ */
+bool gprof_proc_cached(gprof_t *p, uint32_t ttbr0, uint16_t reread, uint16_t *proc);
+/* The index of (ttbr0, name), adding it if new; 0 when the table is full
+ * (the sample is then counted in proc_full and proc[0]). */
+uint16_t gprof_proc_intern(gprof_t *p, uint32_t ttbr0, const char *name);
+
+/* ------------------------------------------------- reading the guest RAM --- */
+
+typedef struct {
+    const uint8_t *ram;     /* guest DRAM                                     */
+    uint32_t       base;    /* its physical address                           */
+    uint32_t       size;
+} gprof_ram_t;
+
+/*
+ * ARMv6 short-descriptor walk (sections, supersections, coarse tables with
+ * large and small pages) of `va` through tables in `ram`. TTBCR.N picks
+ * TTBR1 for the high addresses exactly as the MMU does. Reads only; false
+ * on a fault or a table outside `ram`.
+ */
+bool gprof_va_to_pa(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                    uint32_t ttbcr, uint32_t va, uint32_t *pa);
+
+/*
+ * The executable path of the task whose tables are `ttbr0`: the first
+ * absolute path (a NUL, then '/', printable bytes, a NUL) in the two pages
+ * below `stack_top`, which is where exec copies the path, argv and envp
+ * (iPhone OS 3 puts the main stack's top at 0x30000000). A leading
+ * "executable_path=" is dropped. false, with out[0] = 0, when neither page is
+ * mapped in RAM or no such string is there.
+ */
+bool gprof_exec_path(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                     uint32_t ttbcr, uint32_t stack_top, char *out, size_t cap);
 
 /* ------------------------------------------------ dyld shared cache file --- */
 

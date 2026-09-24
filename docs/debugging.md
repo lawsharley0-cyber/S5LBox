@@ -190,6 +190,23 @@ functions, and the hottest single addresses. With N samples a share p has a
 standard error of about sqrt(p(1−p)/N): at 3,000 samples a 10% entry is
 10 ± 0.5%.
 
+It also says **which process** each sample ran in. The process is the address
+space: the guest's TTBR0 at the sample (XNU loads each task's own first-level
+table there). The name is the exec path that the kernel copies to the top of
+the task's user stack at exec (iPhone OS 3: just below 0x30000000). It is read
+from guest RAM by a pure ARMv6 table walk (`gprof_va_to_pa`,
+`gprof_exec_path`), once per context switch and again every 64 samples. A
+TTBR0 is reused after its task exits, so a process is the pair (TTBR0, path).
+A shared-cache function called from several processes is counted once per
+process in "By process", and the per-process top-function lists come from
+those counts. Kernel samples count toward the process whose tables were
+loaded: its system calls, but also interrupts that happened to land in its
+time slice. An address space with no readable path (a kernel thread, or a
+stack page not present yet) is listed by its TTBR0 alone. The 6ec47e8
+reports put 45% and 62% of all samples in Security.framework's bignum code
+(`_mulg_common`, `_grammarSquare_common`). That is RSA-sized arithmetic. The
+process section exists to name who is doing it.
+
 ### 2b. Everything from one session — "Save Full Test Report"
 
 The emulator menu's *Save Full Test Report* writes
@@ -201,7 +218,11 @@ audio section:
 
 - the whole kext (or both kexts) whose code touched AMC or its SRAM, copied
   from guest RAM and trimmed to the kext's extent from the kernelcache's
-  prelink map, with every kernel function it references by name
+  prelink map. The copy reaches 1 MiB each side of the accessing pcs, so
+  `__cstring` and `__DATA` come with the code. AppleAMC_r1 prints each
+  failed assertion as its own preformatted string, so its line numbers can
+  only be matched to code through `__cstring`. The copy also lists every
+  kernel function the kext references, by name
   (`app/Sources/VMDriverDump.c` finds ARM B/BL/BLX, Thumb BL/BLX pairs and
   vtable/literal words; only exact symbol entries are printed);
 - the AMC registers the driver left non-zero, and the SRAM's non-empty 1 KiB

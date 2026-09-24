@@ -195,9 +195,167 @@ static void test_cache(void) {
     free(b);
 }
 
+static void test_processes(void) {
+    gprof_t p, q;
+    CHECK(gprof_init(&p, 6u) && p.nproc == 1u, "proc[0] is reserved at init");
+    uint16_t got = 99u;
+    CHECK(!gprof_proc_cached(&p, 0x100000u, 8u, &got) && got == 99u, "nothing cached at first");
+    const uint16_t a = gprof_proc_intern(&p, 0x100000u, "/usr/libexec/lockdownd");
+    const uint16_t b = gprof_proc_intern(&p, 0x104000u, "/System/Library/CoreServices/SpringBoard.app/SpringBoard");
+    CHECK(a == 1u && b == 2u && p.nproc == 3u, "two processes: %u %u n %u", a, b, p.nproc);
+    CHECK(gprof_proc_intern(&p, 0x100000u, "/usr/libexec/lockdownd") == a, "same pair, same index");
+    /* The same TTBR0 reused by a new task is a new process. */
+    const uint16_t c = gprof_proc_intern(&p, 0x100000u, "/usr/sbin/mediaserverd");
+    CHECK(c == 3u, "a reused TTBR0 with another name is new (%u)", c);
+    CHECK(gprof_proc_intern(&p, 0x108000u, "") == 4u, "an unnamed address space counts apart");
+    /* The cache answers until `reread` samples, then asks for a fresh read. */
+    CHECK(gprof_proc_cached(&p, 0x108000u, 2u, &got) && got == 4u, "cached once");
+    CHECK(gprof_proc_cached(&p, 0x108000u, 2u, &got) && got == 4u, "cached twice");
+    CHECK(!gprof_proc_cached(&p, 0x108000u, 2u, &got), "then re-read");
+    CHECK(!gprof_proc_cached(&p, 0x100000u, 2u, &got), "another TTBR0 is not cached");
+    /* Attribution: the same pc in two processes is two slots. */
+    gprof_note_in(&p, 0x3145ad59u, true, a);
+    gprof_note_in(&p, 0x3145ad58u, true, a);
+    gprof_note_in(&p, 0x3145ad58u, false, b);
+    gprof_note_in(&p, 0x3145ad58u, true, 60u);     /* out of range: row 0 */
+    uint32_t ca = 0, cb = 0, c0 = 0;
+    for (uint32_t i = 0; i < p.cap; i++) {
+        if (!p.slot[i].count || p.slot[i].pc != 0x3145ad58u) continue;
+        if (p.slot[i].proc == a) ca = p.slot[i].count;
+        if (p.slot[i].proc == b) cb = p.slot[i].count;
+        if (p.slot[i].proc == 0) c0 = p.slot[i].count;
+    }
+    CHECK(ca == 2u && cb == 1u && c0 == 1u, "per-process slots %u %u %u", ca, cb, c0);
+    CHECK(p.proc[a].samples == 2u && p.proc[a].user == 2u && p.proc[b].samples == 1u &&
+          p.proc[b].user == 0u && p.proc[0].samples == 1u && p.samples == 4u,
+          "per-process totals");
+    CHECK(gprof_init(&q, 6u) && gprof_copy(&q, &p) && q.nproc == p.nproc &&
+          !strcmp(q.proc[b].name, p.proc[b].name) && q.proc[a].samples == 2u,
+          "copy carries the process table");
+    /* Full table: the extra process reads back as 0 and is counted. */
+    char name[32];
+    for (uint32_t i = 0; p.nproc < GPROF_MAX_PROCS; i++) {
+        snprintf(name, sizeof name, "/bin/p%u", i);
+        CHECK(gprof_proc_intern(&p, 0x200000u + i * 0x4000u, name) != 0, "fills");
+    }
+    CHECK(gprof_proc_intern(&p, 0x900000u, "/bin/late") == 0 && p.proc_full == 1u,
+          "a full table answers 0");
+    got = 99u;
+    CHECK(gprof_proc_cached(&p, 0x900000u, 8u, &got) && got == 0u,
+          "and that answer is cached, not re-read every sample");
+    gprof_reset(&p);
+    CHECK(p.nproc == 1u && p.proc[1].samples == 0 && p.last_proc == 0 &&
+          !gprof_proc_cached(&p, 0x900000u, 8u, &got), "reset empties the process table");
+    gprof_free(&p);
+    gprof_free(&q);
+}
+
+/* A 1 MiB guest RAM at 0x08000000 with ARMv6 tables in it. */
+#define RAM_PA   0x08000000u
+#define RAM_SIZE 0x100000u
+#define L1_PA    (RAM_PA + 0x0000u)      /* 16 KiB, TTBR0 with N = 0        */
+#define L1H_PA   (RAM_PA + 0x4000u)      /* TTBR1's table                   */
+#define L2_PA    (RAM_PA + 0x8000u)      /* one coarse table                */
+
+static void test_walk(void) {
+    uint8_t *ram = calloc(1, RAM_SIZE);
+    gprof_ram_t m = { ram, RAM_PA, RAM_SIZE };
+    uint32_t pa = 0;
+    /* 0x2ff00000: coarse table; page 0x2ffff -> 0x08050000, page 0x2fffe
+     * -> 0x08040000; a 64 KiB large page for 0x2ff10000..; the rest fault. */
+    put32(ram, (L1_PA - RAM_PA) + (0x2ffu << 2), L2_PA | 1u);
+    put32(ram, (L2_PA - RAM_PA) + (0xffu << 2), 0x08050000u | 0x2u);
+    put32(ram, (L2_PA - RAM_PA) + (0xfeu << 2), 0x08040000u | 0x3u);   /* XN small */
+    for (unsigned i = 0x10; i < 0x20; i++)
+        put32(ram, (L2_PA - RAM_PA) + (i << 2), 0x08060000u | 0x1u);
+    CHECK(gprof_va_to_pa(&m, L1_PA, 0, 0, 0x2ffff123u, &pa) && pa == 0x08050123u,
+          "small page: 0x%08x", pa);
+    CHECK(gprof_va_to_pa(&m, L1_PA, 0, 0, 0x2fffe004u, &pa) && pa == 0x08040004u,
+          "extended small page: 0x%08x", pa);
+    CHECK(gprof_va_to_pa(&m, L1_PA, 0, 0, 0x2ff1abcdu, &pa) && pa == 0x0806abcdu,
+          "large page: 0x%08x", pa);
+    CHECK(!gprof_va_to_pa(&m, L1_PA, 0, 0, 0x2fffd000u, &pa), "a fault entry faults");
+    CHECK(!gprof_va_to_pa(&m, L1_PA, 0, 0, 0x10000000u, &pa), "an empty L1 entry faults");
+    /* Sections and supersections. */
+    put32(ram, (L1_PA - RAM_PA) + (0x001u << 2), 0x08000000u | 0x2u);
+    for (unsigned i = 0x010; i < 0x020; i++)      /* a supersection spans 16 */
+        put32(ram, (L1_PA - RAM_PA) + (i << 2), 0x09000000u | (1u << 18) | 0x2u);
+    CHECK(gprof_va_to_pa(&m, L1_PA, 0, 0, 0x00112345u, &pa) && pa == 0x08012345u,
+          "section: 0x%08x", pa);
+    CHECK(gprof_va_to_pa(&m, L1_PA, 0, 0, 0x01abcdefu, &pa) && pa == 0x09abcdefu,
+          "supersection: 0x%08x", pa);
+    /* TTBCR.N = 1: 0x80000000 and up walk TTBR1's table. */
+    put32(ram, (L1H_PA - RAM_PA) + (0xc00u << 2), 0x08000000u | 0x2u);
+    CHECK(gprof_va_to_pa(&m, L1_PA, L1H_PA, 1u, 0xc0000040u, &pa) && pa == 0x08000040u,
+          "TTBR1 for the top half: 0x%08x", pa);
+    CHECK(!gprof_va_to_pa(&m, L1_PA, L1H_PA, 0u, 0xc0000040u, &pa),
+          "N = 0 walks TTBR0 for every address");
+    /* A table outside RAM is a miss, not a read out of bounds. */
+    CHECK(!gprof_va_to_pa(&m, 0x40000000u, 0, 0, 0x2ffff000u, &pa), "table outside RAM");
+    put32(ram, (L1_PA - RAM_PA) + (0x2feu << 2), 0x7ffffc00u | 1u);
+    CHECK(!gprof_va_to_pa(&m, L1_PA, 0, 0, 0x2fe00000u, &pa), "L2 outside RAM");
+    free(ram);
+}
+
+static void test_exec_path(void) {
+    uint8_t *ram = calloc(1, RAM_SIZE);
+    gprof_ram_t m = { ram, RAM_PA, RAM_SIZE };
+    char out[GPROF_NAME_MAX];
+    put32(ram, (L1_PA - RAM_PA) + (0x2ffu << 2), L2_PA | 1u);
+    /* Only the top page mapped: nothing there yet. */
+    put32(ram, (L2_PA - RAM_PA) + (0xffu << 2), 0x08050000u | 0x2u);
+    CHECK(!gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out) && !out[0],
+          "an empty stack page names nothing");
+    /* exec's layout: argc, argv/envp pointers (0x2fffxxxx: bytes xx xx ff 2f),
+     * then the path, argv and envp strings up to the top. */
+    uint8_t *top = ram + 0x50000u;
+    size_t o = 0xe00u;
+    put32(top, o, 1u); o += 4;
+    put32(top, o, 0x2fffff2fu); o += 4;          /* pointer ending in '/'      */
+    put32(top, o, 0); o += 4;
+    put32(top, o, 0x2fffff60u); o += 4;
+    put32(top, o, 0); o += 4;
+    static const char strings[] = "\0/usr/libexec/lockdownd\0lockdownd\0PATH=/usr/bin\0";
+    memcpy(top + o, strings, sizeof strings);
+    CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out) &&
+          !strcmp(out, "/usr/libexec/lockdownd"), "the exec path: '%s'", out);
+    /* A path that starts in the lower page and ends in the top one. */
+    memset(top, 0, 0x1000u);
+    put32(ram, (L2_PA - RAM_PA) + (0xfeu << 2), 0x08040000u | 0x2u);
+    uint8_t *low = ram + 0x40000u;
+    static const char path[] = "/var/mobile/Applications/X/AngryBirds.app/AngryBirds";
+    memcpy(low + 0x1000u - 10u, path, 10u);
+    memcpy(top, path + 10, sizeof path - 10u);
+    CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out) &&
+          !strcmp(out, path), "a path across the two pages: '%s'", out);
+    /* "executable_path=" is dropped; a short output buffer truncates. */
+    memset(low, 0, 0x1000u);
+    memset(top, 0, 0x1000u);
+    static const char apple[] = "\0executable_path=/sbin/launchd\0";
+    memcpy(top + 0x100u, apple, sizeof apple);
+    char small[6];
+    CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out) &&
+          !strcmp(out, "/sbin/launchd"), "prefix dropped: '%s'", out);
+    CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, small, sizeof small) &&
+          !strcmp(small, "/sbin"), "truncated: '%s'", small);
+    /* An unterminated run at the very top is not a path. */
+    memset(top, 0, 0x1000u);
+    memset(top + 0xff0u, 'a', 16u);
+    top[0xfefu] = '/';
+    CHECK(!gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out),
+          "an unterminated string is not taken");
+    CHECK(!gprof_exec_path(&m, L1_PA, 0, 0, 0x30000001u, out, sizeof out) &&
+          !gprof_exec_path(NULL, L1_PA, 0, 0, 0x30000000u, out, sizeof out),
+          "bad arguments");
+    free(ram);
+}
+
 int main(void) {
     test_histogram();
     test_cache();
+    test_processes();
+    test_walk();
+    test_exec_path();
     printf("guest profile: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

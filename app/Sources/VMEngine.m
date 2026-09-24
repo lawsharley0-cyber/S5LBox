@@ -1864,9 +1864,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 if (_profileReady) {
                     pthread_mutex_lock(&_profileLock);
                     if (ran == kVMChunkInstructions && status == ARM_OK)
-                        gprof_note(&_profile, _machine.cpu.r[15],
-                                   (_machine.cpu.cpsr & ARM_CPSR_MODE_MASK) ==
-                                       ARM_MODE_USR);
+                        [self profileSample_emulatorThread];
                     else
                         _profileShort++;
                     pthread_mutex_unlock(&_profileLock);
@@ -2452,6 +2450,52 @@ static NSArray<NSString *> *VMProfileTop(NSDictionary<NSString *, NSNumber *> *d
     return keys.count > limit ? [keys subarrayWithRange:NSMakeRange(0, limit)] : keys;
 }
 
+/*
+ * "Which process": each address space's share, named by its exec path, then
+ * the top functions inside the busiest ones. Counts are samples taken while
+ * that TTBR0 was loaded, so a process's kernel share is the kernel working
+ * for it (system calls, faults, interrupts that landed during its slice).
+ */
+static NSString *VMProfileProcesses(const gprof_t *w,
+                                    NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *procFunctions,
+                                    double total) {
+    NSMutableString *out = [NSMutableString string];
+    NSMutableArray<NSNumber *> *order = [NSMutableArray array];
+    for (uint32_t i = 0; i < w->nproc; i++)
+        if (w->proc[i].samples) [order addObject:@(i)];
+    [order sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        const uint64_t ca = w->proc[a.unsignedIntValue].samples;
+        const uint64_t cb = w->proc[b.unsignedIntValue].samples;
+        return ca == cb ? NSOrderedSame : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
+    }];
+    NSString *(^label)(uint32_t) = ^NSString *(uint32_t i) {
+        const gprof_proc_t *p = &w->proc[i];
+        if (i == 0) return @"(MMU off, or past the process table)";
+        NSString *path = p->name[0] ? [NSString stringWithUTF8String:p->name] : nil;
+        return path.length
+            ? [NSString stringWithFormat:@"%@  (ttbr0 %08x)", path, p->ttbr0]
+            : [NSString stringWithFormat:@"(no exec path readable: kernel task or not yet mapped)  (ttbr0 %08x)", p->ttbr0];
+    };
+    [out appendFormat:@"\nBy process (the address space each sample ran in; %u seen%s)\n",
+        w->nproc - 1u, w->proc_full ? ", table full" : ""];
+    for (NSUInteger k = 0; k < order.count && k < 16; k++) {
+        const uint32_t i = order[k].unsignedIntValue;
+        const gprof_proc_t *p = &w->proc[i];
+        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]\n", 100.0 * p->samples / total,
+            label(i), 100.0 * p->user / p->samples];
+    }
+    [out appendString:@"\nTop functions in the busiest processes\n"];
+    for (NSUInteger k = 0; k < order.count && k < 6; k++) {
+        const uint32_t i = order[k].unsignedIntValue;
+        if (100.0 * w->proc[i].samples / total < 1.0) break;
+        [out appendFormat:@"%@\n", label(i)];
+        NSMutableDictionary<NSString *, NSNumber *> *f = procFunctions[i];
+        for (NSString *key in VMProfileTop(f, 6))
+            [out appendFormat:@"  %6.2f%%  %@\n", 100.0 * f[key].unsignedLongLongValue / total, key];
+    }
+    return out;
+}
+
 static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunks,
                                       double seconds, NSString *firmwareDir,
                                       NSString *revision) {
@@ -2524,7 +2568,12 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
 
     NSMutableDictionary<NSString *, NSNumber *> *images = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSNumber *> *functions = [NSMutableDictionary dictionary];
-    NSMutableArray<NSNumber *> *hot = [NSMutableArray array];   /* slot indices */
+    /* A pc can have one slot per process; the address list sums them. */
+    NSMutableDictionary<NSNumber *, NSNumber *> *addresses = [NSMutableDictionary dictionary];
+    NSMutableArray<NSMutableDictionary<NSString *, NSNumber *> *> *procFunctions =
+        [NSMutableArray arrayWithCapacity:window->nproc];
+    for (uint32_t i = 0; i < window->nproc; i++)
+        [procFunctions addObject:[NSMutableDictionary dictionary]];
     for (uint32_t i = 0; i < window->cap; i++) {
         const gprof_slot_t *slot = &window->slot[i];
         if (!slot->count) continue;
@@ -2567,15 +2616,16 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
                 function = VMProfileBlock(pc);
             }
         }
+        NSString *both = [NSString stringWithFormat:@"%@  %@", image, function];
         VMProfileAdd(images, image, slot->count);
-        VMProfileAdd(functions, [NSString stringWithFormat:@"%@  %@", image, function],
-                     slot->count);
-        [hot addObject:@(i)];
+        VMProfileAdd(functions, both, slot->count);
+        if (slot->proc < procFunctions.count)
+            VMProfileAdd(procFunctions[slot->proc], both, slot->count);
+        NSNumber *key = @(pc);
+        addresses[key] = @(addresses[key].unsignedLongLongValue + slot->count);
     }
-    [hot sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
-        uint32_t ca = window->slot[a.unsignedIntValue].count;
-        uint32_t cb = window->slot[b.unsignedIntValue].count;
-        return ca == cb ? NSOrderedSame : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
+    NSArray<NSNumber *> *hot = [addresses keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [b compare:a];
     }];
 
     const double total = (double)kept;
@@ -2586,15 +2636,43 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
     for (NSString *key in VMProfileTop(functions, 40))
         [out appendFormat:@"%6.2f%%  %@\n", 100.0 * functions[key].unsignedLongLongValue / total, key];
     [out appendString:@"\nHottest single addresses\n"];
-    for (NSUInteger i = 0; i < hot.count && i < 12; i++) {
-        const gprof_slot_t *slot = &window->slot[hot[i].unsignedIntValue];
-        [out appendFormat:@"%6.2f%%  0x%08x\n", 100.0 * slot->count / total, slot->pc];
-    }
+    for (NSUInteger i = 0; i < hot.count && i < 12; i++)
+        [out appendFormat:@"%6.2f%%  0x%08x\n",
+            100.0 * addresses[hot[i]].unsignedLongLongValue / total, hot[i].unsignedIntValue];
+
+    [out appendString:VMProfileProcesses(window, procFunctions, total)];
 
     if (cacheOpen) gprof_cache_close(&cache);
     free(cacheBytes);
     VMFreeKernelSymbols(ks);
     return out;
+}
+
+/*
+ * One profile sample, attributed to the process it ran in (guest_profile.h):
+ * the address space is the TTBR0, and its name is read from the guest's own
+ * RAM -- a page-table walk and one 8 KiB scan -- only when TTBR0 changed since
+ * the last sample or kVMProfileReread samples have passed, so a task that
+ * exits and hands its tables to a new one is noticed. Emulator thread, with
+ * _profileLock held, between chunks.
+ */
+static const uint16_t kVMProfileReread = 64u;
+static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK */
+
+- (void)profileSample_emulatorThread {
+    const arm_cp15_t *cp = &_machine.cpu.cp15;
+    const bool mmu = (cp->sctlr & 1u) != 0;
+    const uint32_t ttbr0 = mmu ? cp->ttbr0 : 0u;
+    uint16_t proc = 0;
+    if (mmu && !gprof_proc_cached(&_profile, ttbr0, kVMProfileReread, &proc)) {
+        char path[GPROF_NAME_MAX];
+        const gprof_ram_t ram = { _machine.ram, _machine.ram_base, _machine.ram_size };
+        gprof_exec_path(&ram, cp->ttbr0, cp->ttbr1, cp->ttbcr, kVMUserStackTop,
+                        path, sizeof path);
+        proc = gprof_proc_intern(&_profile, ttbr0, path);
+    }
+    gprof_note_in(&_profile, _machine.cpu.r[15],
+                  (_machine.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR, proc);
 }
 
 - (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion {
@@ -2641,7 +2719,10 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
  * is copied here, on the caller's thread, so nothing reads guest RAM after
  * this returns; trimming it to the kext and naming run in the background.
  */
-static const uint32_t kVMDriverWindow = 0x40000u;   /* each side of the pcs */
+/* Each side of the pcs. It has to reach the kext's end, not just its code:
+ * AppleAMC_r1 is 0x66000 bytes with its accessors at +0x5000, and 0x40000
+ * cut off its __cstring (every assertion message) and __DATA (the vtables). */
+static const uint32_t kVMDriverWindow = 0x100000u;
 
 /* Bytes for the report: raw DEFLATE (RFC 1951; zlib's wbits=-15 inflates it),
  * then base64, since code compresses to about half and SRAM is mostly
