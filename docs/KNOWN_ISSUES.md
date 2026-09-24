@@ -130,10 +130,10 @@ Carried from `CURRENT_ARCHITECTURE.md` §8, sources README, `QUALITY.md`,
   reaches 30 fps. Dominant costs in the steady state include RSA/crypto in
   `Security.framework` and QuartzCore's software rasteriser, not decode alone
   (`hotpath.md`). A 2× faster CPU core does not translate to 2× frames.
-- Audio modelled, never heard. PCM DMA runs on the device since the I²S
-  frame clock was modelled, but the samples were all zero: AAC went to the
-  AMC hardware decoder, whose DSP is not modelled. The app now hides the AMC
-  so the guest decodes in software; untested on a device (`audio.md`).
+- System sounds play on the device, with some lag, once the guest's
+  Ring/Silent switch has been moved (controls menu: Silent, then Ring); an
+  unmoved switch leaves the guest silent. Ringtones (AAC) do not play: the
+  AMC hardware decoder is not modelled (`audio.md`).
 - PPP link comes up; no guest IP packet carried; the app has no PPP endpoint.
 - MBX graphics experimental and hidden from the guest by default.
 - RTC placeholder; baseband, Wi-Fi, Bluetooth, camera, accelerometer not

@@ -804,3 +804,33 @@ it reads them.
 
 The report's PCM section now also lists the WM8991 registers the driver
 wrote, and the switch position set in the app.
+
+## 2026-09-24 System sounds play (build 2ecac70)
+
+**Measured on the device:** after moving the new Ring/Silent switch to Silent
+and back to Ring, the user hears every system sound (keyboard clicks,
+lock/unlock and the rest), "a bit laggy". Ringtones stay silent.
+
+So the whole PCM path works end to end: frame clock, startTransfer()'s two
+edges, paced DMA, 16-bit frames packed for the app, and host playback. The
+silence in the 12b2cba and 27d084d reports was the guest's silent mode.
+
+**The switch at boot.** The model rests the ringer pin low, the level
+AppleM68Buttons reports as "not muted". Moving it gives SpringBoard real
+events, and after that it plays sound. An unmoved switch was never
+reported, and SpringBoard behaved as if silent. Why is not established. It
+may start silent until told otherwise, or it may read the state some way
+this model answers differently. The next report dumps AppleM68Buttons so its
+start-up path can be read. Until then, the fix is the menu step: Silent,
+then Ring.
+
+**Ringtones are AAC.** With `/arm-io/amc` hidden there is no hardware AAC
+decoder, and the ringtone path does not fall back to software. With the AMC
+matched, the hardware decode fails its reset asserts. So ringtones need the
+AMC's decoder modelled (the transformer protocol from 2026-09-24's AMC
+section, with a host decoder behind it) or a software path the ringtone
+player will take. Neither exists yet.
+
+**The lag** is not measured yet. Two known sources:
+- the guest runs slower than real time (0.77x in the 27d084d report);
+- the app's ring buffer holds up to 16,383 frames (0.37 s).

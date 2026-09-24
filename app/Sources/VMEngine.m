@@ -2869,8 +2869,18 @@ static const uint32_t kVMKernelWindow = 0x01000000u;
 /* Always dumped when the kernelcache names them: the PCM output driver that
  * prints "could not start DMA", and the DMA controller driver under it. */
 static const char *const kVMAudioKextNames[] = {
+    /* The button driver: how the guest learns the Ring/Silent switch's
+     * position at boot. docs/audio.md, "System sounds play". */
+    "com.apple.driver.AppleM68Buttons",
+};
+
+/* Kexts already analysed, printed by name only. Their dumps differ from run
+ * to run (they include live data), so a hash cannot skip them, and they were
+ * most of the report's length. docs/audio.md has the analysis. */
+static const char *const kVMAnalysedBundles[] = {
     "com.apple.driver.AppleEmbeddedAudio",
     "com.apple.driver.AppleARMPL080DMAC",
+    "com.apple.driver.AppleS5L8900X",
 };
 
 /* SHA-256 of kexts already analysed from an earlier report: printed by name
@@ -3183,6 +3193,15 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
                 if (ks0 < start) ks0 = start;
                 if (ks1 > end) ks1 = end;
                 if (ks1 <= ks0) continue;
+                BOOL analysed = NO;
+                for (size_t b = 0; b < sizeof kVMAnalysedBundles / sizeof kVMAnalysedBundles[0]; b++)
+                    analysed |= strcmp(k->bundle, kVMAnalysedBundles[b]) == 0;
+                if (analysed) {
+                    [out appendFormat:@"--- %s va=0x%08x len=0x%x: already analysed, bytes omitted\n",
+                        k->bundle, k->addr, k->size];
+                    any = YES;
+                    continue;
+                }
                 char label[160];
                 snprintf(label, sizeof label, "%s%s", k->bundle,
                          clipped ? " (clipped to the copied window)" : "");
