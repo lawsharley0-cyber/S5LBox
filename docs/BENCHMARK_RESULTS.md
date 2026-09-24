@@ -322,3 +322,23 @@ identical on all three machines; the same three also pass with
 alternately, best of two medians each: **geomean 1.07x over 21 rows**, no row
 below 0.99x (svc Thumb, noise); e.g. calls ARM 192.8 -> 215.3, interp ARM
 192.7 -> 216.7, sort ARM 226.0 -> 247.4, sha1 ARM 349.1 -> 379.9.
+
+## 12. Translation misses: a bigger host TLB, and RAM reads without the bus
+
+The engine's host TLB had 1,024 one-KiB entries shared by the two privilege
+levels, about 1 MiB of reach; `mmu` (a 6 MiB working set, one page per access)
+spent 43 % of its host instructions refilling it (`tlb_fill` 920 K times for
+3.6 M guest instructions, about 400 host instructions each, callgrind). It
+now has 4,096. And every refill's page-table walk read its descriptors through
+`bus_read`, a function large enough that the call alone cost about 64 host
+instructions for a plain RAM word; `r32`/`r16`/`r8` now apply `bus_read`'s own
+first test (the RAM aperture) themselves, which also serves interpreter and
+VFP loads.
+
+`cpubench --backend cached --reps 3 --mode user`, alternately, best of two
+medians: TLB 1,024 -> 4,096: `mmu` ARM 37.3 -> 46.8, Thumb 47.8 -> 59.4
+(1.25x), other rows 0.94x-1.02x (noise; geomean over all 21 rows 1.016x).
+Then the read path: `mmu` ARM 49.3 -> 54.2 (cached) and 24.8 -> 26.0 (the
+reference interpreter), `memops`/`calls`/`vfp` unchanged within noise. Full
+suite and `test_ci_diff` pass. A real guest touches far more than the
+benchmarks' working sets, which is the reason to take the larger table.

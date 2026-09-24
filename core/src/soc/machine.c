@@ -814,9 +814,35 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     note_device(m, addr, val, true);
 }
 
-static uint32_t r32(void *c, uint32_t a) { return bus_read(c, a, 4); }
-static uint16_t r16(void *c, uint32_t a) { return (uint16_t)bus_read(c, a, 2); }
-static uint8_t  r8 (void *c, uint32_t a) { return (uint8_t) bus_read(c, a, 1); }
+/*
+ * bus_read()'s own first test, repeated here so a plain RAM read -- a page
+ * table walk, an interpreter load, a VFP transfer -- does not pay for the
+ * call into a function big enough to save half the register file. Identical
+ * by construction: bus_read() returns exactly this for the same range.
+ */
+static uint32_t r32(void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 4u)) {
+        uint32_t v;
+        memcpy(&v, &m->ram[a - m->ram_base], 4u);
+        return v;
+    }
+    return bus_read(c, a, 4);
+}
+static uint16_t r16(void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 2u)) {
+        uint16_t v;
+        memcpy(&v, &m->ram[a - m->ram_base], 2u);
+        return v;
+    }
+    return (uint16_t)bus_read(c, a, 2);
+}
+static uint8_t  r8 (void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 1u)) return m->ram[a - m->ram_base];
+    return (uint8_t)bus_read(c, a, 1);
+}
 /*
  * THE DMA REQUEST LINE, which this machine answers on its peripherals' behalf.
  *

@@ -156,7 +156,7 @@ unsigned ci_ref_class(uint32_t insn, bool thumb);
 
 /* --------------------------------------------------------- engine state --- */
 
-#define CI_TLB_ENTRIES 1024u
+#define CI_TLB_ENTRIES 4096u    /* 4 MiB per privilege; see BENCHMARK_RESULTS.md section 12 */
 
 typedef struct {
     uint32_t tag;      /* (va & ~0x3ff) | priv                               */
