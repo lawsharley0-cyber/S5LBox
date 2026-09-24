@@ -92,6 +92,7 @@ machine. Contract until fixed: after changing `SCTLR.M` from the host, call
 | Engine (pre-commit) | `MSR CPSR_c` setting T without a branch left the block running ARM ops in Thumb state | fuzzer, seed 3 case 36010 | `962aa8b` |
 | Engine | host TLBs and (later) block map outlived `arm_reset`, snapshot restore and a host SCTLR.M clear | code review while adding the map; `test_ci_translation` | `e06c8e7` |
 | Engine | `base` local in LDM/STM handlers shadowed the block base used by `PC_OF` (latent) | `-Wpointer-to-int-cast` when dispatch was inlined | `a50b124` |
+| Reference | `SMMLA`/`SMMLS`/`SMMLAR` shifted a negative Ra left and could overflow a signed 64-bit sum; `SMLALD`/`SMLSLD` likewise (undefined behaviour in C; results were right on the compilers tried) | `asan + ubsan` CI job running the differential fuzzer (run 35935011470) | this commit, with `test_arm` cases that trip UBSan on the old code |
 
 ## 6. Repository hygiene
 

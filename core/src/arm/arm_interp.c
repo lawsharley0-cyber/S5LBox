@@ -2103,9 +2103,11 @@ static arm_status_t exec_media(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
                      (int16_t)(uint16_t)(m >> 16);
         uint64_t wide = ((uint64_t)reg_read(c, pc, rdhi) << 32) |
                         reg_read(c, pc, rdlo);
-        int64_t acc = (int64_t)wide + (sub ? (p1 - p2) : (p1 + p2));
-        c->r[rdlo] = (uint32_t)((uint64_t)acc & UINT64_C(0xffffffff));
-        c->r[rdhi] = (uint32_t)((uint64_t)acc >> 32);
+        /* Modulo 2^64, as the architecture defines it: in unsigned
+         * arithmetic, because a signed add can overflow (undefined in C). */
+        uint64_t acc = wide + (uint64_t)(sub ? (p1 - p2) : (p1 + p2));
+        c->r[rdlo] = (uint32_t)(acc & UINT64_C(0xffffffff));
+        c->r[rdhi] = (uint32_t)(acc >> 32);
         return ARM_OK;
     }
     if ((insn & 0x0ff00010u) == 0x07500010u) {        /* SMMUL SMMLA SMMLS */
@@ -2118,13 +2120,16 @@ static arm_status_t exec_media(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         /* SMMUL has no accumulator and is the Ra == 15 encoding; SMMLS with
          * Ra == 15 is not an encoding at all. */
         if (sub && ra == 15u) return ARM_UNDEFINED;
-        int64_t prod = (int64_t)(int32_t)reg_read(c, pc, rn) *
-                       (int32_t)reg_read(c, pc, rm);
-        int64_t acc = (ra == 15u)
-            ? 0 : ((int64_t)(int32_t)reg_read(c, pc, ra) << 32);
-        int64_t res = sub ? (acc - prod) : (acc + prod);
-        if (round) res += INT64_C(0x80000000);
-        c->r[rd] = (uint32_t)((uint64_t)res >> 32);
+        /* The product always fits in 64 bits; the accumulate and the
+         * rounding constant are modulo 2^64 (only bits 63:32 are kept), so
+         * they are done unsigned: a negative Ra shifted left, or a sum past
+         * INT64_MAX, would be undefined behaviour in signed C. */
+        uint64_t prod = (uint64_t)((int64_t)(int32_t)reg_read(c, pc, rn) *
+                                   (int32_t)reg_read(c, pc, rm));
+        uint64_t acc = (ra == 15u) ? 0u : (uint64_t)reg_read(c, pc, ra) << 32;
+        uint64_t res = sub ? (acc - prod) : (acc + prod);
+        if (round) res += UINT64_C(0x80000000);
+        c->r[rd] = (uint32_t)(res >> 32);
         return ARM_OK;
     }
     if ((insn & 0x0ff000f0u) == 0x07800010u) {        /* USAD8 USADA8 */

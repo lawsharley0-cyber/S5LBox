@@ -5139,6 +5139,15 @@ static void test_signed_dual_multiply_family(void) {
         /* SMMLA adds Ra at bit 32 before taking the top word. */
         { 0xe7523011u, 0x40000000u, 0x40000000u, 1u, 0x10000001u, false,
           "SMMLA accumulates into the high word" },
+        /* The accumulate is modulo 2^64. A negative Ra (sign bit set)
+         * shifted to bit 32, a difference below INT64_MIN and a rounded sum
+         * above INT64_MAX all wrap; these were undefined behaviour in C. */
+        { 0xe7523011u, 0x00000001u, 0x00000001u, 0x80000000u, 0x80000000u, false,
+          "SMMLA with a negative accumulator" },
+        { 0xe75230d1u, 0x00000001u, 0x0000052bu, 0x80000000u, 0x7fffffffu, false,
+          "SMMLS wraps below INT64_MIN" },
+        { 0xe7523031u, 0x0000ffffu, 0x00010000u, 0x7fffffffu, 0x80000000u, false,
+          "SMMLAR rounding wraps above INT64_MAX" },
         /* USAD8 sums |a-b| per byte: 3+1+1+3 = 8. */
         { 0xe782f011u, 0x01020304u, 0x04030201u, 0u, 8u, false,
           "USAD8 sums absolute byte differences" },
@@ -5163,6 +5172,20 @@ static void test_signed_dual_multiply_family(void) {
         CHECK(((c.cpsr & ARM_CPSR_Q) != 0u) == CASES[i].expect_q,
               "%s: Q was %d", CASES[i].what,
               (c.cpsr & ARM_CPSR_Q) != 0u);
+    }
+
+    /* SMLALD's 64-bit accumulate wraps modulo 2^64 too: INT64_MAX + 1. */
+    {
+        uint32_t prog[] = { 0xe7423011u };      /* SMLALD r3, r2, r1, r0 */
+        memset(g_ram, 0, sizeof g_ram);
+        m_w32(NULL, 0, prog[0]);
+        arm_reset(&c, &g_bus);
+        c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS;
+        c.r[1] = 1u; c.r[0] = 1u;
+        c.r[2] = 0x7fffffffu; c.r[3] = 0xffffffffu;
+        CHECK(arm_step(&c) == ARM_OK, "SMLALD wrap: refused");
+        CHECK(c.r[2] == 0x80000000u && c.r[3] == 0u,
+              "SMLALD wrap: got %08x:%08x expected 80000000:00000000", c.r[2], c.r[3]);
     }
 
     /* The exact encoding and register values r207 recorded. */
