@@ -11,6 +11,8 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -406,4 +408,58 @@ bool s5l_pl080_run(s5l_pl080_t *d, const arm_bus_t *bus,
         }
     }
     return s5l_pl080_irq(d);
+}
+
+/* snprintf onto the end of out[0..cap), keeping it terminated; returns the new
+ * length, which stays below cap. */
+static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...) {
+    if (len + 1u >= cap) return len;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(out + len, cap - len, fmt, ap);
+    va_end(ap);
+    if (w < 0) return len;
+    return (size_t)w >= cap - len ? cap - 1u : len + (size_t)w;
+}
+
+size_t s5l_pl080_describe(const s5l_pl080_t *d, const char *name,
+                          char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!d) return 0;
+    if (!name) name = "dmac";
+    size_t len = append(out, cap, 0, "%s: config 0x%08x (written %llu times, first 0x%08x), "
+        "sync 0x%08x, raw tc 0x%02x, raw err 0x%02x, line %s\n",
+        name, d->config, (unsigned long long)d->config_writes, d->config_first,
+        d->sync, d->raw_tc, d->raw_err, s5l_pl080_irq(d) ? "high" : "low");
+    len = append(out, cap, len, "  moved: %llu transfers, %llu bytes, %llu items, %llu completions; "
+        "refused: flow %llu, width %llu, chain %llu, soft request %llu, endian %llu\n",
+        (unsigned long long)d->transfers, (unsigned long long)d->bytes_moved,
+        (unsigned long long)d->items, (unsigned long long)d->completions,
+        (unsigned long long)d->refused_flow, (unsigned long long)d->refused_width,
+        (unsigned long long)d->refused_chain, (unsigned long long)d->refused_softreq,
+        (unsigned long long)d->refused_endian);
+    len = append(out, cap, len, "  accesses: %llu reads, %llu writes, %llu/%llu to unknown offsets",
+        (unsigned long long)d->reads, (unsigned long long)d->writes,
+        (unsigned long long)d->unknown_reads, (unsigned long long)d->unknown_writes);
+    for (unsigned i = 0; i < d->unknown_off_count && i < S5L_PL080_UNKNOWN_OFF; i++)
+        len = append(out, cap, len, "%s+0x%03x", i ? " " : " at ", d->unknown_off[i]);
+    len = append(out, cap, len, "\n");
+    unsigned shown = 0;
+    for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++) {
+        const s5l_pl080_chan_t *ch = &d->ch[c];
+        if (!(ch->src | ch->dst | ch->lli | ch->ctrl | ch->cfg)) continue;
+        shown++;
+        len = append(out, cap, len, "  ch%u src 0x%08x dst 0x%08x lli 0x%08x ctrl 0x%08x cfg 0x%08x"
+            " (%s, flow %u, src periph %u, dst periph %u%s)\n",
+            c, ch->src, ch->dst, ch->lli, ch->ctrl, ch->cfg,
+            (ch->cfg & PL080_CFG_EN) ? "enabled" : "disabled",
+            (unsigned)((ch->cfg & PL080_CFG_FLOW_MASK) >> PL080_CFG_FLOW_SHIFT),
+            (unsigned)((ch->cfg >> 1) & 0xfu), (unsigned)((ch->cfg >> 6) & 0xfu),
+            (ch->cfg & PL080_CFG_HALT) ? ", halted" : "");
+    }
+    if (!shown) len = append(out, cap, len, "  no channel has a register set\n");
+    return len;
 }

@@ -153,10 +153,13 @@ typedef void (^VMEngineStopCompletion)(void);
  * thread; `completion` is called on the main queue. */
 - (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion;
 
-/* Opt-in, for the Full Test Report: the whole kext whose code touched the
- * audio block, base64, with the kernel functions it references named from
- * the imported kernelcache. Guest RAM is copied before this returns; the rest
- * runs off the calling thread and `completion` is called on the main queue. */
+/* Opt-in, for the Full Test Report: the whole kexts of the audio paths,
+ * base64, with the kernel functions they reference named from the imported
+ * kernelcache -- the ones whose code touched the AMC or the I2S windows, and
+ * AppleEmbeddedAudio and AppleARMPL080DMAC by name -- then the PCM path's
+ * device state and the AMC's storage. A kext already analysed is named by
+ * hash only. Guest RAM is copied before this returns; the rest runs off the
+ * calling thread and `completion` is called on the main queue. */
 - (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion;
 
 /*

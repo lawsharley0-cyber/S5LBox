@@ -287,17 +287,30 @@ bool gprof_exec_path(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
     if (lo) { memcpy(buf, lo, 0x1000u); len = 0x1000u; }
     memcpy(buf + len, hi, 0x1000u);
     len += 0x1000u;
+    /*
+     * exec copies the path, then argv and envp, as one run of NUL-terminated
+     * strings ending just below the stack top; the pointer array beneath
+     * them holds 0x2fffxxxx words, whose 0xff bytes end the run. Everything
+     * lower is the process's own stack, where any path a function has in a
+     * local buffer can sit, so the run is found from the top down and the
+     * path is the lowest complete string in it.
+     */
+    size_t r = len;
+    while (r > 0 && (buf[r - 1u] == 0 || (buf[r - 1u] >= 0x20u && buf[r - 1u] < 0x7fu))) r--;
     static const char kPrefix[] = "executable_path=";
-    for (size_t i = 1; i < len; i++) {
-        if (buf[i - 1u] != 0) continue;
+    for (size_t i = r; i < len; i++) {
+        /* A string starts after a NUL; one at the run's own start is complete
+         * only if the byte below it is visible (and so not part of it). */
+        if (i > r ? buf[i - 1u] != 0 : i == 0) continue;
+        if (buf[i] == 0) continue;
         size_t s = i;
         if (len - s > sizeof kPrefix - 1u &&
             !memcmp(buf + s, kPrefix, sizeof kPrefix - 1u))
             s += sizeof kPrefix - 1u;
-        if (buf[s] != '/') continue;
-        size_t e = s;
-        while (e < len && buf[e] >= 0x20u && buf[e] < 0x7fu) e++;
-        if (e >= len || buf[e] != 0 || e - s < 2u) continue;
+        const uint8_t *nul = memchr(buf + i, 0, len - i);
+        if (!nul) return false;                       /* runs off the top */
+        const size_t e = (size_t)(nul - buf);
+        if (s >= e || buf[s] != '/' || e - s < 2u) { i = e; continue; }
         size_t n = e - s < cap - 1u ? e - s : cap - 1u;
         memcpy(out, buf + s, n);
         out[n] = 0;

@@ -12,6 +12,8 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 /*
@@ -108,4 +110,36 @@ void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
     }
     i2s->unknown_writes++;
     note_unknown(i2s, off);
+}
+
+/* snprintf onto the end of out[0..cap), keeping it terminated; returns the new
+ * length, which stays below cap. */
+static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static size_t append(char *out, size_t cap, size_t len, const char *fmt, ...) {
+    if (len + 1u >= cap) return len;
+    va_list ap;
+    va_start(ap, fmt);
+    const int w = vsnprintf(out + len, cap - len, fmt, ap);
+    va_end(ap);
+    if (w < 0) return len;
+    return (size_t)w >= cap - len ? cap - 1u : len + (size_t)w;
+}
+
+size_t s5l_i2s_describe(const s5l_i2s_t *i2s, const char *name,
+                        char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!i2s) return 0;
+    if (!name) name = "i2s";
+    size_t len = append(out, cap, 0, "%s:", name);
+    for (unsigned i = 0; i < S5L_I2S_REGS; i++)
+        len = append(out, cap, len, " +0x%02x=0x%08x", I2S_OFFSETS[i], i2s->regs[i]);
+    len = append(out, cap, len, "\n  %llu reads, %llu writes, %llu/%llu to other offsets",
+        (unsigned long long)i2s->reads, (unsigned long long)i2s->writes,
+        (unsigned long long)i2s->unknown_reads, (unsigned long long)i2s->unknown_writes);
+    for (unsigned i = 0; i < i2s->unknown_off_count && i < S5L_I2S_UNKNOWN_OFF; i++)
+        len = append(out, cap, len, "%s+0x%02x", i ? " " : " at ", i2s->unknown_off[i]);
+    len = append(out, cap, len, "; TX FIFO words %llu\n", (unsigned long long)i2s->tx_words);
+    return len;
 }

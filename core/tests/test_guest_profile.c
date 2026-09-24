@@ -338,6 +338,31 @@ static void test_exec_path(void) {
           !strcmp(out, "/sbin/launchd"), "prefix dropped: '%s'", out);
     CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, small, sizeof small) &&
           !strcmp(small, "/sbin"), "truncated: '%s'", small);
+    /* The regression the bc45a3f reports showed: launchd's address space
+     * named "/var/mobile/Library/Preferences/com.apple.PortableStorage.plist",
+     * "/S+K" and "/dev/md0" by turns, because those strings sat in stack
+     * frames BELOW exec's strings. The run starts above the pointer array. */
+    memset(low, 0, 0x1000u);
+    memset(top, 0, 0x1000u);
+    static const char junk[] = "\0/var/mobile/Library/Preferences/com.apple.PortableStorage.plist\0/S+K\0";
+    put32(low, 0x7f8u, 0x2fffe810u);                      /* a frame: saved r7 */
+    memcpy(low + 0x800u, junk, sizeof junk);
+    put32(low, 0x860u, 0x3145b001u);                      /* saved lr */
+    o = 0xf00u;
+    put32(top, o, 1u); o += 4;                            /* argc */
+    put32(top, o, 0x2fffff20u); o += 4;                   /* argv[0] */
+    put32(top, o, 0); o += 4;
+    put32(top, o, 0x2fffff40u); o += 4;                   /* envp[0] */
+    put32(top, o, 0); o += 4;
+    static const char exec_strings[] = "/sbin/launchd\0/sbin/launchd\0HOME=/var/root\0";
+    memcpy(top + o, exec_strings, sizeof exec_strings);
+    CHECK(gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out) &&
+          !strcmp(out, "/sbin/launchd"), "a path on the stack below was taken: '%s'", out);
+    /* With nothing above the pointer array, a stack path is still not taken. */
+    memset(top + 0xf00u, 0, 0x100u);
+    put32(top, 0xff8u, 0x2fffff20u);
+    CHECK(!gprof_exec_path(&m, L1_PA, 0, 0, 0x30000000u, out, sizeof out),
+          "a stack path was taken with no exec strings: '%s'", out);
     /* An unterminated run at the very top is not a path. */
     memset(top, 0, 0x1000u);
     memset(top + 0xff0u, 'a', 16u);

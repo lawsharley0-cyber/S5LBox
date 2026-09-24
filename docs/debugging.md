@@ -195,14 +195,30 @@ space: the guest's TTBR0 at the sample (XNU loads each task's own first-level
 table there). The name is the exec path that the kernel copies to the top of
 the task's user stack at exec (iPhone OS 3: just below 0x30000000). It is read
 from guest RAM by a pure ARMv6 table walk (`gprof_va_to_pa`,
-`gprof_exec_path`), once per context switch and again every 64 samples. A
-TTBR0 is reused after its task exits, so a process is the pair (TTBR0, path).
-A shared-cache function called from several processes is counted once per
-process in "By process", and the per-process top-function lists come from
-those counts. Kernel samples count toward the process whose tables were
-loaded: its system calls, but also interrupts that happened to land in its
+`gprof_exec_path`), once per context switch and again every 64 samples.
+
+exec writes the path, argv and envp as one run of NUL-terminated strings
+ending at the stack top, above the argv/envp pointer array. The run is found
+from the top down: it ends at the first byte that is neither printable nor
+NUL, which is a pointer's 0xff. The path is the lowest complete string in the
+run. The first version took the lowest '/' string anywhere in the two pages
+below the top. That picked up paths in the process's own stack frames. The
+bc45a3f reports named launchd's address space
+`/var/mobile/Library/Preferences/com.apple.PortableStorage.plist`, `/S+K`
+and `/dev/md0` in turn. Each wrong name took a row, which filled the
+64-entry table and left 58% of samples unattributed. The table now holds 256
+address spaces.
+
+A TTBR0 is reused after its task exits, so an address space is the pair
+(TTBR0, path). The report groups address spaces by path. A program started
+more than once in the window, for example a daemon that crashes and is
+relaunched, shows as one row "(N address spaces)", not as N rows. A
+shared-cache function called from several processes is counted once per
+process, and the per-process top-function lists come from those counts.
+Kernel samples count toward the process whose tables were loaded. That
+includes its system calls, and also interrupts that happened to land in its
 time slice. An address space with no readable path (a kernel thread, or a
-stack page not present yet) is listed by its TTBR0 alone.
+stack page not present yet) goes in one group of its own.
 
 Each sample also keeps its **call stack**: the pc, the link register (unless
 it is already the first saved lr, as it is once a function has pushed its
@@ -227,15 +243,29 @@ machine's name and recorded graphics mode; the whole console scrollback; the
 guest profile (which, like *Copy Guest Profile*, starts a new window); and the
 audio section:
 
-- the whole kext (or both kexts) whose code touched AMC or its SRAM, copied
-  from guest RAM and trimmed to the kext's extent from the kernelcache's
-  prelink map. The copy reaches 1 MiB each side of the accessing pcs, so
-  `__cstring` and `__DATA` come with the code. AppleAMC_r1 prints each
-  failed assertion as its own preformatted string, so its line numbers can
-  only be matched to code through `__cstring`. The copy also lists every
-  kernel function the kext references, by name
+- the whole kexts of both audio paths, cut from a copy of the kernel's first
+  16 MiB of guest RAM at each kext's extent in the kernelcache's prelink map,
+  so `__cstring` and `__DATA` come with the code. Four kinds of kext are
+  included:
+  - the kext whose code touched AMC or its SRAM;
+  - the kext whose code touched either I2S window;
+  - `com.apple.driver.AppleEmbeddedAudio`, which prints "could not start
+    DMA", by name;
+  - `com.apple.driver.AppleARMPL080DMAC`, by name.
+
+  Each copy lists every kernel function the kext references, by name
   (`app/Sources/VMDriverDump.c` finds ARM B/BL/BLX, Thumb BL/BLX pairs and
-  vtable/literal words; only exact symbol entries are printed);
+  vtable/literal words; only exact symbol entries are printed). A kext whose
+  SHA-256 matches one already analysed is named with its hash and nothing
+  else; today that is AppleAMC_r1, `d3611f38...`. AppleAMC_r1 prints each
+  failed assertion as its own preformatted string, so its line numbers can
+  only be matched to code through `__cstring`;
+- the PCM path's state. This is the kernel's recent distinct accesses to the
+  I2S windows (a table of their own, which the timer cannot evict). It also
+  has, for both PL080 controllers, the configuration, bytes moved, every
+  refusal counter and each programmed channel, and for both I2S windows,
+  the seven stored registers, any other offset touched and the TX FIFO word
+  count;
 - the AMC registers the driver left non-zero, and the SRAM's non-empty 1 KiB
   chunks by offset.
 

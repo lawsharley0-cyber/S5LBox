@@ -501,6 +501,25 @@ static void test_i2s_stores_the_seven_and_shows_the_rest(void) {
     s5l_i2s_reset(NULL);
 }
 
+static void test_i2s_describe_shows_storage_and_strays(void) {
+    s5l_i2s_t i2s;
+    s5l_i2s_reset(&i2s);
+    s5l_i2s_write(&i2s, 0x08u, 6u);
+    s5l_i2s_write(&i2s, 0x3cu, 1u);
+    (void)s5l_i2s_read(&i2s, 0x38u);
+    char text[512];
+    size_t n = s5l_i2s_describe(&i2s, "i2s0", text, sizeof text);
+    CHECK(n == strlen(text), "length");
+    CHECK(strstr(text, "i2s0: +0x00=0x00000000 +0x04=0x00000000 +0x08=0x00000006") != NULL &&
+          strstr(text, "+0x3c=0x00000001") != NULL, "storage:\n%s", text);
+    CHECK(strstr(text, "1 reads, 2 writes, 1/0 to other offsets at +0x38") != NULL,
+          "counts:\n%s", text);
+    CHECK(strstr(text, "TX FIFO words 0") != NULL, "FIFO words:\n%s", text);
+    char tiny[12];
+    n = s5l_i2s_describe(&i2s, "i2s0", tiny, sizeof tiny);
+    CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
+}
+
 /* -------------------------------------------------------- the machine --- */
 
 static void test_machine_routes_the_codec_and_both_windows(void) {
@@ -702,6 +721,7 @@ int main(void) {
     test_unwritten_registers_are_visible_and_bounded();
     test_reset_is_total();
     test_i2s_stores_the_seven_and_shows_the_rest();
+    test_i2s_describe_shows_storage_and_strays();
     test_machine_routes_the_codec_and_both_windows();
     test_snapshot_carries_the_codec_and_windows();
     test_snapshot_rejects_impossible_codec_state();

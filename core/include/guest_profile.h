@@ -45,7 +45,10 @@ typedef struct {
  * read (a kernel thread, a page not yet present) keeps an empty name and is
  * still counted apart from the others.
  */
-#define GPROF_MAX_PROCS 64u
+/* 256: a boot and a few app launches start well over 64 programs (launchctl,
+ * fsck, mtmergeprops, IQAgent, ReportCrash...), and a table that fills early
+ * leaves everything after it unattributed. ~31 KB per profile. */
+#define GPROF_MAX_PROCS 256u
 #define GPROF_NAME_MAX  96u
 
 typedef struct {
@@ -153,12 +156,16 @@ unsigned gprof_backtrace(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
                          uint32_t *frames, unsigned max);
 
 /*
- * The executable path of the task whose tables are `ttbr0`: the first
- * absolute path (a NUL, then '/', printable bytes, a NUL) in the two pages
- * below `stack_top`, which is where exec copies the path, argv and envp
- * (iPhone OS 3 puts the main stack's top at 0x30000000). A leading
- * "executable_path=" is dropped. false, with out[0] = 0, when neither page is
- * mapped in RAM or no such string is there.
+ * The executable path of the task whose tables are `ttbr0`. exec copies the
+ * path, argv and envp as one run of NUL-terminated strings ending just below
+ * `stack_top` (iPhone OS 3 puts the main stack's top at 0x30000000), above
+ * the argv/envp pointer array. The run is taken from the top of the two pages
+ * below `stack_top` down to the first byte that is neither printable nor NUL,
+ * and the path is its lowest complete string that starts with '/' and is at
+ * least two bytes long. A leading "executable_path=" is dropped. Strings below
+ * the run -- the process's own stack, where a function may hold any path -- are
+ * never taken. false, with out[0] = 0, when the top page is not mapped in RAM
+ * or the run holds no such string.
  */
 bool gprof_exec_path(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
                      uint32_t ttbcr, uint32_t stack_top, char *out, size_t cap);

@@ -2391,6 +2391,11 @@ typedef struct {
 void     s5l_i2s_reset(s5l_i2s_t *i2s);
 uint32_t s5l_i2s_read(s5l_i2s_t *i2s, uint32_t off);
 void     s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val);
+/* A diagnostic summary of `i2s` (named `name`): the seven stored offsets, the
+ * access counts, any offset outside them, and the TX FIFO words. Same
+ * contract as s5l_pl080_describe(). */
+size_t   s5l_i2s_describe(const s5l_i2s_t *i2s, const char *name,
+                          char *out, size_t cap);
 /* The byte offset backing slot `index`, or UINT32_MAX past the end. The map is
  * exposed so the tests pin the exact seven the driver writes rather than
  * re-deriving them from this model's own storage order. */
@@ -3772,6 +3777,11 @@ typedef struct {
 void     s5l_pl080_reset(s5l_pl080_t *d);
 uint32_t s5l_pl080_read(s5l_pl080_t *d, uint32_t off);
 void     s5l_pl080_write(s5l_pl080_t *d, uint32_t off, uint32_t val);
+/* A diagnostic summary of `d` (named `name`) into out, always NUL-terminated
+ * when cap > 0: the controller registers, what moved, every refusal counter,
+ * and each channel with any register set. Returns the length written. */
+size_t   s5l_pl080_describe(const s5l_pl080_t *d, const char *name,
+                            char *out, size_t cap);
 /* The combined interrupt line, which is what 0x000 reads back. */
 bool     s5l_pl080_irq(const s5l_pl080_t *d);
 /*
@@ -4238,6 +4248,18 @@ typedef struct {
     uint32_t                  audio_pc_lo;
     uint32_t                  audio_pc_hi;
     uint64_t                  audio_accesses;
+    /*
+     * The same for the PCM output path: accesses to the two I2S windows, in
+     * their own table (mmio_recent is flooded by the timer and the VICs long
+     * before a sound starts) plus the range of kernel pcs that made them, so
+     * a report can name and dump the controller's driver. Diagnostics only,
+     * never serialised.
+     */
+    s5l_access_entry_t        pcm_recent[S5L_ACCESS_LOG];
+    uint64_t                  pcm_seq;
+    uint32_t                  pcm_pc_lo;
+    uint32_t                  pcm_pc_hi;
+    uint64_t                  pcm_accesses;
     uint64_t                  refresh_count;
     uint64_t                  ci_horizon_key;   /* refresh_count + 1; 0 = none */
     uint32_t                  ci_horizon_edges;

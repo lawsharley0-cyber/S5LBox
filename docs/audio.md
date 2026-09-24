@@ -583,3 +583,77 @@ the driver starts (status bits, the SRAM reply), and play the PCM that the
 streaming channel reads from DRAM at the rate +0x1010 must advance. The
 next report's `__cstring` names each assertion. That maps the four lines
 to the checks that fail, and so to the exact replies the model owes.
+
+# 2026-09-24 The assertions, named (build bc45a3f)
+
+The bc45a3f report carried the whole of AppleAMC_r1 (va 0xc0712000, 0x66000
+bytes, SHA-256 d3611f38...626f; read in a scratch directory, not stored
+here), `__cstring` and `__DATA` included. Each assertion is a preformatted
+string passed to `IOLog`, so a string's address leads straight to its call
+site.
+
+**Observed:**
+
+- **The four assertions are one failure.** Line 350 is in the reset routine
+  at 0xc0715748. That routine calls the device-tree platform functions
+  `function-core_reset` and `function-de_reset` (looked up by name during
+  start, at 0xc0716428) with argument 1, then the wait at 0xc071768c. Line
+  349 would mean the `de_reset` call failed; it never printed. Line 350 means
+  all ten polls of +0xb18 bit 8 read 0. The other three are callers giving
+  up:
+  - line 565 is in the codec start at 0xc0715a48 (vtable +0x3f8);
+  - line 2097 is in the locked reset at 0xc0715804 (vtable +0x478, whose BSU
+    error reads "AMC reset [non-fatal error]");
+  - line 726 is in 0xc07135fc (vtable +0x3fc), which fails when +0x3f8 does.
+- **What the block is.** The strings name the driver classes
+  (`AppleAMCDriver_r1`, `AppleAMCDriverManager`) and the codecs they load:
+  `Espico_mp3`, `Espico_aac`, `Spirit_aache`, `Spirit_aace`, `ARM_alac`,
+  `ARM_acelp`, and `::Encoder`. They also name:
+  - the properties it publishes: `input format`, `output formats`,
+    `encoder bitrate`;
+  - the DSP memory regions it loads code into: `pmem`, `sys_pmem`,
+    `ram_mc1`, `ram_mc2` and `AMCSS`;
+  - a dependency on `com_apple_driver_FairPlayIOKit`;
+  - its own description of what it runs: "starting the transformer without
+    an input magic cookie".
+
+  The AMC is a codec offload engine for MP3, AAC, HE-AAC and ALAC. It is not
+  the PCM output path.
+- **After a successful reset**, the codec start goes on to:
+  1. reset the mailboxes and the channel;
+  2. write +0x204 = 1, a mailbox word, and +0xb0c = 0x2000;
+  3. set +0x1018 = 1;
+  4. wait for +0xb18 **bit 9** (0xc0717b94, 10 polls 1 ms apart).
+- **Nothing links it to PCM playback.** `__text` contains no call into
+  AppleEmbeddedAudio. The report's "calls" into AppleEmbeddedAudio,
+  AppleEmbeddedUSBAudio and AppleWM8991Audio are words in `__const` (the
+  microcode tables) that happen to decode as Thumb `BL`.
+
+**Not observed:** what `function-core_reset` and `function-de_reset` do in
+hardware. The platform function lives in another kext.
+
+**Inferred:** +0xb18 bit 8 says the DSP core is out of reset, and bit 9 says
+the loaded codec is running. Both are answers from the DSP's own firmware or
+reset logic.
+
+**Decision: these bits are not set.** Setting them without running the codec
+would let the driver start a decoder that never produces a sample. For any
+app that asks for hardware decode, that turns today's fast, logged failure
+into a hang. A working AMC means high-level emulation of the transformer
+protocol (the mailboxes, the channel at +0x1000, the two 24 KiB SRAM buffers)
+with host decoders behind it. That is a project of its own and comes after
+PCM output works.
+
+**The PCM path fails on its own.** The line to diagnose is
+`AppleEmbeddedAudioDevice: could not start DMA: device is not ready`, and I2S0
+has received 0 words. The report now also carries:
+
+- AppleEmbeddedAudio's kext;
+- the kext whose code touches the I2S windows;
+- AppleARMPL080DMAC's kext;
+- every PL080 channel's registers;
+- the I2S windows' storage;
+- a separate access log for the I2S windows.
+
+The AMC kext's bytes are left out when their SHA-256 matches the copy already
+analysed.

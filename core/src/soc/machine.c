@@ -417,6 +417,21 @@ static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
         }
     }
     bool fresh;
+    if (addr - S5L8900_I2S0_BASE < S5L8900_DEV_SIZE ||
+        addr - S5L8900_I2S1_BASE < S5L8900_DEV_SIZE) {
+        const uint32_t pc = m->cpu.r[15];
+        if (pc >= 0xc0000000u) {
+            if (!m->pcm_accesses || pc < m->pcm_pc_lo) m->pcm_pc_lo = pc;
+            if (!m->pcm_accesses || pc > m->pcm_pc_hi) m->pcm_pc_hi = pc;
+            m->pcm_accesses++;
+        }
+        s5l_access_entry_t *p = log_access(m->pcm_recent, &m->pcm_seq, pc, addr,
+                                           val, bytes, is_write, &fresh);
+        if (fresh) {
+            p->kind = S5L_ACCESS_DEVICE;
+            p->region = addr < S5L8900_I2S1_BASE ? "i2s0" : "i2s1";
+        }
+    }
     s5l_access_entry_t *e = log_access(m->mmio_recent, &m->mmio_seq,
                                        m->cpu.r[15], addr, val, bytes, is_write,
                                        &fresh);

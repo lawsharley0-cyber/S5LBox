@@ -316,6 +316,13 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
      * block (s5l8900_t::audio_pc_lo/hi), for -audioDriverExcerpt. */
     uint32_t                _diagAudioPcLo, _diagAudioPcHi;
     uint64_t                _diagAudioAccesses;
+    /* The PCM output path the same way (s5l8900_t::pcm_*), plus the state of
+     * the two DMA controllers and I2S windows that carry it. */
+    s5l_access_entry_t      _diagPcm[S5L_ACCESS_LOG];
+    uint32_t                _diagPcmPcLo, _diagPcmPcHi;
+    uint64_t                _diagPcmAccesses;
+    s5l_pl080_t             _diagDmac[S5L8900_DMAC_COUNT];
+    s5l_i2s_t               _diagI2s[S5L8900_I2S_COUNT];
     NSString               *_diagBackendNote;  /* why the cached interpreter is off */
     /*
      * The guest profile (guest_profile.h): the guest pc after every full
@@ -2290,6 +2297,12 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     _diagAudioPcLo = _machine.audio_pc_lo;
     _diagAudioPcHi = _machine.audio_pc_hi;
     _diagAudioAccesses = _machine.audio_accesses;
+    memcpy(_diagPcm, _machine.pcm_recent, sizeof _diagPcm);
+    _diagPcmPcLo = _machine.pcm_pc_lo;
+    _diagPcmPcHi = _machine.pcm_pc_hi;
+    _diagPcmAccesses = _machine.pcm_accesses;
+    memcpy(_diagDmac, _machine.dmac, sizeof _diagDmac);
+    memcpy(_diagI2s, _machine.i2s, sizeof _diagI2s);
     pthread_mutex_unlock(&_lock);
 }
 
@@ -2459,45 +2472,68 @@ static NSArray<NSString *> *VMProfileTop(NSDictionary<NSString *, NSNumber *> *d
 }
 
 /*
- * "Which process": each address space's share, named by its exec path, then
- * the top functions inside the busiest ones. Counts are samples taken while
- * that TTBR0 was loaded, so a process's kernel share is the kernel working
- * for it (system calls, faults, interrupts that landed during its slice).
+ * "Which process": each program's share, named by its exec path, then the
+ * top functions inside the busiest ones. Counts are samples taken while one
+ * of its address spaces (TTBR0) was loaded, so a process's kernel share is
+ * the kernel working for it (system calls, faults, interrupts that landed
+ * during its slice). A program seen in more than one address space was
+ * started more than once in the window -- a daemon that keeps crashing and
+ * being relaunched shows up here as a count, not as rows to add up.
  */
 static NSString *VMProfileProcesses(const gprof_t *w,
                                     NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *procFunctions,
                                     double total) {
     NSMutableString *out = [NSMutableString string];
-    NSMutableArray<NSNumber *> *order = [NSMutableArray array];
-    for (uint32_t i = 0; i < w->nproc; i++)
-        if (w->proc[i].samples) [order addObject:@(i)];
-    [order sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
-        const uint64_t ca = w->proc[a.unsignedIntValue].samples;
-        const uint64_t cb = w->proc[b.unsignedIntValue].samples;
-        return ca == cb ? NSOrderedSame : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
-    }];
-    NSString *(^label)(uint32_t) = ^NSString *(uint32_t i) {
-        const gprof_proc_t *p = &w->proc[i];
-        if (i == 0) return @"(MMU off, or past the process table)";
-        NSString *path = p->name[0] ? [NSString stringWithUTF8String:p->name] : nil;
-        return path.length
-            ? [NSString stringWithFormat:@"%@  (ttbr0 %08x)", path, p->ttbr0]
-            : [NSString stringWithFormat:@"(no exec path readable: kernel task or not yet mapped)  (ttbr0 %08x)", p->ttbr0];
+    /* Group by name; index 0 and the unnamed spaces are groups of their own. */
+    NSString *const kUnnamed = @"(no exec path readable: kernel task or not yet mapped)";
+    NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *groups = [NSMutableDictionary dictionary];
+    for (uint32_t i = 0; i < w->nproc; i++) {
+        if (!w->proc[i].samples) continue;
+        NSString *name = i == 0 ? @"(MMU off, or past the process table)"
+                       : w->proc[i].name[0] ? [NSString stringWithUTF8String:w->proc[i].name] : kUnnamed;
+        if (!name.length) name = kUnnamed;                   /* not UTF-8 */
+        NSMutableArray<NSNumber *> *members = groups[name];
+        if (!members) groups[name] = members = [NSMutableArray array];
+        [members addObject:@(i)];
+    }
+    uint64_t (^samplesOf)(NSString *) = ^uint64_t(NSString *name) {
+        uint64_t n = 0;
+        for (NSNumber *i in groups[name]) n += w->proc[i.unsignedIntValue].samples;
+        return n;
     };
-    [out appendFormat:@"\nBy process (the address space each sample ran in; %u seen%s)\n",
+    NSArray<NSString *> *order = [groups.allKeys sortedArrayUsingComparator:
+        ^NSComparisonResult(NSString *a, NSString *b) {
+            const uint64_t ca = samplesOf(a), cb = samplesOf(b);
+            return ca == cb ? [a compare:b] : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
+        }];
+    NSString *(^label)(NSString *) = ^NSString *(NSString *name) {
+        NSArray<NSNumber *> *members = groups[name];
+        const uint32_t first = members.firstObject.unsignedIntValue;
+        if (first == 0) return name;
+        return members.count == 1
+            ? [NSString stringWithFormat:@"%@  (ttbr0 %08x)", name, w->proc[first].ttbr0]
+            : [NSString stringWithFormat:@"%@  (%lu address spaces)", name, (unsigned long)members.count];
+    };
+    [out appendFormat:@"\nBy process (the address spaces samples ran in, by exec path; %u seen%s)\n",
         w->nproc - 1u, w->proc_full ? ", table full" : ""];
     for (NSUInteger k = 0; k < order.count && k < 16; k++) {
-        const uint32_t i = order[k].unsignedIntValue;
-        const gprof_proc_t *p = &w->proc[i];
-        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]\n", 100.0 * p->samples / total,
-            label(i), 100.0 * p->user / p->samples];
+        uint64_t n = 0, user = 0;
+        for (NSNumber *i in groups[order[k]]) {
+            n += w->proc[i.unsignedIntValue].samples;
+            user += w->proc[i.unsignedIntValue].user;
+        }
+        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]\n", 100.0 * n / total,
+            label(order[k]), 100.0 * user / n];
     }
     [out appendString:@"\nTop functions in the busiest processes\n"];
     for (NSUInteger k = 0; k < order.count && k < 6; k++) {
-        const uint32_t i = order[k].unsignedIntValue;
-        if (100.0 * w->proc[i].samples / total < 1.0) break;
-        [out appendFormat:@"%@\n", label(i)];
-        NSMutableDictionary<NSString *, NSNumber *> *f = procFunctions[i];
+        if (100.0 * samplesOf(order[k]) / total < 1.0) break;
+        [out appendFormat:@"%@\n", label(order[k])];
+        NSMutableDictionary<NSString *, NSNumber *> *f = [NSMutableDictionary dictionary];
+        for (NSNumber *i in groups[order[k]]) {
+            NSDictionary<NSString *, NSNumber *> *one = procFunctions[i.unsignedIntValue];
+            for (NSString *key in one) VMProfileAdd(f, key, one[key].unsignedLongLongValue);
+        }
         for (NSString *key in VMProfileTop(f, 6))
             [out appendFormat:@"  %6.2f%%  %@\n", 100.0 * f[key].unsignedLongLongValue / total, key];
     }
@@ -2804,15 +2840,32 @@ static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK *
 }
 
 /*
- * The whole kext (or kexts) whose code touched the audio block, from this
- * machine's RAM, with the kernel functions it references named. The window
- * is copied here, on the caller's thread, so nothing reads guest RAM after
- * this returns; trimming it to the kext and naming run in the background.
+ * The whole kexts of the audio paths, from this machine's RAM, with the
+ * kernel functions they reference named. The kernel's linear mapping is
+ * copied here, on the caller's thread, so nothing reads guest RAM after this
+ * returns; cutting out each kext and naming run in the background.
  */
-/* Each side of the pcs. It has to reach the kext's end, not just its code:
- * AppleAMC_r1 is 0x66000 bytes with its accessors at +0x5000, and 0x40000
- * cut off its __cstring (every assertion message) and __DATA (the vtables). */
-static const uint32_t kVMDriverWindow = 0x100000u;
+/* How much of the kernel's linear mapping is copied: the kernel and every
+ * prelinked kext (the last ones end below 0xc0800000 on iPhone OS 3.1.3), so
+ * any kext can be cut out once the load map is read. A kext window around the
+ * pcs is not enough: AppleEmbeddedAudio and AppleARMPL080DMAC are dumped by
+ * name, and an I2S driver's pcs say nothing about where the AMC's kext is. */
+static const uint32_t kVMKernelWindow = 0x01000000u;
+
+/* Always dumped when the kernelcache names them: the PCM output driver that
+ * prints "could not start DMA", and the DMA controller driver under it. */
+static const char *const kVMAudioKextNames[] = {
+    "com.apple.driver.AppleEmbeddedAudio",
+    "com.apple.driver.AppleARMPL080DMAC",
+};
+
+/* SHA-256 of kexts already analysed from an earlier report: printed by name
+ * and hash only, so the report stays small enough to paste. A kext whose
+ * bytes differ in any way is dumped in full. */
+static const char *const kVMAnalysedKexts[] = {
+    /* AppleAMC_r1 from iPhone OS 3.1.3: docs/audio.md, 2026-09-24. */
+    "d3611f38c830ab6918e312abd200c368529c0823158dff1554c0b33cfe29626f",
+};
 
 /* Bytes for the report: raw DEFLATE (RFC 1951; zlib's wbits=-15 inflates it),
  * then base64, since code compresses to about half and SRAM is mostly
@@ -2838,6 +2891,11 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
     NSMutableString *hex = [NSMutableString string];
     for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
     [out appendFormat:@"--- %s va=0x%08x len=0x%x sha256=%@\n", label, va, len, hex];
+    for (size_t i = 0; i < sizeof kVMAnalysedKexts / sizeof kVMAnalysedKexts[0]; i++) {
+        if (![hex isEqualToString:@(kVMAnalysedKexts[i])]) continue;
+        [out appendString:@"bytes omitted: identical to a copy already analysed\n"];
+        return out;
+    }
 
     enum { kMaxRefs = 16384 };
     vm_driver_ref_t *refs = calloc(kMaxRefs, sizeof *refs);
@@ -2940,49 +2998,127 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
     return out;
 }
 
+/* The same record for the PCM output path: kernel pcs that touched either
+ * I2S window. NO when none has. */
+- (BOOL)pcmPcRangeLo:(uint32_t *)outLo hi:(uint32_t *)outHi
+            accesses:(uint64_t *)outAccesses {
+    s5l_access_entry_t log[S5L_ACCESS_LOG];
+    pthread_mutex_lock(&_lock);
+    memcpy(log, _diagPcm, sizeof log);
+    const uint64_t accesses = _diagPcmAccesses;
+    const uint32_t seenLo = _diagPcmPcLo, seenHi = _diagPcmPcHi;
+    pthread_mutex_unlock(&_lock);
+    uint32_t lo = accesses ? seenLo : UINT32_MAX, hi = accesses ? seenHi : 0u;
+    for (size_t i = 0; i < S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &log[i];
+        if (!e->count || e->pc < 0xc0000000u || e->pc >= 0xc0800000u) continue;
+        if (e->pc < lo) lo = e->pc;
+        if (e->pc > hi) hi = e->pc;
+    }
+    *outLo = lo;
+    *outHi = hi;
+    *outAccesses = accesses;
+    return lo <= hi;
+}
+
+/* What the PCM output path's devices hold, formatted from the copies the
+ * emulator thread published: the I2S access log, both PL080s, both I2S
+ * windows. */
+- (NSString *)pcmPathStateText {
+    s5l_access_entry_t log[S5L_ACCESS_LOG];
+    s5l_pl080_t dmac[S5L8900_DMAC_COUNT];
+    s5l_i2s_t i2s[S5L8900_I2S_COUNT];
+    pthread_mutex_lock(&_lock);
+    memcpy(log, _diagPcm, sizeof log);
+    memcpy(dmac, _diagDmac, sizeof dmac);
+    memcpy(i2s, _diagI2s, sizeof i2s);
+    const uint64_t accesses = _diagPcmAccesses;
+    pthread_mutex_unlock(&_lock);
+    NSMutableString *out = [NSMutableString stringWithFormat:
+        @"PCM PATH STATE (the I2S windows and the DMA controllers that feed them)\n"
+        @"I2S accesses from kernel code: %llu. Most recent distinct accesses first:\n",
+        (unsigned long long)accesses];
+    char text[4096];
+    (void)s5l_access_log_describe(log, S5L_ACCESS_LOG, S5L_ACCESS_LOG, text, sizeof text);
+    [out appendFormat:@"%s", text];
+    static const char *const dmacNames[S5L8900_DMAC_COUNT] = { "dmac0", "dmac1" };
+    for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
+        (void)s5l_pl080_describe(&dmac[i], dmacNames[i], text, sizeof text);
+        [out appendFormat:@"%s", text];
+    }
+    static const char *const i2sNames[S5L8900_I2S_COUNT] = { "i2s0", "i2s1" };
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        (void)s5l_i2s_describe(&i2s[i], i2sNames[i], text, sizeof text);
+        [out appendFormat:@"%s", text];
+    }
+    return out;
+}
+
 - (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion {
     if (!completion) return;
     NSData *amcBytes = VMStubBytes(&_machine, S5L8900_AMC_BASE);
     NSData *sramBytes = VMStubBytes(&_machine, S5L8900_SRAM_BASE);
-    uint32_t lo = 0, hi = 0;
-    uint64_t accesses = 0;
-    if (![self audioPcRangeLo:&lo hi:&hi accesses:&accesses]) {
-        completion([@"AUDIO DRIVER: no kernel code has touched the audio block in this run "
-                    @"(play a ringtone in Settings > Sounds first).\n\n"
-                    stringByAppendingString:VMAudioBlockText(amcBytes, sramBytes)]);
-        return;
-    }
+    NSString *pcmState = [self pcmPathStateText];
+    uint32_t lo = 0, hi = 0, pcmLo = 0, pcmHi = 0;
+    uint64_t accesses = 0, pcmAccesses = 0;
+    const BOOL amcSeen = [self audioPcRangeLo:&lo hi:&hi accesses:&accesses];
+    const BOOL pcmSeen = [self pcmPcRangeLo:&pcmLo hi:&pcmHi accesses:&pcmAccesses];
+    /* The whole kernelcache region, so any kext can be cut out of it once the
+     * load map is read (off this thread): the kernel maps 0xc0000000 ->
+     * physical 0x08000000 linearly. */
     const uint32_t kbase = 0xc0000000u, pbase = 0x08000000u;
-    uint32_t start = lo > kbase + kVMDriverWindow ? lo - kVMDriverWindow : kbase;
-    uint32_t end = hi < 0xffffffffu - kVMDriverWindow ? hi + kVMDriverWindow : 0xffffffffu;
-    start &= ~0xfffu;
-    end = (end + 0xfffu) & ~0xfffu;
     const uint64_t ramLo = _machine.ram_base, ramHi = ramLo + _machine.ram_size;
-    uint64_t pa = (uint64_t)start - kbase + pbase;
-    if (pa < ramLo) { start += (uint32_t)(ramLo - pa); pa = ramLo; }
+    uint32_t start = kbase, end = kbase + kVMKernelWindow;
+    if ((uint64_t)pbase < ramLo) start += (uint32_t)(ramLo - pbase);
     if ((uint64_t)end - kbase + pbase > ramHi) end = (uint32_t)(ramHi - pbase + kbase);
-    if (!_machine.ram || end <= start || lo < start || hi >= end) {
-        completion(@"AUDIO DRIVER: the kernel is not where this build expects it in guest RAM.\n");
+    if (!_machine.ram || end <= start) {
+        completion([NSString stringWithFormat:@"AUDIO DRIVER: the kernel is not where this build expects it in guest RAM.\n\n%@\n%@",
+                    pcmState, VMAudioBlockText(amcBytes, sramBytes)]);
         return;
     }
+    const uint64_t pa = (uint64_t)start - kbase + pbase;
     NSData *window = [NSData dataWithBytes:_machine.ram + (pa - ramLo) length:end - start];
     NSString *firmwareDir = [[VMSettings sharedSettings] firmwareDirectory];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSMutableString *out = [NSMutableString string];
         @autoreleasepool {
-            [out appendFormat:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"
-                              @"audio pcs=0x%08x..0x%08x accesses=%llu\n",
-                lo, hi, (unsigned long long)accesses];
+            [out appendString:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"];
+            if (amcSeen)
+                [out appendFormat:@"audio pcs=0x%08x..0x%08x accesses=%llu\n", lo, hi,
+                    (unsigned long long)accesses];
+            else
+                [out appendString:@"audio pcs: no kernel code has touched the AMC or its SRAM in this run\n"];
+            if (pcmSeen)
+                [out appendFormat:@"pcm pcs=0x%08x..0x%08x accesses=%llu\n", pcmLo, pcmHi,
+                    (unsigned long long)pcmAccesses];
+            else
+                [out appendString:@"pcm pcs: no kernel code has touched the I2S windows in this run\n"];
             NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
             ksyms_t *ks = VMLoadKernelSymbols(firmwareDir, &kernel);
-            const kext_t *kexts[2] = {
-                ks ? ksyms_kext_at(ks, lo) : NULL, ks ? ksyms_kext_at(ks, hi) : NULL,
-            };
-            if (kexts[1] == kexts[0]) kexts[1] = NULL;
+            enum { kMaxKexts = 8 };
+            const kext_t *kexts[kMaxKexts];
+            unsigned nk = 0;
+            const uint32_t owners[4] = { lo, hi, pcmLo, pcmHi };
+            const BOOL ownerSeen[4] = { amcSeen, amcSeen, pcmSeen, pcmSeen };
+            for (unsigned i = 0; ks && i < 4u; i++) {
+                const kext_t *k = ownerSeen[i] ? ksyms_kext_at(ks, owners[i]) : NULL;
+                BOOL dup = NO;
+                for (unsigned j = 0; j < nk; j++) dup |= kexts[j] == k;
+                if (k && !dup && nk < kMaxKexts) kexts[nk++] = k;
+            }
+            for (size_t n = 0; ks && n < sizeof kVMAudioKextNames / sizeof kVMAudioKextNames[0]; n++) {
+                for (unsigned i = 0; i < ks->nkext; i++) {
+                    const kext_t *k = &ks->kext[i];
+                    if (!k->has_exec || strcmp(k->bundle, kVMAudioKextNames[n])) continue;
+                    BOOL dup = NO;
+                    for (unsigned j = 0; j < nk; j++) dup |= kexts[j] == k;
+                    if (!dup && nk < kMaxKexts) kexts[nk++] = k;
+                    break;
+                }
+            }
             BOOL any = NO;
-            for (int i = 0; i < 2; i++) {
+            for (unsigned i = 0; i < nk; i++) {
                 const kext_t *k = kexts[i];
-                if (!k) continue;
                 uint32_t ks0 = k->addr, ks1 = k->addr + k->size;
                 BOOL clipped = ks0 < start || ks1 > end;
                 if (ks0 < start) ks0 = start;
@@ -2995,20 +3131,24 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
                                                    ks0, ks1 - ks0, label, ks)];
                 any = YES;
             }
-            if (!any) {
+            if (!any && amcSeen) {
                 /* No kext map: the old excerpt's window, named as such. */
                 uint32_t w0 = (lo - 0x4000u) & ~0xfu, w1 = (hi + 0x2000u + 0xfu) & ~0xfu;
                 if (w0 < start) w0 = start;
                 if (w1 > end) w1 = end;
                 if (w1 - w0 > 0x8000u) w1 = w0 + 0x8000u;
-                [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (w0 - start),
-                                                   w0, w1 - w0,
-                                                   ks ? "window (no kext owns these pcs)"
-                                                      : "window (no kernel.macho to map kexts)",
-                                                   ks)];
+                if (w1 > w0)
+                    [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (w0 - start),
+                                                       w0, w1 - w0,
+                                                       ks ? "window (no kext owns these pcs)"
+                                                          : "window (no kernel.macho to map kexts)",
+                                                       ks)];
+            } else if (!any) {
+                [out appendString:ks ? @"no audio kext found in the kernelcache's load map\n"
+                                     : @"no kernel.macho to map kexts\n"];
             }
             VMFreeKernelSymbols(ks);
-            [out appendFormat:@"\n%@", VMAudioBlockText(amcBytes, sramBytes)];
+            [out appendFormat:@"\n%@\n%@", pcmState, VMAudioBlockText(amcBytes, sramBytes)];
         }
         dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
     });

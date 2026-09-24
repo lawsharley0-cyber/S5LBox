@@ -96,6 +96,40 @@ static void test_unmodelled_log(void) {
     CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
 }
 
+/* The PCM path's own table: I2S accesses land there with their kernel pc
+ * range, other devices do not, and user-mode pcs do not widen the range. */
+static void test_pcm_log(void) {
+    arm_bus_t *bus = &g_m.bus;
+    CHECK(g_m.pcm_accesses == 0u && !g_m.pcm_recent[0].seq, "PCM log not empty at start");
+
+    g_m.cpu.r[15] = 0xc05a4000u;
+    bus->write32(bus->ctx, S5L8900_I2S0_BASE + 0x04u, 0x11u);
+    g_m.cpu.r[15] = 0xc05a3000u;
+    (void)bus->read32(bus->ctx, S5L8900_I2S1_BASE + 0x08u);
+    g_m.cpu.r[15] = 0x00010000u;                                /* user mode */
+    bus->write32(bus->ctx, S5L8900_I2S0_BASE + 0x00u, 1u);
+    g_m.cpu.r[15] = 0xc0020000u;
+    (void)bus->read32(bus->ctx, S5L8900_POWER_BASE + POWER_STATE);
+
+    CHECK(g_m.pcm_accesses == 2u, "kernel I2S accesses %llu", (unsigned long long)g_m.pcm_accesses);
+    CHECK(g_m.pcm_pc_lo == 0xc05a3000u && g_m.pcm_pc_hi == 0xc05a4000u,
+          "pc range %08x..%08x", g_m.pcm_pc_lo, g_m.pcm_pc_hi);
+    const s5l_access_entry_t *w0 = NULL, *r1 = NULL, *user = NULL, *other = NULL;
+    for (unsigned i = 0; i < S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &g_m.pcm_recent[i];
+        if (!e->seq) continue;
+        if (e->pc == 0xc05a4000u) w0 = e;
+        if (e->pc == 0xc05a3000u) r1 = e;
+        if (e->pc == 0x00010000u) user = e;
+        if (e->pc == 0xc0020000u) other = e;
+    }
+    CHECK(w0 && w0->write && w0->value == 0x11u && w0->region && !strcmp(w0->region, "i2s0"),
+          "i2s0 write entry wrong");
+    CHECK(r1 && !r1->write && r1->region && !strcmp(r1->region, "i2s1"), "i2s1 read entry wrong");
+    CHECK(user != NULL, "user-mode access missing from the table");
+    CHECK(other == NULL, "power access in the PCM table");
+}
+
 static void test_engine_counters(void) {
     static const uint32_t prog[] = {
         0xe3a00001u,   /* mov   r0, #1                 */
@@ -251,6 +285,7 @@ int main(void) {
         printf("FAIL setup\n");
         return 1;
     }
+    test_pcm_log();
     test_unmodelled_log();
     test_engine_counters();
     test_guest_pc();
