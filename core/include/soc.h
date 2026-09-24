@@ -144,12 +144,11 @@ typedef enum {
  * derivation every other peripheral here uses. The guest's own driver prints a
  * mapped VA for each on every boot, so the pair is confirmed twice.
  *
- * As with uart4 there is deliberately NO S5L8900_IRQ_I2S0/1 constant. The
- * `interrupts` properties say 0x86 and 0xaa, but both nodes name
- * `interrupt-parent = /arm-io/gpio` — they are GPIO-IC lines, not VIC lines —
- * and nothing in this model raises either. A constant that looks wired but is
- * not is the landmine the old S5L8900_GPIO_BASE was; it joins the header the
- * day something can actually assert it.
+ * There is deliberately NO S5L8900_IRQ_I2S0/1 constant. The `interrupts`
+ * properties say 0x86 and 0xaa, but both nodes name
+ * `interrupt-parent = /arm-io/gpio`: they are GPIO-IC lines, not VIC lines.
+ * They are S5L_GPIOIC_LINE_I2S0/1 in the GPIO-IC block below, and each
+ * controller's frame clock drives its line (see the I2S block).
  */
 #define S5L8900_I2S0_BASE   0x3ca00000u
 #define S5L8900_I2S1_BASE   0x3cd00000u
@@ -1321,6 +1320,10 @@ bool     s5l_mbx_irq(const s5l_mbx_t *m);
 /* Device-tree interrupt lines, as flat indices on this controller. */
 #define S5L_GPIOIC_LINE_PMU         85u
 #define S5L_GPIOIC_LINE_MULTITOUCH 155u
+/* /arm-io/i2s0 and /arm-io/i2s1 `interrupts`: group 4 bit 6 and group 5
+ * bit 10. Driven by each controller's frame clock; see the I2S block. */
+#define S5L_GPIOIC_LINE_I2S0       0x86u
+#define S5L_GPIOIC_LINE_I2S1       0xaau
 
 /* Number of distinct unknown offsets remembered, as on I2C and SPI. */
 #define S5L_GPIOIC_UNKNOWN_OFF 8u
@@ -2362,14 +2365,67 @@ uint16_t s5l_wm8991_peek(const s5l_wm8991_t *codec, uint8_t reg);
  * WHAT THIS IS NOT. Not a sample path. The PCM FIFOs live at +0x10 and +0x38
  * and the CPU never touches them: the device tree hands their PHYSICAL
  * addresses (0x3ca00010/0x3ca00038, 0x3cd00010/0x3cd00038 — already absolute in
- * the `dma-channels` blob, not arm-io relative) straight to the PL080, which is
- * not modelled. No clock, no frame timing, no interrupt. i2s0 carries the
- * WM8991 (`/arm-io/i2s0/audio0`, `audio-data,wm8991`); i2s1 carries the
- * baseband voice path (`audio-data,baseband`), which is why both windows exist
- * here even though only one of them belongs to the codec.
+ * the `dma-channels` blob, not arm-io relative) straight to the PL080. i2s0
+ * carries the WM8991 (`/arm-io/i2s0/audio0`, `audio-data,wm8991`); i2s1
+ * carries the baseband voice path (`audio-data,baseband`), which is why both
+ * windows exist here even though only one of them belongs to the codec.
+ *
+ * THE FRAME CLOCK, AND WHY SOUND NEEDED ONE. startTransfer() at 0xc05a3928
+ * does not start DMA straight away. It sets a state word at this+0x8c to 1,
+ * enables its provider's interrupt 0 (vtable +0x220), arms a timer from the
+ * command's timeout, and sleeps on the state word until it reads 3 or 4. Its
+ * handler at 0xc05a3c2c moves 1 to 2 on the first interrupt; on the second it
+ * stores 3, disables the interrupt (+0x224) and wakes the sleeper. The timer
+ * stores 4. Only state 3 goes on to start the DMA channel and write 6 to
+ * +0x08/+0x34; state 4 returns kIOReturnNotReady (0xe00002d8, the literal at
+ * 0xc05a3ac4) and an interrupted sleep returns kIOReturnAborted (0xe00002eb).
+ * Those are exactly the two AppleEmbeddedAudioDevice "could not start DMA"
+ * messages every device report carried, and the d09d9b8 reports show
+ * configure()'s seven writes at +0x00..+0x40 and never the 6.
+ *
+ * Interrupt 0 of this nub is GPIO-IC line 0x86 (i2s1: 0xaa). A line on the
+ * GPIO block is a pin, and the handler neither reads a register nor looks at
+ * the time: it counts two edges and then starts DMA. That is the usual way to
+ * start I2S DMA at a frame boundary, so the pin is taken to be the frame
+ * (word-select) clock. That is an INFERENCE from the handler's shape, and it
+ * is the only claim about the pin this model makes.
+ *
+ * So each controller runs a frame clock once configure() has run (+0x00 bit
+ * 0, which configure() always sets), high for the first half of each frame,
+ * and drives its GPIO-IC line with it. The rate, S5L_I2S_FRAME_HZ, is NOT
+ * decoded from any register: +0x04 = 0x01100301 in every report and nothing
+ * says which field is a divider. 44.1 kHz is the rate the app's output
+ * already assumes. The handler cannot see the rate; it only decides how long
+ * the two-edge wait takes (about 45 us of guest time).
+ *
+ * THE TRANSMIT FIFO, PACED BY THAT CLOCK. Every PL080 request line used to be
+ * asserted all the time, so a started audio channel would move its whole
+ * linked list in one refresh, and a circular list would stop at
+ * S5L_PL080_MAX_ITEMS. The TX FIFO now holds S5L_I2S_TX_FIFO_BYTES and loses
+ * S5L_I2S_FRAME_BYTES (one 16-bit stereo frame) at each rising edge of the
+ * frame clock. Its DMA request is asserted while it has room. The depth is
+ * not decoded either: the driver never reads a FIFO level, and the depth only
+ * sets how far DMA may run ahead of the clock. The `dma-channels` template
+ * for both FIFOs is 0x00249000, i.e. 16-bit transfers, so the FIFO counts
+ * bytes, not stores.
+ *
+ * A refresh can span many frames (a WFI fast-forward, or the cached
+ * interpreter's horizon). Frames that find the FIFO empty become `tx_credit`
+ * for the rest of that refresh, and DMA pushes in the same refresh pay it off
+ * before they fill the FIFO. That gives the same totals as one refresh per
+ * frame, which the horizon relies on (see horizon_devices_idle() in
+ * machine.c). Credit left at the end of the refresh is an underrun.
+ *
+ * The host sink (`tx_fn`) is given whole 32-bit frames, low halfword first
+ * (the left sample on a little-endian bus), however narrow the stores that
+ * filled them. It used to receive one call per store, which delivered each
+ * 16-bit DMA store as a stereo frame of its own.
  */
 #define S5L_I2S_REGS         7u
 #define S5L_I2S_UNKNOWN_OFF  8u
+#define S5L_I2S_FRAME_HZ     44100u   /* nominal, not decoded; see above */
+#define S5L_I2S_FRAME_BYTES  4u       /* one 16-bit stereo frame          */
+#define S5L_I2S_TX_FIFO_BYTES 64u     /* not decoded; see above           */
 
 typedef void (*s5l_audio_tx_fn)(void *ctx, uint32_t word);
 typedef bool (*s5l_audio_ready_fn)(void *ctx);
@@ -2385,17 +2441,54 @@ typedef struct {
     unsigned unknown_off_count;
     s5l_audio_tx_fn tx_fn;
     void           *tx_ctx;
-    uint64_t        tx_words;
+    uint64_t        tx_words;     /* stores into the TX FIFO (host-side)   */
+    uint64_t        tx_frames;    /* 32-bit frames handed to tx_fn (host)  */
+    /* The frame clock and the TX FIFO. Guest state, serialised (v33). */
+    uint64_t fclk_phase;   /* into the current frame, in units of one
+                            * timebase tick x S5L_I2S_FRAME_HZ; a frame is
+                            * tb_hz units */
+    uint64_t frames;       /* rising edges of the frame clock since reset  */
+    uint32_t tx_fill;      /* bytes in the TX FIFO, <= S5L_I2S_TX_FIFO_BYTES */
+    uint32_t tx_pack;      /* bytes of the next frame for tx_fn, low first */
+    uint32_t tx_pack_len;  /* how many, 0..3                               */
+    uint64_t tx_underrun;  /* bytes the clock took from an empty FIFO      */
+    uint64_t tx_overrun;   /* bytes stored into a full FIFO, and dropped   */
+    /* Drained bytes owed to this refresh's pushes; zero outside
+     * s5l_i2s_advance()..s5l_i2s_settle(), so never serialised. */
+    uint64_t tx_credit;
 } s5l_i2s_t;
 
 void     s5l_i2s_reset(s5l_i2s_t *i2s);
 uint32_t s5l_i2s_read(s5l_i2s_t *i2s, uint32_t off);
+/* A 32-bit store. The same as s5l_i2s_store(i2s, off, val, 4). */
 void     s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val);
+/* A store of `bytes` (1, 2 or 4). The width matters only at the TX FIFO. */
+void     s5l_i2s_store(s5l_i2s_t *i2s, uint32_t off, uint32_t val,
+                       unsigned bytes);
 /* A diagnostic summary of `i2s` (named `name`): the seven stored offsets, the
- * access counts, any offset outside them, and the TX FIFO words. Same
- * contract as s5l_pl080_describe(). */
+ * access counts, any offset outside them, the frame clock and the TX FIFO.
+ * Same contract as s5l_pl080_describe(). */
 size_t   s5l_i2s_describe(const s5l_i2s_t *i2s, const char *name,
                           char *out, size_t cap);
+
+/* The frame clock runs once configure() has set +0x00 bit 0. */
+bool     s5l_i2s_clocking(const s5l_i2s_t *i2s);
+/* Advance the frame clock by `tb` ticks of a `tb_hz` timebase and drain one
+ * frame from the TX FIFO per rising edge. Returns the rising edges crossed
+ * (saturating). Does nothing while the clock is stopped or tb_hz is 0. */
+uint32_t s5l_i2s_advance(s5l_i2s_t *i2s, uint32_t tb, uint32_t tb_hz);
+/* End the refresh s5l_i2s_advance() started: unpaid credit is an underrun. */
+void     s5l_i2s_settle(s5l_i2s_t *i2s);
+/* The frame-clock pin's level now (high for the first half of a frame). */
+bool     s5l_i2s_frame_level(const s5l_i2s_t *i2s, uint32_t tb_hz);
+/* Timebase ticks until the pin next changes level, or until the `k`-th next
+ * rising edge (k >= 1). 0 when the clock is stopped; UINT32_MAX when it is
+ * further than that. */
+uint32_t s5l_i2s_ticks_to_toggle(const s5l_i2s_t *i2s, uint32_t tb_hz);
+uint32_t s5l_i2s_ticks_to_frame(const s5l_i2s_t *i2s, uint64_t k,
+                                uint32_t tb_hz);
+/* The TX FIFO's DMA request: can it take `bytes` more right now? */
+bool     s5l_i2s_tx_room(const s5l_i2s_t *i2s, unsigned bytes);
 /* The byte offset backing slot `index`, or UINT32_MAX past the end. The map is
  * exposed so the tests pin the exact seven the driver writes rather than
  * re-deriving them from this model's own storage order. */
@@ -3927,10 +4020,14 @@ typedef struct {
  */
 #define S5L_ACCESS_LOG 32u
 
-enum { S5L_ACCESS_DEVICE = 0, S5L_ACCESS_STUB = 1, S5L_ACCESS_UNMAPPED = 2 };
+/* S5L_ACCESS_DMA: a DMA controller made it, not the CPU; pc is 0. Paced
+ * audio DMA stores into the I2S FIFOs all the time, and logged under the
+ * CPU's pc they would look like kernel code writing samples. */
+enum { S5L_ACCESS_DEVICE = 0, S5L_ACCESS_STUB = 1, S5L_ACCESS_UNMAPPED = 2,
+       S5L_ACCESS_DMA = 3 };
 
 typedef struct {
-    uint32_t    pc;       /* cpu.r[15] when the access was made              */
+    uint32_t    pc;       /* cpu.r[15] when the access was made; 0 for DMA   */
     uint32_t    addr;     /* physical address                                 */
     uint32_t    value;    /* last value read (as answered) or written          */
     uint32_t    count;    /* accesses of this triple, saturating              */
@@ -4265,6 +4362,10 @@ typedef struct {
     uint32_t                  ci_horizon_edges;
     uint8_t                   ci_horizon_kind;  /* s5l_wake_kind_t */
     bool                      ci_horizon_idle;
+    /* Set while the DMA controllers run, so the access logs above record
+     * their stores as DMA rather than under whatever pc the CPU stopped at.
+     * Host-only, never serialised. */
+    bool                      dma_bus_active;
 } s5l8900_t;
 
 /*

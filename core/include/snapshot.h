@@ -189,7 +189,14 @@
  *      only thing in this machine that can distinguish "the guest never
  *      programmed a transfer" from "it programmed one and this model refused
  *      it", and refused_flow/width/chain/softreq/endian name which refusal. */
-#define SNAPSHOT_VERSION   32u
+/*
+ * v33: each I2S window's frame clock and transmit FIFO joined snap_i2s(): the
+ *      clock phase, frames counted, the FIFO fill, the partial frame for the
+ *      host sink, and the underrun/overrun counters. The phase decides when
+ *      the next GPIO-IC edge and the next DMA request happen, so a restore
+ *      without it would not continue the same way.
+ */
+#define SNAPSHOT_VERSION   33u
 
 typedef enum {
     SNAP_OK = 0,

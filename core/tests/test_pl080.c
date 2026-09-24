@@ -930,11 +930,11 @@ static void test_both_controllers_are_declared_wake_sources(void) {
           "rediscover", found);
 
     /*
-     * And both answer NEVER, which is a claim about this model and not a
-     * placeholder: a transfer completes inside the tick that the enabling store
-     * dirties, so there is never one in flight when a core reaches WFI. The day
-     * transfers are paced against a peripheral request line, this assertion is
-     * the one that must change first.
+     * And with nothing in flight both answer NEVER: a transfer completes inside
+     * the tick that the enabling store dirties, so there is never one in flight
+     * when a core reaches WFI. The one exception is a channel feeding an I2S
+     * TX FIFO, which its frame clock paces; test_audio_dma.c pins the edge
+     * such a channel names.
      */
     s5l8900_t m;
     CHECK(s5l8900_init(&m, 0u, 1u << 16), "init failed");

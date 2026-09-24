@@ -2,9 +2,13 @@
  * S5LBox — the two S5L8900 I2S controller windows.
  *
  * Honest storage for the seven offsets AppleS5L8900XI2SController writes, and
- * bounded visibility for anything else. It stores rather than interprets: no
- * semantics are claimed for any of the seven, because the driver never reads
- * one back and nothing in the kernelcache documents them.
+ * bounded visibility for anything else. It stores rather than interprets, with
+ * one exception: +0x00 bit 0, which configure() always sets, starts the frame
+ * clock. The driver never reads a register back and nothing in the
+ * kernelcache documents them.
+ *
+ * The frame clock and the transmit FIFO it drains are described in the I2S
+ * block of soc.h, with the startTransfer() disassembly that needs them.
  *
  * See the I2S block in soc.h for the enumeration of the seven write sites and
  * for the four checks that establish `readRegister` is dead code.
@@ -93,7 +97,35 @@ uint32_t s5l_i2s_read(s5l_i2s_t *i2s, uint32_t off) {
     return 0u;
 }
 
-void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
+/*
+ * One byte into the TX FIFO. Credit first: a byte pushed while the clock has
+ * already taken bytes this refresh that the FIFO did not have is a byte that,
+ * one refresh per frame, would have gone in and out between two edges.
+ */
+static bool tx_accept_byte(s5l_i2s_t *i2s) {
+    if (i2s->tx_credit) { i2s->tx_credit--; return true; }
+    if (i2s->tx_fill < S5L_I2S_TX_FIFO_BYTES) { i2s->tx_fill++; return true; }
+    i2s->tx_overrun++;
+    return false;
+}
+
+static void tx_push(s5l_i2s_t *i2s, uint32_t val, unsigned bytes) {
+    i2s->tx_words++;
+    for (unsigned b = 0; b < bytes; b++) {
+        /* A full FIFO drops the byte. The DMA request stops before that
+         * (s5l_i2s_tx_room), so only a CPU store can get here. */
+        if (!tx_accept_byte(i2s)) continue;
+        i2s->tx_pack |= ((val >> (8u * b)) & 0xffu) << (8u * i2s->tx_pack_len);
+        if (++i2s->tx_pack_len < S5L_I2S_FRAME_BYTES) continue;
+        if (i2s->tx_fn) i2s->tx_fn(i2s->tx_ctx, i2s->tx_pack);
+        i2s->tx_frames++;
+        i2s->tx_pack = 0;
+        i2s->tx_pack_len = 0;
+    }
+}
+
+void s5l_i2s_store(s5l_i2s_t *i2s, uint32_t off, uint32_t val,
+                   unsigned bytes) {
     if (!i2s) return;
     i2s->writes++;
     int slot = slot_for(off);
@@ -101,15 +133,87 @@ void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
         i2s->regs[slot] = val;
         return;
     }
-    if (off == S5L_I2S_TX_FIFO_OFF) {
-        i2s->tx_words++;
-        if (i2s->tx_fn) i2s->tx_fn(i2s->tx_ctx, val);
-        /* Preserve the existing access census below: format derivation uses
-         * writes - unknown_writes to count configuration writes. FIFO data
-         * must never be mistaken for programming the audio format. */
-    }
+    if (off == S5L_I2S_TX_FIFO_OFF && (bytes == 1u || bytes == 2u || bytes == 4u))
+        tx_push(i2s, val, bytes);
+    /* Preserve the existing access census below: format derivation uses
+     * writes - unknown_writes to count configuration writes. FIFO data must
+     * never be mistaken for programming the audio format. */
     i2s->unknown_writes++;
     note_unknown(i2s, off);
+}
+
+void s5l_i2s_write(s5l_i2s_t *i2s, uint32_t off, uint32_t val) {
+    s5l_i2s_store(i2s, off, val, 4u);
+}
+
+/* ------------------------------------------------------- the frame clock --- */
+
+bool s5l_i2s_clocking(const s5l_i2s_t *i2s) {
+    /* Slot 0 is +0x00; configure() at 0xc05a3820 stores cfg | 1 there. */
+    return i2s && (i2s->regs[0] & 1u) != 0u;
+}
+
+uint32_t s5l_i2s_advance(s5l_i2s_t *i2s, uint32_t tb, uint32_t tb_hz) {
+    if (!s5l_i2s_clocking(i2s) || !tb_hz || !tb) return 0u;
+    /* At most 2^32 x 44100 + tb_hz, well inside 64 bits. */
+    uint64_t total = i2s->fclk_phase + (uint64_t)tb * S5L_I2S_FRAME_HZ;
+    /* Most refreshes are one tick and cross no edge: skip the divides. */
+    if (total < tb_hz) {
+        i2s->fclk_phase = total;
+        return 0u;
+    }
+    uint64_t edges = total / tb_hz;
+    i2s->fclk_phase = total % tb_hz;
+    i2s->frames += edges;
+
+    /* One frame out of the FIFO per edge; what it does not hold is owed. */
+    uint64_t want = edges * S5L_I2S_FRAME_BYTES;
+    uint64_t have = want < i2s->tx_fill ? want : i2s->tx_fill;
+    i2s->tx_fill -= (uint32_t)have;
+    i2s->tx_credit += want - have;
+    return edges > UINT32_MAX ? UINT32_MAX : (uint32_t)edges;
+}
+
+void s5l_i2s_settle(s5l_i2s_t *i2s) {
+    if (!i2s) return;
+    i2s->tx_underrun += i2s->tx_credit;
+    i2s->tx_credit = 0;
+}
+
+bool s5l_i2s_frame_level(const s5l_i2s_t *i2s, uint32_t tb_hz) {
+    if (!s5l_i2s_clocking(i2s) || !tb_hz) return false;
+    return 2u * i2s->fclk_phase < tb_hz;
+}
+
+static uint32_t clamp_ticks(uint64_t t) {
+    return t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
+}
+
+uint32_t s5l_i2s_ticks_to_toggle(const s5l_i2s_t *i2s, uint32_t tb_hz) {
+    if (!s5l_i2s_clocking(i2s) || !tb_hz) return 0u;
+    /* A phase past the frame (only a malformed caller can make one) is
+     * normalised by the next advance, which is one tick away. */
+    if (i2s->fclk_phase >= tb_hz) return 1u;
+    const uint64_t hz = S5L_I2S_FRAME_HZ;
+    if (2u * i2s->fclk_phase < tb_hz)     /* high: the fall at half a frame */
+        return clamp_ticks((tb_hz - 2u * i2s->fclk_phase + 2u * hz - 1u) /
+                           (2u * hz));
+    return clamp_ticks((tb_hz - i2s->fclk_phase + hz - 1u) / hz);
+}
+
+uint32_t s5l_i2s_ticks_to_frame(const s5l_i2s_t *i2s, uint64_t k,
+                                uint32_t tb_hz) {
+    if (!s5l_i2s_clocking(i2s) || !tb_hz || !k) return 0u;
+    if (i2s->fclk_phase >= tb_hz) return 1u;
+    /* The first t with phase + t*hz >= k*tb_hz. */
+    if (k > UINT64_MAX / tb_hz) return UINT32_MAX;
+    const uint64_t hz = S5L_I2S_FRAME_HZ;
+    return clamp_ticks((k * tb_hz - i2s->fclk_phase + hz - 1u) / hz);
+}
+
+bool s5l_i2s_tx_room(const s5l_i2s_t *i2s, unsigned bytes) {
+    if (!i2s) return false;
+    return i2s->tx_credit + (S5L_I2S_TX_FIFO_BYTES - i2s->tx_fill) >= bytes;
 }
 
 /* snprintf onto the end of out[0..cap), keeping it terminated; returns the new
@@ -141,6 +245,12 @@ size_t s5l_i2s_describe(const s5l_i2s_t *i2s, const char *name,
         (unsigned long long)i2s->unknown_reads, (unsigned long long)i2s->unknown_writes);
     for (unsigned i = 0; i < i2s->unknown_off_count && i < S5L_I2S_UNKNOWN_OFF; i++)
         len = append(out, cap, len, "%s+0x%02x", i ? " " : " at ", i2s->unknown_off[i]);
-    len = append(out, cap, len, "; TX FIFO words %llu\n", (unsigned long long)i2s->tx_words);
+    len = append(out, cap, len, "; TX FIFO stores %llu, frames to host %llu\n",
+        (unsigned long long)i2s->tx_words, (unsigned long long)i2s->tx_frames);
+    len = append(out, cap, len,
+        "  frame clock %s, %llu frames; TX FIFO %u/%u bytes, underrun %llu bytes, overrun %llu bytes\n",
+        s5l_i2s_clocking(i2s) ? "running" : "stopped", (unsigned long long)i2s->frames,
+        i2s->tx_fill, S5L_I2S_TX_FIFO_BYTES,
+        (unsigned long long)i2s->tx_underrun, (unsigned long long)i2s->tx_overrun);
     return len;
 }

@@ -130,7 +130,9 @@ Carried from `CURRENT_ARCHITECTURE.md` §8, sources README, `QUALITY.md`,
   reaches 30 fps. Dominant costs in the steady state include RSA/crypto in
   `Security.framework` and QuartzCore's software rasteriser, not decode alone
   (`hotpath.md`). A 2× faster CPU core does not translate to 2× frames.
-- Audio modelled, never heard; an AMC/BSU lock freeze reproduces on device.
+- Audio modelled, never heard. PCM DMA never started because the I²S frame
+  clock (GPIO line 0x86) was not modelled; it is now, untested on a device
+  (`audio.md`). The AMC codec DSP is not modelled.
 - PPP link comes up; no guest IP packet carried; the app has no PPP endpoint.
 - MBX graphics experimental and hidden from the guest by default.
 - RTC placeholder; baseband, Wi-Fi, Bluetooth, camera, accelerometer not

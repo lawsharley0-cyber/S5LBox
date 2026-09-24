@@ -140,14 +140,18 @@ size_t s5l_access_log_describe(const s5l_access_entry_t *log, unsigned n,
                 best = &log[i];
         if (!best) break;
         below = best->seq;
+        char who[16];
+        if (best->kind == S5L_ACCESS_DMA) snprintf(who, sizeof who, "dma");
+        else snprintf(who, sizeof who, "pc %08x", best->pc);
         int w = snprintf(out + len, cap - len,
-                         "pc %08x %s %08x %s %08x x%u%s%s (%s%s%s)\n",
-                         best->pc, best->write ? "W" : "R", best->addr,
+                         "%s %s %08x %s %08x x%u%s%s (%s%s%s)\n",
+                         who, best->write ? "W" : "R", best->addr,
                          best->write ? "<-" : "->", best->value, best->count,
                          best->count == UINT32_MAX ? "+" : "",
                          best->bytes == 2u ? " h" : best->bytes == 1u ? " b" : "",
                          best->kind == S5L_ACCESS_DEVICE ? "device" :
-                         best->kind == S5L_ACCESS_STUB ? "stub" : "unmapped",
+                         best->kind == S5L_ACCESS_STUB ? "stub" :
+                         best->kind == S5L_ACCESS_DMA ? "dma to device" : "unmapped",
                          best->region ? " " : "",
                          best->region ? best->region : "");
         if (w < 0) break;
@@ -396,8 +400,8 @@ static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
                             unsigned bytes, bool is_write, const s5l_stub_t *stub) {
     bool fresh;
     s5l_access_entry_t *e = log_access(m->unmodelled, &m->unmodelled_seq,
-                                       m->cpu.r[15], addr, val, bytes, is_write,
-                                       &fresh);
+                                       m->dma_bus_active ? 0u : m->cpu.r[15],
+                                       addr, val, bytes, is_write, &fresh);
     if (fresh) {
         e->kind = stub ? S5L_ACCESS_STUB : S5L_ACCESS_UNMAPPED;
         e->region = stub ? stub->name : soc_region_name(addr);
@@ -407,9 +411,14 @@ static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
 /* The all-device table: every access that reaches the device paths. */
 static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
                       unsigned bytes, bool is_write) {
+    /* A DMA controller's access has no pc. 0 keeps it out of every
+     * kernel-pc range below, which is what the report uses to find the
+     * driver that touched a device. */
+    const bool dma = m->dma_bus_active;
+    const uint32_t cpu_pc = dma ? 0u : m->cpu.r[15];
     if (addr - S5L8900_AMC_BASE < S5L8900_AMC_SIZE ||
         addr - S5L8900_SRAM_BASE < S5L8900_SRAM_SIZE) {
-        const uint32_t pc = m->cpu.r[15];
+        const uint32_t pc = cpu_pc;
         if (pc >= 0xc0000000u) {
             if (!m->audio_accesses || pc < m->audio_pc_lo) m->audio_pc_lo = pc;
             if (!m->audio_accesses || pc > m->audio_pc_hi) m->audio_pc_hi = pc;
@@ -419,7 +428,7 @@ static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
     bool fresh;
     if (addr - S5L8900_I2S0_BASE < S5L8900_DEV_SIZE ||
         addr - S5L8900_I2S1_BASE < S5L8900_DEV_SIZE) {
-        const uint32_t pc = m->cpu.r[15];
+        const uint32_t pc = cpu_pc;
         if (pc >= 0xc0000000u) {
             if (!m->pcm_accesses || pc < m->pcm_pc_lo) m->pcm_pc_lo = pc;
             if (!m->pcm_accesses || pc > m->pcm_pc_hi) m->pcm_pc_hi = pc;
@@ -428,17 +437,17 @@ static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
         s5l_access_entry_t *p = log_access(m->pcm_recent, &m->pcm_seq, pc, addr,
                                            val, bytes, is_write, &fresh);
         if (fresh) {
-            p->kind = S5L_ACCESS_DEVICE;
+            p->kind = dma ? S5L_ACCESS_DMA : S5L_ACCESS_DEVICE;
             p->region = addr < S5L8900_I2S1_BASE ? "i2s0" : "i2s1";
         }
     }
     s5l_access_entry_t *e = log_access(m->mmio_recent, &m->mmio_seq,
-                                       m->cpu.r[15], addr, val, bytes, is_write,
+                                       cpu_pc, addr, val, bytes, is_write,
                                        &fresh);
     if (!fresh) return;
     for (unsigned i = 0; i < NDEVICE_WINDOWS; i++) {
         if (addr - DEVICE_WINDOWS[i].base < DEVICE_WINDOWS[i].size) {
-            e->kind = S5L_ACCESS_DEVICE;
+            e->kind = dma ? S5L_ACCESS_DMA : S5L_ACCESS_DEVICE;
             e->region = DEVICE_WINDOWS[i].name;
             return;
         }
@@ -763,12 +772,12 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     if (mmio_data(addr, bytes, S5L8900_I2S0_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
-        s5l_i2s_write(&m->i2s[0], addr - S5L8900_I2S0_BASE, val);
+        s5l_i2s_store(&m->i2s[0], addr - S5L8900_I2S0_BASE, val, bytes);
         return;
     }
     if (mmio_data(addr, bytes, S5L8900_I2S1_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
-        s5l_i2s_write(&m->i2s[1], addr - S5L8900_I2S1_BASE, val);
+        s5l_i2s_store(&m->i2s[1], addr - S5L8900_I2S1_BASE, val, bytes);
         return;
     }
     if (mmio_data(addr, bytes, S5L8900_SPI0_BASE, S5L8900_DEV_SIZE)) {
@@ -877,7 +886,6 @@ static uint8_t  r8 (void *c, uint32_t a) {
  */
 static bool dma_dst_ready(void *ctx, uint32_t dst, unsigned width) {
     const s5l8900_t *m = ctx;
-    (void)width;
     for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) {
         static const uint32_t base[] = {
             S5L8900_SPI0_BASE, S5L8900_SPI1_BASE, S5L8900_SPI2_BASE
@@ -886,8 +894,15 @@ static bool dma_dst_ready(void *ctx, uint32_t dst, unsigned width) {
         if (dst == base[i] + SPI_TXDATA)
             return m->spi[i].tx_level < S5L_SPI_FIFO_DEPTH;
     }
-    if (dst == S5L8900_I2S0_BASE + S5L_I2S_TX_FIFO_OFF) {
-        if (m->audio_ready) return m->audio_ready(m->audio_ctx);
+    /* The two I2S transmit FIFOs ask for data while they have room, and
+     * they make room one frame per edge of their frame clock. See the I2S
+     * block in soc.h. i2s0 is the codec's, so the host sink can also hold it
+     * back. */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        if (dst != s5l_i2s_fifo_pa(i, S5L_I2S_FIFO_TX)) continue;
+        if (!s5l_i2s_tx_room(&m->i2s[i], width)) return false;
+        if (i == 0u && m->audio_ready) return m->audio_ready(m->audio_ctx);
+        return true;
     }
     return true;
 }
@@ -1184,11 +1199,42 @@ static s5l_wake_kind_t wake_edge_spi1(const s5l8900_t *m, uint32_t *ticks) {
  * CASCADE VIC line, not 155. wake_line_enabled() rejects anything at or above
  * 32 * S5L8900_VIC_COUNT, so a source written as `{ "multitouch", 155, ... }`
  * would return false silently and could never wake the core.
+ *
+ * THE ONE EXCEPTION IS AN I2S FRAME CLOCK. It moves on guest time alone, so it
+ * can produce an edge while the core sleeps, and startTransfer() sleeps
+ * waiting for exactly two of them. While a controller's clock runs and the
+ * guest has unmasked its line (group 4 for i2s0, group 5 for i2s1), that group
+ * names the clock's next level change. Either direction, because the guest
+ * may have made the line level-sensitive; a change that asserts nothing only
+ * ends the WFI early, which ARM permits. Masked, it names nothing: the line
+ * cannot reach the cascade, and the stock driver masks it again as soon as it
+ * has its two edges.
  */
-static s5l_wake_kind_t wake_edge_gpio(const s5l8900_t *m, uint32_t *ticks) {
-    (void)m; (void)ticks;
-    return S5L_WAKE_NEVER;
+static s5l_wake_kind_t wake_edge_gpio_group(const s5l8900_t *m, unsigned group,
+                                            uint32_t *ticks) {
+    bool have = false;
+    uint32_t best = 0u;
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        const unsigned line = i == 0u ? S5L_GPIOIC_LINE_I2S0
+                                      : S5L_GPIOIC_LINE_I2S1;
+        if (line >> 5 != group) continue;
+        if (!(m->gpioic.en[group] & (1u << (line & 31u)))) continue;
+        uint32_t t = s5l_i2s_ticks_to_toggle(&m->i2s[i], m->tb_hz);
+        if (!t) continue;                  /* clock stopped */
+        if (!have || t < best) { best = t; have = true; }
+    }
+    if (!have) return S5L_WAKE_NEVER;
+    *ticks = best;
+    return S5L_WAKE_AT;
 }
+#define WAKE_EDGE_GPIO(g)                                                     \
+    static s5l_wake_kind_t wake_edge_gpio##g(const s5l8900_t *m,              \
+                                             uint32_t *ticks) {               \
+        return wake_edge_gpio_group(m, g##u, ticks);                          \
+    }
+WAKE_EDGE_GPIO(0) WAKE_EDGE_GPIO(1) WAKE_EDGE_GPIO(2) WAKE_EDGE_GPIO(3)
+WAKE_EDGE_GPIO(4) WAKE_EDGE_GPIO(5) WAKE_EDGE_GPIO(6)
+#undef WAKE_EDGE_GPIO
 
 /*
  * uart4's receive line, and the answer docs/derivations.md §23.5.1 asked for:
@@ -1234,16 +1280,64 @@ static s5l_wake_kind_t wake_edge_uart4(const s5l8900_t *m, uint32_t *ticks) {
  * any source is consulted) or there is no transfer in flight at all. There is
  * no future edge to name.
  *
- * That would stop being true the day this model paces transfers against a
- * peripheral's DMA request line instead of completing them in one call, which
- * is exactly the change the burst note in soc.h says has not been made. This
- * entry is where that change would be felt: it would have to start answering
- * S5L_WAKE_AT with the remaining distance, or the machine would fast-forward
- * straight over the completion.
+ * That stopped being true for one kind of channel: one that feeds an I2S
+ * transmit FIFO, which takes data only as fast as its frame clock drains it
+ * (see the I2S block in soc.h). Such a channel is in flight across a WFI, and
+ * its item ends -- raising terminal count if the item asks -- at a frame edge
+ * that can be computed: the item's remaining bytes, less the room the FIFO
+ * has now, drained one frame per edge. That edge is named here. An item
+ * without the interrupt bit ends the WFI for nothing, once per item, which
+ * ARM permits. Every other channel still finishes inside the refresh that
+ * starts it, so it still names nothing.
  */
-static s5l_wake_kind_t wake_edge_dmac(const s5l8900_t *m, uint32_t *ticks) {
-    (void)m; (void)ticks;
-    return S5L_WAKE_NEVER;
+static unsigned dmac_paced_fifo(const s5l8900_t *m, const s5l_pl080_chan_t *ch) {
+    /* A channel paced by a running I2S frame clock: its destination is a TX
+     * FIFO and does not move. Returns the controller index, or
+     * S5L8900_I2S_COUNT. */
+    if ((ch->cfg & (PL080_CFG_EN | PL080_CFG_HALT)) != PL080_CFG_EN)
+        return S5L8900_I2S_COUNT;
+    if (ch->ctrl & PL080_CTRL_DI) return S5L8900_I2S_COUNT;
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++)
+        if (ch->dst == s5l_i2s_fifo_pa(i, S5L_I2S_FIFO_TX) &&
+            s5l_i2s_clocking(&m->i2s[i]))
+            return i;
+    return S5L8900_I2S_COUNT;
+}
+
+static s5l_wake_kind_t wake_edge_dmac_n(const s5l8900_t *m, unsigned n,
+                                        uint32_t *ticks) {
+    const s5l_pl080_t *d = &m->dmac[n];
+    if (!(d->config & PL080_CONFIG_EN)) return S5L_WAKE_NEVER;
+    bool have = false;
+    uint32_t best = 0u;
+    for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++) {
+        const s5l_pl080_chan_t *ch = &d->ch[c];
+        const unsigned i = dmac_paced_fifo(m, ch);
+        if (i >= S5L8900_I2S_COUNT) continue;
+        const s5l_i2s_t *i2s = &m->i2s[i];
+        const uint32_t sw = (ch->ctrl >> PL080_CTRL_SWIDTH_SHIFT) &
+                            PL080_CTRL_WIDTH_MASK;
+        const uint64_t left = (uint64_t)(ch->ctrl & PL080_CTRL_SIZE_MASK)
+                              << (sw > 2u ? 0u : sw);
+        const uint64_t room = S5L_I2S_TX_FIFO_BYTES - i2s->tx_fill;
+        /* Nothing left, or room for all of it: the next refresh finishes the
+         * item unless the host sink holds it, so wake at the next frame. */
+        const uint64_t k = left > room
+            ? (left - room + S5L_I2S_FRAME_BYTES - 1u) / S5L_I2S_FRAME_BYTES
+            : 1u;
+        const uint32_t t = s5l_i2s_ticks_to_frame(i2s, k, m->tb_hz);
+        if (!t) continue;
+        if (!have || t < best) { best = t; have = true; }
+    }
+    if (!have) return S5L_WAKE_NEVER;
+    *ticks = best;
+    return S5L_WAKE_AT;
+}
+static s5l_wake_kind_t wake_edge_dmac0(const s5l8900_t *m, uint32_t *ticks) {
+    return wake_edge_dmac_n(m, 0u, ticks);
+}
+static s5l_wake_kind_t wake_edge_dmac1(const s5l8900_t *m, uint32_t *ticks) {
+    return wake_edge_dmac_n(m, 1u, ticks);
 }
 
 static const s5l_wake_source_t WAKE_SOURCES[] = {
@@ -1254,16 +1348,16 @@ static const s5l_wake_source_t WAKE_SOURCES[] = {
     { "spi1",  S5L8900_IRQ_SPI1,  wake_edge_spi1  },
     /* Group order, so entry k is group k. The lines are /arm-io/gpio's own
      * `interrupts` = {33,32,31,3,2,1,0}; group 4 -> VIC line 2 carries touch. */
-    { "gpio-group0", 33u, wake_edge_gpio },
-    { "gpio-group1", 32u, wake_edge_gpio },
-    { "gpio-group2", 31u, wake_edge_gpio },
-    { "gpio-group3",  3u, wake_edge_gpio },
-    { "gpio-group4",  2u, wake_edge_gpio },
-    { "gpio-group5",  1u, wake_edge_gpio },
-    { "gpio-group6",  0u, wake_edge_gpio },
+    { "gpio-group0", 33u, wake_edge_gpio0 },
+    { "gpio-group1", 32u, wake_edge_gpio1 },
+    { "gpio-group2", 31u, wake_edge_gpio2 },
+    { "gpio-group3",  3u, wake_edge_gpio3 },
+    { "gpio-group4",  2u, wake_edge_gpio4 },
+    { "gpio-group5",  1u, wake_edge_gpio5 },
+    { "gpio-group6",  0u, wake_edge_gpio6 },
     { "uart4-rx", S5L8900_IRQ_UART4, wake_edge_uart4 },
-    { "dmac0", S5L8900_IRQ_DMAC0, wake_edge_dmac },
-    { "dmac1", S5L8900_IRQ_DMAC1, wake_edge_dmac },
+    { "dmac0", S5L8900_IRQ_DMAC0, wake_edge_dmac0 },
+    { "dmac1", S5L8900_IRQ_DMAC1, wake_edge_dmac1 },
 };
 #define NWAKE_SOURCES (sizeof WAKE_SOURCES / sizeof WAKE_SOURCES[0])
 
@@ -2004,12 +2098,40 @@ static void s5l8900_refresh(s5l8900_t *m, uint32_t tb) {
      * request line below reads true rather than stale. */
     for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) s5l_spi_step(&m->spi[i]);
 
+    /*
+     * The I2S frame clocks, before the DMA controllers so that the frames
+     * that elapsed have already made room in the TX FIFOs they feed. Each
+     * clock also drives its GPIO-IC line: startTransfer() will not start DMA
+     * until it has seen two edges there. See the I2S block in soc.h.
+     *
+     * A refresh can cover many frames. The line only needs one rising edge to
+     * latch, so a refresh that crossed any pulses it and then leaves the wire
+     * at the clock's current level. A stopped clock drives nothing: nothing
+     * is on the wire until configure() has run.
+     */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        s5l_i2s_t *i2s = &m->i2s[i];
+        if (!s5l_i2s_clocking(i2s)) continue;
+        const unsigned line = i == 0u ? S5L_GPIOIC_LINE_I2S0
+                                      : S5L_GPIOIC_LINE_I2S1;
+        if (s5l_i2s_advance(i2s, tb, m->tb_hz)) {
+            s5l_gpioic_set_line(&m->gpioic, line, false);
+            s5l_gpioic_set_line(&m->gpioic, line, true);
+        }
+        s5l_gpioic_set_line(&m->gpioic, line,
+                            s5l_i2s_frame_level(i2s, m->tb_hz));
+    }
+
+    m->dma_bus_active = true;
     for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
         bool dmac_irq = s5l_pl080_run(&m->dmac[i], &m->bus, dma_dst_ready, m);
         s5l_vic_set_line(&m->vic[0],
                          i == 0u ? S5L8900_IRQ_DMAC0 : S5L8900_IRQ_DMAC1,
                          dmac_irq);
     }
+    m->dma_bus_active = false;
+    /* Frames the FIFO could not supply and DMA did not pay for are lost. */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) s5l_i2s_settle(&m->i2s[i]);
 
     /*
      * The GPIO interrupt cascade. Seven group outputs, seven VIC lines, and
@@ -2144,11 +2266,18 @@ static unsigned run_retirement_batch_limit(const s5l8900_t *m,
 #define S5L8900_CI_HORIZON_MAX_INSNS 16384u
 
 static bool horizon_devices_idle(const s5l8900_t *m) {
+    /* A channel feeding a running I2S frame clock's FIFO moves per frame
+     * edge, not per refresh, and a refresh that spans several frames moves
+     * what several refreshes would have (the credit in s5l_i2s_advance()).
+     * Its item ends are named by the dmac wake sources, so it does not stop
+     * the horizon. That matters: audio can play for as long as the guest
+     * runs. */
     for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
         const s5l_pl080_t *d = &m->dmac[i];
         if (!(d->config & PL080_CONFIG_EN)) continue;
         for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++)
-            if ((d->ch[c].cfg & (PL080_CFG_EN | PL080_CFG_HALT)) == PL080_CFG_EN)
+            if ((d->ch[c].cfg & (PL080_CFG_EN | PL080_CFG_HALT)) == PL080_CFG_EN &&
+                dmac_paced_fifo(m, &d->ch[c]) >= S5L8900_I2S_COUNT)
                 return false;
     }
     for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++)

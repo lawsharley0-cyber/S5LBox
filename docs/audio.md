@@ -657,3 +657,76 @@ has received 0 words. The report now also carries:
 
 The AMC kext's bytes are left out when their SHA-256 matches the copy already
 analysed.
+
+## 2026-09-24 Why DMA never started, and the frame clock (build d09d9b8 reports)
+
+In the three d09d9b8 reports, i2s0 received configure()'s seven writes and
+never the `6` that startTransfer() writes to +0x08. The DMA controllers had
+no channel pointed at 0x3ca00010. So startTransfer() returned before it
+started DMA. Its code (AppleS5L8900X, 0xc05a3928) is a wait:
+
+| Step | Address | What it does |
+|---|---|---|
+| 1 | 0xc05a3964 | state (this+0x8c) = 1 |
+| 2 | 0xc05a3980 | enable the nub's interrupt 0 (vtable +0x220) |
+| 3 | 0xc05a3998 | arm a timer from the command's timeout |
+| 4 | 0xc05a39a0 | commandSleep on the state word until it is 3 or 4 |
+| 5 | 0xc05a3a3c | only for state 3: start the DMA channel, then write 6 |
+
+The interrupt handler at 0xc05a3c2c moves state 1 to 2 on the first
+interrupt. On the second it stores 3, disables the interrupt and wakes the
+sleeper. The timer stores 4, which returns `kIOReturnNotReady`
+(0xe00002d8, "device is not ready"). An interrupted sleep returns
+`kIOReturnAborted` (0xe00002eb, "operation was aborted"). Those are the two
+messages every report carried.
+
+Interrupt 0 of the i2s0 nub is GPIO-IC line 0x86 (i2s1: 0xaa), and nothing
+in the emulator drove either line. That was the whole failure.
+
+**Inferred:** the line is the I2S frame (word-select) clock's pin. The
+handler reads no register and no time; it counts two edges and starts DMA.
+That is how DMA is usually lined up with a frame boundary.
+
+**What changed:**
+
+- Each I2S window runs a frame clock once configure() has set +0x00 bit 0.
+  The clock drives its GPIO-IC line: high for the first half of each frame.
+- The clock also drains the TX FIFO, one 4-byte frame per edge. The FIFO's
+  DMA request is asserted only while it has room. Before this, a started
+  channel would have moved its whole list in one refresh.
+- The host sink now gets whole 32-bit frames (left sample in the low half).
+  The `dma-channels` template 0x00249000 means 16-bit DMA stores. The old
+  path would have played each 16-bit store as a stereo frame.
+- The idle fast-forward and the cached interpreter's horizon know the new
+  edges. An unmasked frame-clock line names its next level change. A DMA
+  channel feeding the FIFO names the frame at which its current item ends.
+
+**Not decoded, and stated in soc.h:**
+
+- The rate is a nominal 44.1 kHz, which is what the app's output assumes.
+  +0x04 = 0x01100301 in every report, and nothing says which field is a
+  divider.
+- The FIFO depth is 64 bytes. The driver never reads a FIFO level.
+- 16-bit stereo frames.
+
+The wait's handler cannot observe the rate or the depth. They only set the
+pace of the audio.
+
+Snapshots are v33: the clock phase and the FIFO state are guest state.
+
+**What the next report should show if this worked:**
+
+- i2s0 +0x08 = 6.
+- A dmac channel with dst 0x3ca00010.
+- "frame clock running".
+- A rising frames count and non-zero "frames to host".
+- No "could not start DMA" lines.
+
+If the lines are gone and the sound is still silent, look next at the app's
+"Guest I2S0" line: words received, how many were non-zero, and underruns. The
+app plays whatever reaches I2S0; the codec's own registers do not gate it.
+
+Tests: `core/tests/test_audio_dma.c` (153 checks, including a replay of
+startTransfer()'s two-edge wait and a WFI-sized refresh that must equal
+per-tick refreshes). Three hand mutants were all caught: no pulse on a
+multi-frame refresh, FIFO room ignored, and the DMA wake source removed.

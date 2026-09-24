@@ -131,8 +131,11 @@ SNAP_SIZE_GUARD(s5l_i2c_t,         320,   "snap_i2c");
 SNAP_SIZE_GUARD(s5l_pcf50635_t,    600,   "snap_pmu");
 SNAP_SIZE_GUARD(s5l_wm8991_t,      496,   "snap_codec");
 /* 128 = 104 + the audio tx callback, context, and tx_words counter (24).
- * Host wiring, not serialized. */
-SNAP_SIZE_GUARD(s5l_i2s_t,         128,   "snap_i2s");
+ * Host wiring, not serialized. 192 adds tx_frames (host-side, not serialised),
+ * the v33 frame clock and TX FIFO (phase, frames, fill, pack, pack length,
+ * underrun, overrun; serialised) and tx_credit (zero outside a refresh, not
+ * serialised). */
+SNAP_SIZE_GUARD(s5l_i2s_t,         192,   "snap_i2s");
 SNAP_SIZE_GUARD(s5l_spi_t,         240,   "snap_spi");
 /* Four register banks, plus what the board is driving and which lines it
  * drives at all -- see the `driven` note in soc.h. */
@@ -221,10 +224,14 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * diagnostic like the access logs, outside snap_mach().
  * 129712 adds the host-only PCM-path log (32 x 40 + 8) and its pc range
  * (lo, hi, count): diagnostics again, outside snap_mach().
- * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
+ * SNAPSHOT_VERSION and the bytes on disk do not move for any of those.
+ * 129840 is the exception: the two I2S windows grew by 64 bytes each (see
+ * the s5l_i2s_t guard), and their frame clock and FIFO ARE in snap_i2s(), so
+ * this one is v33. The host-only dma_bus_active flag sits in the tail
+ * padding after ci_horizon_idle and does not change the size. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         129712, "snap_mach");
+SNAP_SIZE_GUARD(s5l8900_t,         129840, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -828,7 +835,10 @@ static bool codec_state_valid(const s5l_wm8991_t *c) {
 }
 
 static bool i2s_state_valid(const s5l_i2s_t *s) {
-    return s && s->unknown_off_count <= S5L_I2S_UNKNOWN_OFF;
+    return s && s->unknown_off_count <= S5L_I2S_UNKNOWN_OFF &&
+           s->tx_fill <= S5L_I2S_TX_FIFO_BYTES &&
+           s->tx_pack_len < S5L_I2S_FRAME_BYTES &&
+           (s->tx_pack >> (8u * s->tx_pack_len)) == 0u;
 }
 
 static void snap_codec(sn_io_t *io, s5l_wm8991_t *c) {
@@ -854,6 +864,13 @@ static void snap_i2s(sn_io_t *io, s5l_i2s_t *s) {
     F64(s->unknown_reads); F64(s->unknown_writes);
     FA32(s->unknown_off, S5L_I2S_UNKNOWN_OFF);
     F32(s->unknown_off_count);
+    /* v33: the frame clock and the TX FIFO it drains. tx_credit is not here:
+     * it is zero outside a refresh. The partial frame for the host sink is,
+     * so a restore does not shift every later sample by a halfword. */
+    F64(s->fclk_phase); F64(s->frames);
+    F32(s->tx_fill); F32(s->tx_pack); F32(s->tx_pack_len);
+    F64(s->tx_underrun); F64(s->tx_overrun);
+    if (sn_reading(io) && io->err == SNAP_OK) s->tx_credit = 0;
     if (sn_reading(io) && io->err == SNAP_OK && !i2s_state_valid(s))
         io->err = SNAP_ERR_CORRUPT;
 }

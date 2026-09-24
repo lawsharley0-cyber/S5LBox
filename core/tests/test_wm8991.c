@@ -514,7 +514,10 @@ static void test_i2s_describe_shows_storage_and_strays(void) {
           strstr(text, "+0x3c=0x00000001") != NULL, "storage:\n%s", text);
     CHECK(strstr(text, "1 reads, 2 writes, 1/0 to other offsets at +0x38") != NULL,
           "counts:\n%s", text);
-    CHECK(strstr(text, "TX FIFO words 0") != NULL, "FIFO words:\n%s", text);
+    CHECK(strstr(text, "TX FIFO stores 0, frames to host 0") != NULL,
+          "FIFO stores:\n%s", text);
+    CHECK(strstr(text, "frame clock stopped, 0 frames; TX FIFO 0/64 bytes") != NULL,
+          "frame clock:\n%s", text);
     char tiny[12];
     n = s5l_i2s_describe(&i2s, "i2s0", tiny, sizeof tiny);
     CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
