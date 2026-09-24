@@ -190,6 +190,35 @@ functions, and the hottest single addresses. With N samples a share p has a
 standard error of about sqrt(p(1−p)/N): at 3,000 samples a 10% entry is
 10 ± 0.5%.
 
+### 2b. Everything from one session — "Save Full Test Report"
+
+The emulator menu's *Save Full Test Report* writes
+`Documents/Reports/S5LBox-test-<time>.txt` (Files app → S5LBox → Reports) and
+offers the share sheet. It holds, in order: the Performance & Sound text; the
+machine's name and recorded graphics mode; the whole console scrollback; the
+guest profile (which, like *Copy Guest Profile*, starts a new window); and the
+audio section:
+
+- the whole kext (or both kexts) whose code touched AMC or its SRAM, copied
+  from guest RAM and trimmed to the kext's extent from the kernelcache's
+  prelink map, with every kernel function it references by name
+  (`app/Sources/VMDriverDump.c` finds ARM B/BL/BLX, Thumb BL/BLX pairs and
+  vtable/literal words; only exact symbol entries are printed);
+- the AMC registers the driver left non-zero, and the SRAM's non-empty 1 KiB
+  chunks by offset.
+
+Binary images are raw DEFLATE in base64. To get the bytes back:
+
+```python
+import base64, zlib
+raw = zlib.decompress(base64.b64decode(text), -15)   # "deflate-raw+base64"
+```
+
+The kext's `va=` is where the bytes start, so a disassembler pointed at that
+base reproduces the kernel's own addresses (`capstone`, ARM and Thumb). The
+bytes are the user's firmware: read them in a scratch directory and never
+commit them.
+
 ---
 
 ## 3. "Make the loop bearable" — snapshot and restore
