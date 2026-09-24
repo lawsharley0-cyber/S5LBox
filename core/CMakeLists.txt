@@ -56,6 +56,7 @@ add_library(emucore STATIC
     src/firmware/lzss.c
     src/firmware/macho.c
     src/firmware/ksyms.c
+    src/firmware/guest_profile.c
     src/boot/bringup.c
     # The host's PPP peer (docs/networking.md §10, N2). It belongs in emucore
     # rather than in a host-tool target for the reason the header states: it has
@@ -1460,6 +1461,10 @@ add_test(NAME cached_interpreter_differential COMMAND test_ci_diff 10000)
 add_executable(test_ci_translation tests/test_ci_translation.c)
 target_link_libraries(test_ci_translation PRIVATE emucore)
 add_test(NAME cached_interpreter_translation COMMAND test_ci_translation)
+add_executable(test_guest_profile tests/test_guest_profile.c)
+target_link_libraries(test_guest_profile PRIVATE emucore)
+add_test(NAME guest_profile COMMAND test_guest_profile)
+
 add_executable(test_ci_timeline tests/test_ci_timeline.c)
 target_link_libraries(test_ci_timeline PRIVATE emucore)
 add_test(NAME cached_interpreter_timeline COMMAND test_ci_timeline)

@@ -41,6 +41,9 @@
 #import "VMFramePublication.h"
 #import "VMAudioOutput.h"
 #import "arm_ci.h"
+#import "guest_profile.h"
+#import "ksyms.h"
+#import "rootfs_work.h"
 
 #import <CommonCrypto/CommonDigest.h>
 #import <mach/mach.h>
@@ -309,6 +312,19 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     uint32_t                _diagAudioPcLo, _diagAudioPcHi;
     uint64_t                _diagAudioAccesses;
     NSString               *_diagBackendNote;  /* why the cached interpreter is off */
+    /*
+     * The guest profile (guest_profile.h): the guest pc after every full
+     * chunk, i.e. one sample per kVMChunkInstructions retired. Its own lock,
+     * so a sample never waits on the UI formatting the status line; taken by
+     * the emulator thread a few thousand times a second, uncontended.
+     * _profileShort counts chunks that ended early (guest idle, a stop) and
+     * so were not sampled.
+     */
+    pthread_mutex_t         _profileLock;
+    BOOL                    _profileReady;
+    gprof_t                 _profile;
+    uint64_t                _profileShort;
+    uint64_t                _profileSinceNs;
 }
 
 + (uint64_t)physFootprintBytes {
@@ -335,6 +351,11 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     _mode    = @"";
     _bringUpNote = @"";
     _instanceID = [identifier copy];
+    if (pthread_mutex_init(&_profileLock, NULL) == 0) {
+        _profileReady = gprof_init(&_profile, 17u);
+        if (!_profileReady) pthread_mutex_destroy(&_profileLock);
+    }
+    _profileSinceNs = vm_now_ns();
     return self;
 }
 
@@ -345,6 +366,10 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     [_audioOutput stop];
     _audioOutput = nil;
     free(_snapshot);
+    if (_profileReady) {
+        gprof_free(&_profile);
+        pthread_mutex_destroy(&_profileLock);
+    }
     if (_lockReady) pthread_mutex_destroy(&_lock);
 }
 
@@ -1831,8 +1856,20 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 
             {
                 const uint64_t t0 = vm_now_ns();
-                retired += s5l8900_run(&_machine, kVMChunkInstructions, &status);
+                const unsigned ran =
+                    s5l8900_run(&_machine, kVMChunkInstructions, &status);
+                retired += ran;
                 runNs += vm_now_ns() - t0;
+                if (_profileReady) {
+                    pthread_mutex_lock(&_profileLock);
+                    if (ran == kVMChunkInstructions && status == ARM_OK)
+                        gprof_note(&_profile, _machine.cpu.r[15],
+                                   (_machine.cpu.cpsr & ARM_CPSR_MODE_MASK) ==
+                                       ARM_MODE_USR);
+                    else
+                        _profileShort++;
+                    pthread_mutex_unlock(&_profileLock);
+                }
             }
 
             /* Taken here precisely because the chunk has ENDED: the machine is
@@ -2344,6 +2381,233 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
         @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x accesses=%llu\n%@\n",
         start, end - start, hex, lo, hi, (unsigned long long)accesses,
         [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+}
+
+/*
+ * WHERE THE GUEST'S INSTRUCTIONS WENT: the pcs sampled since the previous
+ * call (or since this engine was made), named by library and function.
+ *
+ * Kernel addresses are named from the imported kernelcache (ksyms.h: kernel
+ * symbols, and which prelinked kext owns an address). User addresses are
+ * named from the dyld shared cache FILE on the pristine rootfs.img -- every
+ * framework and libSystem lives there, at the same address in every process
+ * -- read-only, the same way the Crash Logs screen reads the work image.
+ * Code nothing can name is reported as its 256-byte block, with the address,
+ * rather than attributed to the nearest symbol.
+ *
+ * Each sample stands for kVMChunkInstructions retired instructions, so a
+ * share of samples is a share of guest instructions. Chunks that ended early
+ * (the guest went idle, or the run stopped) are counted, not sampled: this is
+ * a profile of busy time.
+ */
+static NSString *VMProfileBlock(uint32_t pc) {
+    return [NSString stringWithFormat:@"code @0x%08x (256 B)", pc & ~0xffu];
+}
+
+static void VMProfileAdd(NSMutableDictionary<NSString *, NSNumber *> *d,
+                         NSString *key, uint64_t n) {
+    d[key] = @(d[key].unsignedLongLongValue + n);
+}
+
+static NSArray<NSString *> *VMProfileTop(NSDictionary<NSString *, NSNumber *> *d,
+                                         NSUInteger limit) {
+    NSArray<NSString *> *keys = [d keysSortedByValueUsingComparator:
+        ^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+    return keys.count > limit ? [keys subarrayWithRange:NSMakeRange(0, limit)] : keys;
+}
+
+static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunks,
+                                      double seconds, NSString *firmwareDir,
+                                      NSString *revision) {
+    NSMutableString *out = [NSMutableString string];
+    const uint64_t kept = window->samples - window->dropped;
+    [out appendFormat:
+        @"S5LBox guest profile (the guest pc sampled after every %u retired instructions)\n"
+        @"Build: %@\nWindow: %.1f s, %llu samples = %.1f M instructions; %llu shorter chunks (guest idle or a stop) not sampled\n",
+        kVMChunkInstructions, revision, seconds,
+        (unsigned long long)window->samples,
+        window->samples * (double)kVMChunkInstructions / 1e6,
+        (unsigned long long)shortChunks];
+    if (!window->samples) {
+        [out appendString:@"\nNo samples yet. Use the guest for 30-60 seconds, then copy the profile again.\n"];
+        return out;
+    }
+    [out appendFormat:@"User mode %.1f%%, kernel %.1f%%; %llu samples dropped (table full)\n",
+        100.0 * window->user / window->samples,
+        100.0 * (window->samples - window->user) / window->samples,
+        (unsigned long long)window->dropped];
+
+    /* Names: the kernelcache for kernel pcs. ksyms points into these bytes,
+     * so they must outlive every ksyms call below, not just the last use ARC
+     * can see. */
+    NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
+    ksyms_t *ks = NULL;
+    BOOL ksLoaded = NO;
+    if (firmwareDir.length) {
+        kernel = [NSData dataWithContentsOfFile:
+                     [firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_KERNEL_FILE]
+                                        options:NSDataReadingMappedIfSafe error:NULL];
+        ks = kernel.length ? calloc(1, sizeof *ks) : NULL;
+        if (ks) {
+            (void)ksyms_load(ks, kernel.bytes, kernel.length);
+            ksLoaded = YES;
+        }
+    }
+    if (ksLoaded)
+        [out appendFormat:@"Kernel names: %u symbols (%s), %u kexts (%s)\n",
+            ks->nsym, ksyms_strerror(ks->sym_status), ks->nkext,
+            ksyms_strerror(ks->prelink_status)];
+    else
+        [out appendString:@"Kernel names: unavailable (no imported kernel.macho)\n"];
+
+    /* ...and the dyld shared cache for user pcs. */
+    static const char kCachePath[] =
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv6";
+    uint8_t *cacheBytes = NULL;
+    gprof_cache_t cache;
+    BOOL cacheOpen = NO;
+    memset(&cache, 0, sizeof cache);
+    char rootfs[VM_FW_BOOT_PATH_CAPACITY];
+    rootfs_work_result_t *rr = calloc(1, sizeof *rr);
+    if (rr && firmwareDir.length &&
+        [[firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_ROOTFS_FILE]
+            getFileSystemRepresentation:rootfs maxLength:sizeof rootfs]) {
+        size_t got = 0;
+        uint64_t size = 0;
+        rootfs_work_status_t rs =
+            rootfs_work_read_file(rootfs, kCachePath, NULL, 0, &got, &size, rr);
+        if (rs == ROOTFS_WORK_OK && size && size <= (UINT64_C(512) << 20)) {
+            cacheBytes = malloc((size_t)size);
+            if (cacheBytes)
+                rs = rootfs_work_read_file(rootfs, kCachePath, cacheBytes,
+                                           (size_t)size, &got, &size, rr);
+        }
+        if (rs == ROOTFS_WORK_OK && cacheBytes && got) {
+            cacheOpen = gprof_cache_open(&cache, cacheBytes, got);
+            [out appendFormat:@"User names: dyld shared cache, %.1f MB, %u images%s%s\n",
+                got / 1048576.0, cacheOpen ? cache.nimage : 0u,
+                cache.detail[0] ? "; " : "", cache.detail];
+        } else {
+            [out appendFormat:@"User names: unavailable (%s: %s)\n",
+                rootfs_work_status_name(rs), rr->detail[0] ? rr->detail : "no detail"];
+        }
+    } else {
+        [out appendString:@"User names: unavailable (no imported rootfs.img)\n"];
+    }
+    free(rr);
+
+    NSMutableDictionary<NSString *, NSNumber *> *images = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSNumber *> *functions = [NSMutableDictionary dictionary];
+    NSMutableArray<NSNumber *> *hot = [NSMutableArray array];   /* slot indices */
+    for (uint32_t i = 0; i < window->cap; i++) {
+        const gprof_slot_t *slot = &window->slot[i];
+        if (!slot->count) continue;
+        const uint32_t pc = slot->pc;
+        NSString *image = nil, *function = nil;
+        if (pc >= 0xffff0000u) {
+            image = @"exception vectors";
+            function = VMProfileBlock(pc);
+        } else if (pc >= 0xc0000000u) {
+            const kext_t *kext = ksLoaded ? ksyms_kext_at(ks, pc) : NULL;
+            if (kext) {
+                image = [NSString stringWithUTF8String:kext->bundle] ?: @"(kext)";
+                function = VMProfileBlock(pc);
+            } else {
+                char name[256];
+                const char *r = ksLoaded ? ksyms_resolve(ks, pc, name, sizeof name) : "?";
+                image = @"mach_kernel";
+                if (r[0] == '?' || !strncmp(r, "__PRELINK_TEXT", 14)) {
+                    function = VMProfileBlock(pc);
+                } else {
+                    const char *plus = strstr(r, "+0x");
+                    function = [[NSString alloc] initWithBytes:r
+                        length:plus ? (NSUInteger)(plus - r) : strlen(r)
+                        encoding:NSUTF8StringEncoding] ?: VMProfileBlock(pc);
+                }
+            }
+        } else {
+            gprof_image_t *img = cacheOpen ? gprof_cache_image_at(&cache, pc) : NULL;
+            if (img) {
+                uint32_t off = 0;
+                const char *sym = gprof_cache_symbolize(&cache, img, pc, 0x8000u, &off);
+                image = [NSString stringWithUTF8String:gprof_basename(img->path)] ?: @"(image)";
+                function = sym ? ([NSString stringWithUTF8String:sym] ?: VMProfileBlock(pc))
+                               : VMProfileBlock(pc);
+            } else if (pc >= 0x2fe00000u && pc < 0x30000000u) {
+                image = @"dyld (by address)";
+                function = VMProfileBlock(pc);
+            } else {
+                image = @"user code outside the shared cache (app or plugin)";
+                function = VMProfileBlock(pc);
+            }
+        }
+        VMProfileAdd(images, image, slot->count);
+        VMProfileAdd(functions, [NSString stringWithFormat:@"%@  %@", image, function],
+                     slot->count);
+        [hot addObject:@(i)];
+    }
+    [hot sortUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        uint32_t ca = window->slot[a.unsignedIntValue].count;
+        uint32_t cb = window->slot[b.unsignedIntValue].count;
+        return ca == cb ? NSOrderedSame : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
+    }];
+
+    const double total = (double)kept;
+    [out appendString:@"\nBy library / kext (share of sampled instructions)\n"];
+    for (NSString *key in VMProfileTop(images, 16))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * images[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nBy function\n"];
+    for (NSString *key in VMProfileTop(functions, 40))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * functions[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nHottest single addresses\n"];
+    for (NSUInteger i = 0; i < hot.count && i < 12; i++) {
+        const gprof_slot_t *slot = &window->slot[hot[i].unsignedIntValue];
+        [out appendFormat:@"%6.2f%%  0x%08x\n", 100.0 * slot->count / total, slot->pc];
+    }
+
+    if (cacheOpen) gprof_cache_close(&cache);
+    free(cacheBytes);
+    if (ksLoaded) ksyms_free(ks);
+    free(ks);
+    return out;
+}
+
+- (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion {
+    if (!completion) return;
+    gprof_t *window = calloc(1, sizeof *window);
+    BOOL have = NO;
+    uint64_t shortChunks = 0, sinceNs = 0;
+    const uint64_t nowNs = vm_now_ns();
+    if (_profileReady && window && gprof_init(window, 17u)) {
+        pthread_mutex_lock(&_profileLock);
+        have = gprof_copy(window, &_profile);
+        shortChunks = _profileShort;
+        sinceNs = _profileSinceNs;
+        if (have) {
+            gprof_reset(&_profile);
+            _profileShort = 0;
+            _profileSinceNs = nowNs;
+        }
+        pthread_mutex_unlock(&_profileLock);
+    }
+    if (!have) {
+        if (window) gprof_free(window);
+        free(window);
+        completion(@"The guest profile is unavailable: its table could not be allocated.");
+        return;
+    }
+    NSString *firmwareDir = [[VMSettings sharedSettings] firmwareDirectory];
+    NSString *revision = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"S5LBoxSourceRevision"] ?: @"development";
+    const double seconds = (nowNs - sinceNs) / 1e9;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *text;
+        @autoreleasepool {
+            text = VMGuestProfileReport(window, shortChunks, seconds, firmwareDir, revision);
+        }
+        gprof_free(window);
+        free(window);
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(text); });
+    });
 }
 
 - (NSString *)audioStatusDescription {

@@ -160,6 +160,36 @@ address you can disassemble, where "66.9% in AppleMBX" is not.
 If the kext map fails to build, the boot log prints a banner saying why, with a
 byte offset. A silently empty map is exactly what would waste the next cycle.
 
+### 2a. The same question on the phone — "Copy Guest Profile"
+
+The app samples the guest PC after every full 100,000-instruction chunk
+(`core/include/guest_profile.h`, sampled in `VMEngine.m`'s run loop), so one
+sample stands for 100,000 retired guest instructions. Chunks that end early —
+the guest went idle, or the run stopped — are counted but not sampled: the
+profile describes busy time, not idle time.
+
+*Performance & Sound → Copy Guest Profile* closes the current window, names
+it, copies it and opens the next window. To profile one activity: copy once
+and discard it, do the activity for 30–60 s, then copy again.
+
+Names come from two files already imported, both read-only:
+
+- kernel PCs: `kernel.macho` through `ksyms.h`, the same as above. Kext code
+  cannot be named past its bundle id, so it is reported as a 256-byte block with
+  its address (`com.apple.driver.AppleMBX  code @0xc0712300 (256 B)`).
+- user PCs: the dyld shared cache
+  (`/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv6`), read out
+  of the pristine `rootfs.img` with `rootfs_work_read_file()`. Every framework
+  and libSystem lives in it at the same address in every process, and each
+  image keeps its own `LC_SYMTAB`, so user code resolves to library and
+  function. Code outside the cache (the app itself, a plugin) is reported by
+  block.
+
+The report gives the kernel/user split, the top libraries and kexts, the top
+functions, and the hottest single addresses. With N samples a share p has a
+standard error of about sqrt(p(1−p)/N): at 3,000 samples a 10% entry is
+10 ± 0.5%.
+
 ---
 
 ## 3. "Make the loop bearable" — snapshot and restore

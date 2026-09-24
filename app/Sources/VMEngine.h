@@ -146,6 +146,13 @@ typedef void (^VMEngineStopCompletion)(void);
  * register protocol. Read from guest RAM; nothing is stored. */
 - (NSString *)audioDriverExcerpt;
 
+/* Where the guest's instructions went since the previous call (or since the
+ * engine was made): sampled pcs named by library and function, from the
+ * imported kernelcache and the root filesystem's dyld shared cache. Each call
+ * starts a new window. Symbolization reads files, so it runs off the calling
+ * thread; `completion` is called on the main queue. */
+- (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion;
+
 /*
  * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
  * the build-time compact AArch64 engine compiled in, this forces every guest

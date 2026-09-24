@@ -1226,6 +1226,26 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         handler:^(__unused UIAlertAction *action) {
             UIPasteboard.generalPasteboard.string = [engine audioDriverExcerpt] ?: @"No machine";
         }]];
+    /* Each copy closes one profile window and opens the next, so the way to
+     * profile one activity is: copy (discard), do it, copy again. */
+    __weak EmulatorViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy Guest Profile" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) {
+            if (!engine) {
+                UIPasteboard.generalPasteboard.string = @"No machine";
+                return;
+            }
+            [engine guestProfileReportWithCompletion:^(NSString *profile) {
+                UIPasteboard.generalPasteboard.string = profile;
+                EmulatorViewController *strongSelf = weakSelf;
+                if (!strongSelf || strongSelf.presentedViewController) return;
+                UIAlertController *copied = [UIAlertController alertControllerWithTitle:@"Guest Profile Copied"
+                    message:[@"A new profile window starts now.\n\n" stringByAppendingString:profile]
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [copied addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
+                [strongSelf presentViewController:copied animated:YES completion:nil];
+            }];
+        }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
