@@ -2328,11 +2328,8 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     NSMutableString *hex = [NSMutableString string];
     for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
     return [NSString stringWithFormat:
-        @"S5LBox audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)
-"
-        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x
-%@
-",
+        @"S5LBox audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"
+        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x\n%@\n",
         start, end - start, hex, lo, hi,
         [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
 }
