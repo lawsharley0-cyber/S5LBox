@@ -2690,13 +2690,80 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
     return out;
 }
 
+/*
+ * The audio block's own storage as the driver left it. AMC and its SRAM are
+ * storage stubs (machine.c), not device models, so this is exactly what the
+ * kernel wrote: the AMC registers as a list of the non-zero ones, and the
+ * SRAM as its non-empty 1 KiB chunks -- whatever the driver uploaded there,
+ * firmware or samples. Copied under no lock: the emulator may be writing,
+ * and for a diagnostic a torn word is acceptable.
+ */
+static NSData *VMStubBytes(const s5l8900_t *m, uint32_t base) {
+    for (unsigned i = 0; i < m->stub_count && i < S5L_STUB_MAX; i++) {
+        const s5l_stub_t *st = &m->stubs[i];
+        if (st->base != base || !st->regs || !st->nregs) continue;
+        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)st->nregs * 4u];
+        uint8_t *out = d.mutableBytes;
+        for (uint32_t r = 0; r < st->nregs; r++) {          /* byte i at bits 8i */
+            const uint32_t w = st->regs[r];
+            out[4u * r] = (uint8_t)w;          out[4u * r + 1u] = (uint8_t)(w >> 8);
+            out[4u * r + 2u] = (uint8_t)(w >> 16); out[4u * r + 3u] = (uint8_t)(w >> 24);
+        }
+        [d setLength:st->size];
+        return d;
+    }
+    return nil;
+}
+
+static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
+    NSMutableString *out = [NSMutableString stringWithString:
+        @"AUDIO BLOCK STATE (what the kernel wrote to AMC and its SRAM; storage stubs, not a device model)\n"];
+    if (!amc) [out appendString:@"amc: no storage window on this machine\n"];
+    else {
+        const uint8_t *b = amc.bytes;
+        unsigned nonzero = 0;
+        NSMutableString *regs = [NSMutableString string];
+        for (NSUInteger off = 0; off + 4u <= amc.length; off += 4u) {
+            const uint32_t v = (uint32_t)b[off] | (uint32_t)b[off + 1u] << 8 |
+                               (uint32_t)b[off + 2u] << 16 | (uint32_t)b[off + 3u] << 24;
+            if (!v) continue;
+            nonzero++;
+            [regs appendFormat:@"  +0x%04lx = 0x%08x\n", (unsigned long)off, v];
+        }
+        [out appendFormat:@"amc 0x%08x len 0x%lx: %u non-zero registers\n%@",
+            S5L8900_AMC_BASE, (unsigned long)amc.length, nonzero, regs];
+    }
+    if (!sram) [out appendString:@"sram: no storage window on this machine\n"];
+    else {
+        const uint8_t *b = sram.bytes;
+        NSMutableString *chunks = [NSMutableString string];
+        unsigned kept = 0;
+        for (NSUInteger off = 0; off < sram.length; off += 1024u) {
+            const NSUInteger len = MIN((NSUInteger)1024u, sram.length - off);
+            BOOL any = NO;
+            for (NSUInteger i = 0; i < len && !any; i++) any = b[off + i] != 0;
+            if (!any) continue;
+            kept++;
+            NSData *chunk = [NSData dataWithBytes:b + off length:len];
+            [chunks appendFormat:@"@+0x%05lx\n%@\n", (unsigned long)off,
+                [chunk base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+        }
+        [out appendFormat:@"sram 0x%08x len 0x%lx: %u non-empty 1 KiB chunks (base64, each after its offset)\n%@",
+            S5L8900_SRAM_BASE, (unsigned long)sram.length, kept, chunks];
+    }
+    return out;
+}
+
 - (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion {
     if (!completion) return;
+    NSData *amcBytes = VMStubBytes(&_machine, S5L8900_AMC_BASE);
+    NSData *sramBytes = VMStubBytes(&_machine, S5L8900_SRAM_BASE);
     uint32_t lo = 0, hi = 0;
     uint64_t accesses = 0;
     if (![self audioPcRangeLo:&lo hi:&hi accesses:&accesses]) {
-        completion(@"AUDIO DRIVER: no kernel code has touched the audio block in this run "
-                   @"(play a ringtone in Settings > Sounds first).\n");
+        completion([@"AUDIO DRIVER: no kernel code has touched the audio block in this run "
+                    @"(play a ringtone in Settings > Sounds first).\n\n"
+                    stringByAppendingString:VMAudioBlockText(amcBytes, sramBytes)]);
         return;
     }
     const uint32_t kbase = 0xc0000000u, pbase = 0x08000000u;
@@ -2755,6 +2822,7 @@ static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t le
                                                    ks)];
             }
             VMFreeKernelSymbols(ks);
+            [out appendFormat:@"\n%@", VMAudioBlockText(amcBytes, sramBytes)];
         }
         dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
     });
