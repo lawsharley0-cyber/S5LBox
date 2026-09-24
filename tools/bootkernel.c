@@ -429,6 +429,7 @@ typedef struct {
     bool baseband;
     bool spi2;
     bool usb_otg;
+    bool amc;
     bool multitouch;
     bool framebuffer;
     bool iomfb_display;
@@ -517,6 +518,12 @@ static const boot_toggle_t BOOT_TOGGLES[] = {
       "8.73e9 instructions. Un-matching it costs boot progress -- daemons\n"
       "retry against absent USB -- but it is the only configuration observed\n"
       "to run past that panic." },
+    { "amc", NULL, NULL, true, BOOT_GROUP_HARDWARE, BOOT_FIELD(amc),
+      "leave /arm-io/amc matched (the default here, so recorded runs keep\n"
+      "their meaning). AppleAMC_r1 is the hardware AAC/MP3 decoder, and its\n"
+      "DSP is not modelled: every hardware decode fails its reset asserts and\n"
+      "produces no samples. --no-amc hides it, as the phone app does by\n"
+      "default, so the guest has only its software decoders to use." },
     { "multitouch", NULL, NULL, false, BOOT_GROUP_HARDWARE,
       BOOT_FIELD(multitouch),
       "leave /arm-io/spi1/multi-touch matched. OFF BY DEFAULT SINCE\n"
@@ -36630,6 +36637,12 @@ external_md_work_ready:
          */
         if (!want_usb_otg)
             dt_unmatch(dt, dt_n, "arm-io/usb-otg");
+        /* The hardware AAC/MP3 decoder. Its DSP is not modelled, so a matched
+         * AppleAMC_r1 takes every hardware decode and returns nothing; hidden,
+         * the guest's audio stack has only software decoders. docs/audio.md,
+         * "2026-09-24 The PCM path runs, and plays silence". */
+        if (!cfg.v.amc)
+            dt_unmatch(dt, dt_n, "arm-io/amc");
         /*
          * --jb-codesign's device-tree half. PE_i_can_has_debugger() reads
          * /chosen/debug-enabled, and the three boot-args tokens appended above

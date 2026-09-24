@@ -67,6 +67,11 @@ static const vm_option_t VM_OPTIONS[] = {
       "Off: AppleSynopsysOTGDevice reads unmodelled configuration registers, "
       "derives a self-inconsistent endpoint count and panics.",
       false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
+    { "amc", "Audio decoder  ·  /arm-io/amc",
+      "Off: AppleAMC_r1 is Apple's hardware AAC/MP3 decoder and its DSP is "
+      "not modelled, so a ringtone sent to it fails and plays silence. Hidden, "
+      "the guest has only its software decoders to use.",
+      false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
     { "multitouch", "Touchscreen  ·  /arm-io/spi1/multi-touch",
       "On. The digitizer is bootloaded exactly as the real part is -- Apple's "
       "own driver reports \"downloaded 54156 bytes of firmware data in "
@@ -134,7 +139,7 @@ static const char *const VM_OPTION_GROUP_NOTE[VM_OPT_GROUP_COUNT] = {
     "Device-tree hardware presented to the guest. Touch is present by default. "
     "MBX is now a working but not finally accepted experiment; SHA-1, baseband, "
     "SPI2 and USB remain hidden because their individual rows name measured "
-    "boot failures. The guest therefore still sees less hardware than a real "
+    "boot failures, and the audio decoder because it plays silence. The guest therefore still sees less hardware than a real "
     "iPhone in the default configuration.",
 
     "Work iBoot would have done, done by the emulator instead because it jumps "

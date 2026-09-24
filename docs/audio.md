@@ -730,3 +730,48 @@ Tests: `core/tests/test_audio_dma.c` (153 checks, including a replay of
 startTransfer()'s two-edge wait and a WFI-sized refresh that must equal
 per-tick refreshes). Three hand mutants were all caught: no pulse on a
 multi-frame refresh, FIFO room ignored, and the DMA wake source removed.
+
+## 2026-09-24 The PCM path runs, and plays silence (build 12b2cba)
+
+The first device report with the frame clock (CPU graphics, Settings >
+Sounds, 76.7 s window):
+
+| Measurement | Value |
+|---|---|
+| "could not start DMA" lines | none |
+| i2s0 frame clock | running, 1,687,315 frames |
+| DMA into 0x3ca00010 (dmac0 ch2, 16-bit stores) | 2,918,160 stores, 5,836,320 bytes, 1,423 items, 90 completions |
+| Frames handed to the app | 1,459,080 |
+| App: words received / non-zero | 1,459,080 / **0** |
+| startTransfer/stop writes to +0x08 | 98 |
+
+So startTransfer() now gets its two edges, DMA runs, and every sample in
+the buffer it reads is zero. The DMA reads guest RAM, so those zeros are
+what the guest put in its output buffer.
+
+Each ringtone tap in the same report logs AppleAMC_r1 assertions (lines 350,
+565, 726, 2097). The AMC kext's own tables are named `aacd_*` and `mp3d_*`:
+it is the hardware AAC/MP3 decoder. Ringtones are AAC. With the DSP
+unmodelled, the hardware decode fails and nothing is mixed into the output
+buffer. The PCM engine keeps running and plays silence.
+
+**Change:** the app now hides `/arm-io/amc` by default (switch "amc", Guest
+hardware). AppleAMC_r1 then never matches, and the guest has no hardware
+decoder to pick.
+
+**Expected, not yet observed:** iPhone OS 3 decodes AAC and MP3 in software
+when no hardware decoder is available, so ringtones should reach the PCM
+path. The next report settles it. If the samples are still all zero with the
+AMC hidden, the zeros come from somewhere else.
+
+bootkernel has the same switch (`--no-amc`) but leaves the AMC matched by
+default, so the ~60 recorded desktop runs keep their meaning.
+
+**Two limits of the underrun counter:**
+
+- The clock keeps running while the audio engine is stopped (stop() writes
+  +0x08 = 0). So "underrun" also counts idle time, and 912,940 bytes is not
+  a measure of gaps during playback.
+- Guest time ran at 0.77x wall time in this report. The app plays at 44.1 kHz
+  of wall time, so it will underrun whenever the guest runs slower than real
+  time. That is a speed limit, not an audio-model one.
