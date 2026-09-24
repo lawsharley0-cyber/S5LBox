@@ -44,7 +44,9 @@ first step below.
 ## 3. Order of work (smallest risk first)
 
 1. **Decide the target device** (§1) and **answer the GPU question** with a
-   written design, as `ROADMAP.md` P2 already requires.
+   written design, as `ROADMAP.md` P2 already requires. The target is the
+   iPhone 3GS on iOS 6.1.6 (chosen 2026-09-24); the design note and the
+   firmware questions that decide it are in `IOS6_GRAPHICS.md`.
 2. **ARMv7 CPU profile in the reference interpreter**: Thumb-2 decode, IT
    blocks, VMSAv7, barriers, LDREX B/H/D, the v7 CP15 set, VFPv3/NEON as
    needed. Pure CPU work, testable in CI with no firmware: extend
