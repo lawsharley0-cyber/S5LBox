@@ -275,17 +275,22 @@ slower on average; it therefore stays off. Full synthetic, physical and
 rejected-engine measurements remain in
 [`docs/hotpath.md`](docs/hotpath.md); they are evidence, not FPS multipliers.
 
-A portable **cached interpreter** (`core/src/arm/arm_ci*.c`) is available as
-an opt-in CPU backend on every host, including the app (Settings →
-Diagnostics → CPU Execution Backend) and `bootkernel --cpu-backend cached`.
+A portable **cached interpreter** (`core/src/arm/arm_ci*.c`) is the app's
+default CPU backend (Settings → Diagnostics → CPU Execution Backend offers
+Standard for comparison) and an opt-in backend on every other host
+(`bootkernel --cpu-backend cached`).
 It predecodes guest code into blocks of specialised handlers, runs anything
 uncommon through the reference interpreter's own code, keeps device time
 exact, and generates no host code. On compiled ARMv6 workloads it measured
 2.56× the reference on a desktop x86-64 host, 2.50× with MSVC and 2.94× on
 Apple Silicon CI runners, with identical final machine state on every run; a
-differential fuzzer and the workload suite check it on every push. It has not
-yet been validated across a full firmware boot or measured on a phone, so the
-reference interpreter stays the default. Details:
+differential fuzzer and the workload suite check it on every push. On an
+iPhone 17 Pro Max (build bc45a3f, CPU graphics, one full boot each) it ran
+208.6 M guest instructions per busy second against Standard's 114.7 M. Two
+boots on it, one per graphics mode, were still running when their reports
+were taken (6.0 and 6.2 G instructions in, no CPU stop). A
+bit-for-bit comparison with the reference over a full boot has not been run,
+so the desktop tools keep the reference interpreter as their default. Details:
 [`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md),
 [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md),
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).

@@ -11,12 +11,15 @@ reproduce it.
 | Item | Status | How to validate |
 |---|---|---|
 | A full iPhone OS 3.1.3 boot on the cached interpreter | **Not run.** No Apple firmware exists in this environment and none may be downloaded (repo policy). | `MAC_VALIDATION.md` §3 (the same on Windows): the same `bootkernel --run-api` boot with `--cpu-backend interp` and with `--cpu-backend cached --ci-verify`, each saving `--snapshot-at N`; the two machine states and RAM images must be identical. |
-| Speed on a phone | **Not measured.** Every number in `BENCHMARK_RESULTS.md` is desktop x86-64 (plus the CI runners). | `MAC_VALIDATION.md` §4. |
+| Speed on a phone | **Measured once per backend.** iPhone 17 Pro Max, build bc45a3f, CPU graphics, one full boot each: Standard 114.7 M guest instructions per busy second, cached interpreter 208.6 M (and 233.5 M in a GPU-graphics boot). These are separate sessions, not an A/B of identical work. Every number in `BENCHMARK_RESULTS.md` is desktop x86-64 (plus the CI runners). | The report's "Rate while executing" line, one boot per backend. |
 | MSVC on a local Windows 11 machine | Built and tested only by the `windows-latest` CI runner (MSVC, Visual Studio generator). No local VS2022, Ninja+cl or clang-cl run has been made. | `WINDOWS_VALIDATION.md` §2. |
-| The iOS app with the cached interpreter selected | The app compiles in CI (`ios-build`). Nobody has selected the backend on a device. | Settings → Diagnostics → CPU Execution Backend → Cached Interpreter, then compare with the reference as in `MAC_VALIDATION.md` §4. |
+| The iOS app with the cached interpreter selected | **Run on a device.** Two bc45a3f boots, one CPU-graphics and one GPU-graphics, were still running when their reports were taken, 6.0 and 6.2 G instructions in, with no CPU stop. Those reports do not show which apps were opened. The cached interpreter has been the app's default since then. | Settings → Diagnostics → CPU Execution Backend → Standard gives the comparison run. |
 
-Because of the first row the **reference interpreter stays the default**
-everywhere (app, `bootkernel`, `snapboot`); the engine is opt-in.
+The app defaults to the cached interpreter because of the device
+measurement in the second and fourth rows. The first row still stands: no
+full boot has been compared bit-for-bit with the reference. So `bootkernel`
+and `snapboot`, the tools such a comparison would use, keep the reference
+interpreter as their default.
 
 ## 2. Cached interpreter: limitations by design
 

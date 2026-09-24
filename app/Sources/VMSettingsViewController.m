@@ -1038,22 +1038,23 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
 - (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView {
     NSString *current = [_settings cpuBackend];
     NSString *message =
-        @"Both backends execute the same ARM semantics. Standard is the "
-        @"reference interpreter plus, in this build, the compact build-time "
-        @"AArch64 engine where it applies. The cached interpreter replaces both: "
-        @"it predecodes guest code into blocks and runs anything unusual through "
-        @"the reference interpreter's own code. It is 2.5-4x faster on desktop "
-        @"CPU benchmarks; it has not yet been validated across a full firmware "
-        @"boot, so Standard stays the default. Performance & Sound Details "
-        @"shows its counters. Applies at the next start.";
+        @"Both backends execute the same ARM semantics. The cached interpreter "
+        @"predecodes guest code into blocks and runs anything unusual through "
+        @"the reference interpreter's own code. Standard is the reference "
+        @"interpreter plus, in this build, the compact build-time AArch64 engine "
+        @"where it applies. On an iPhone, over full boots, the cached interpreter "
+        @"ran about twice as many guest instructions per second (209 and 234 M "
+        @"against 115 M), so it is the default. Standard stays available for "
+        @"comparison. Performance & Sound Details shows the counters. Applies at "
+        @"the next start.";
     UIAlertController *picker = [UIAlertController
         alertControllerWithTitle:@"CPU Execution Backend"
                          message:message
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSDictionary<NSString *, NSString *> *> *backends = @[
-        @{ @"id": @"interp", @"name": @"Standard (default)" },
-        @{ @"id": @"cached", @"name": @"Cached Interpreter (experimental)" },
+        @{ @"id": @"cached", @"name": @"Cached Interpreter (default)" },
+        @{ @"id": @"interp", @"name": @"Standard" },
     ];
 
     __weak VMSettingsViewController *weakSelf = self;

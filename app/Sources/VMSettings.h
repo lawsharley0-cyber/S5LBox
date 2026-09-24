@@ -161,6 +161,8 @@ typedef NS_ENUM(NSInteger, VMGraphicsMode) {
 - (BOOL)pausesInBackground;
 - (void)setPausesInBackground:(BOOL)pauses;
 
+/* "cached" (the default) or "interp" (Standard); older builds' saved names
+ * are mapped by VMEngine. */
 - (NSString *)cpuBackend;
 - (void)setCpuBackend:(NSString *)backend;
 

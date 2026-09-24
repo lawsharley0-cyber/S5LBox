@@ -278,16 +278,21 @@ static const uint64_t kVMInstructionCaps[] = {
     [self publishChange];
 }
 
+/* The cached interpreter unless the user chose otherwise: over full boots in
+ * the three device reports of build bc45a3f it ran 209 and 234 M guest
+ * instructions per busy second against Standard's 115. Read at use, like
+ * every other key here, so an explicit "interp" is kept and only the unset
+ * default moves. */
 - (NSString *)cpuBackend {
     NSString *val = [[self defaults] stringForKey:kVMCpuBackendKey];
     if (!val || val.length == 0) {
-        return @"interp";
+        return @"cached";
     }
     return val;
 }
 
 - (void)setCpuBackend:(NSString *)backend {
-    if (!backend || backend.length == 0) backend = @"interp";
+    if (!backend || backend.length == 0) backend = @"cached";
     [[self defaults] setObject:backend forKey:kVMCpuBackendKey];
     [self publishChange];
 }
