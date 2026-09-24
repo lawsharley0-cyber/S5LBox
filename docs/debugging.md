@@ -202,7 +202,18 @@ process in "By process", and the per-process top-function lists come from
 those counts. Kernel samples count toward the process whose tables were
 loaded: its system calls, but also interrupts that happened to land in its
 time slice. An address space with no readable path (a kernel thread, or a
-stack page not present yet) is listed by its TTBR0 alone. The 6ec47e8
+stack page not present yet) is listed by its TTBR0 alone.
+
+Each sample also keeps its **call stack**: the pc, the link register (unless
+it is already the first saved lr, as it is once a function has pushed its
+frame), then the saved lr of every frame reached through r7. iPhone OS code
+keeps r7 pointing at {saved r7, saved lr} in ARM and Thumb alike. The walk
+(`gprof_backtrace`) goes through the same page tables, stops at the first
+frame that does not climb, and keeps at most 12 frames; identical stacks
+share one entry. The report adds "Inclusive" (a function plus everything it
+called, each function counted once per stack) and the four most common call
+paths into each of the three hottest functions. Return addresses are named
+two bytes back, at the call site. The 6ec47e8
 reports put 45% and 62% of all samples in Security.framework's bignum code
 (`_mulg_common`, `_grammarSquare_common`). That is RSA-sized arithmetic. The
 process section exists to name who is doing it.

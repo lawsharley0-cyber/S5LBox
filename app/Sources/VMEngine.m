@@ -59,6 +59,10 @@
 // At a few million instructions a second this is roughly 15-30 ms, which keeps
 // pause latency short without paying the flag check too often.
 static const unsigned kVMChunkInstructions = 100000;
+/* Guest profile tables: 128 Ki (pc, process) slots and 32 Ki distinct call
+ * stacks (about 2 MiB); a quarter of each is kept free. */
+static const unsigned kVMProfileSlotsLog2 = 17u;
+static const unsigned kVMProfileStacksLog2 = 15u;
 
 // Publish a snapshot at most this often. The UI redraws at 30 Hz; going faster
 // would only copy the same pixels twice.
@@ -353,8 +357,12 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     _bringUpNote = @"";
     _instanceID = [identifier copy];
     if (pthread_mutex_init(&_profileLock, NULL) == 0) {
-        _profileReady = gprof_init(&_profile, 17u);
-        if (!_profileReady) pthread_mutex_destroy(&_profileLock);
+        _profileReady = gprof_init(&_profile, kVMProfileSlotsLog2) &&
+                        gprof_init_stacks(&_profile, kVMProfileStacksLog2);
+        if (!_profileReady) {
+            gprof_free(&_profile);
+            pthread_mutex_destroy(&_profileLock);
+        }
     }
     _profileSinceNs = vm_now_ns();
     return self;
@@ -2496,6 +2504,67 @@ static NSString *VMProfileProcesses(const gprof_t *w,
     return out;
 }
 
+/*
+ * What the call stacks add: inclusive time (a function and everything it
+ * called, each function counted once per stack) and, for the hottest
+ * functions, the call paths that reach them. A return address names the
+ * call site, so it is looked up two bytes back (inside the calling
+ * function even when the call is its last instruction).
+ */
+static NSString *VMProfileStacks(const gprof_t *w,
+                                 void (^classify)(uint32_t, NSString **, NSString **),
+                                 NSArray<NSString *> *hottest, double total) {
+    if (!w->stack || !w->stack_samples) return @"";
+    NSMutableDictionary<NSNumber *, NSString *> *names = [NSMutableDictionary dictionary];
+    NSString *(^nameOf)(uint32_t) = ^NSString *(uint32_t a) {
+        NSNumber *key = @(a);
+        NSString *n = names[key];
+        if (!n) {
+            NSString *image = nil, *function = nil;
+            classify(a, &image, &function);
+            n = [NSString stringWithFormat:@"%@  %@", image, function];
+            names[key] = n;
+        }
+        return n;
+    };
+    NSMutableDictionary<NSString *, NSNumber *> *inclusive = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *paths =
+        [NSMutableDictionary dictionary];
+    for (NSString *f in hottest) paths[f] = [NSMutableDictionary dictionary];
+    for (uint32_t i = 0; i < w->stack_cap; i++) {
+        const gprof_stack_t *e = &w->stack[i];
+        if (!e->count || !e->depth) continue;
+        NSMutableArray<NSString *> *chain = [NSMutableArray array];
+        for (unsigned k = 0; k < e->depth; k++) {
+            const uint32_t a = k && e->frame[k] >= 2u ? e->frame[k] - 2u : e->frame[k];
+            NSString *n = nameOf(a);
+            if (![chain.lastObject isEqualToString:n]) [chain addObject:n];
+        }
+        for (NSString *f in [NSSet setWithArray:chain]) VMProfileAdd(inclusive, f, e->count);
+        NSMutableDictionary<NSString *, NSNumber *> *into = paths[chain[0]];
+        if (into) {
+            const NSUInteger callers = MIN((NSUInteger)6, chain.count - 1u);
+            NSString *path = callers
+                ? [[chain subarrayWithRange:NSMakeRange(1, callers)] componentsJoinedByString:@"\n        <- "]
+                : @"(no caller recorded)";
+            VMProfileAdd(into, path, e->count);
+        }
+    }
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"\nInclusive (the function and everything it called; %llu stacks, %llu not kept: table full)\n",
+        (unsigned long long)w->stack_samples, (unsigned long long)w->stack_dropped];
+    for (NSString *key in VMProfileTop(inclusive, 30))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * inclusive[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nCall paths into the hottest functions (r7 frame chain, innermost caller first)\n"];
+    for (NSString *f in hottest) {
+        NSMutableDictionary<NSString *, NSNumber *> *into = paths[f];
+        [out appendFormat:@"%@\n", f];
+        for (NSString *key in VMProfileTop(into, 4))
+            [out appendFormat:@"  %6.2f%%  <- %@\n", 100.0 * into[key].unsignedLongLongValue / total, key];
+    }
+    return out;
+}
+
 static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunks,
                                       double seconds, NSString *firmwareDir,
                                       NSString *revision) {
@@ -2574,10 +2643,11 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
         [NSMutableArray arrayWithCapacity:window->nproc];
     for (uint32_t i = 0; i < window->nproc; i++)
         [procFunctions addObject:[NSMutableDictionary dictionary]];
-    for (uint32_t i = 0; i < window->cap; i++) {
-        const gprof_slot_t *slot = &window->slot[i];
-        if (!slot->count) continue;
-        const uint32_t pc = slot->pc;
+    /* Library and function for one address, the same naming everywhere
+     * below. Only the report's own thread uses it, so the caches need no lock. */
+    gprof_cache_t *cacheRef = &cache;   /* symbolizing fills its tables */
+    void (^classify)(uint32_t, NSString **, NSString **) =
+        ^(uint32_t pc, NSString **imageOut, NSString **functionOut) {
         NSString *image = nil, *function = nil;
         if (pc >= 0xffff0000u) {
             image = @"exception vectors";
@@ -2601,10 +2671,10 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
                 }
             }
         } else {
-            gprof_image_t *img = cacheOpen ? gprof_cache_image_at(&cache, pc) : NULL;
+            gprof_image_t *img = cacheOpen ? gprof_cache_image_at(cacheRef, pc) : NULL;
             if (img) {
                 uint32_t off = 0;
-                const char *sym = gprof_cache_symbolize(&cache, img, pc, 0x8000u, &off);
+                const char *sym = gprof_cache_symbolize(cacheRef, img, pc, 0x8000u, &off);
                 image = [NSString stringWithUTF8String:gprof_basename(img->path)] ?: @"(image)";
                 function = sym ? ([NSString stringWithUTF8String:sym] ?: VMProfileBlock(pc))
                                : VMProfileBlock(pc);
@@ -2616,6 +2686,15 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
                 function = VMProfileBlock(pc);
             }
         }
+        *imageOut = image;
+        *functionOut = function;
+    };
+    for (uint32_t i = 0; i < window->cap; i++) {
+        const gprof_slot_t *slot = &window->slot[i];
+        if (!slot->count) continue;
+        const uint32_t pc = slot->pc;
+        NSString *image = nil, *function = nil;
+        classify(pc, &image, &function);
         NSString *both = [NSString stringWithFormat:@"%@  %@", image, function];
         VMProfileAdd(images, image, slot->count);
         VMProfileAdd(functions, both, slot->count);
@@ -2641,6 +2720,7 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
             100.0 * addresses[hot[i]].unsignedLongLongValue / total, hot[i].unsignedIntValue];
 
     [out appendString:VMProfileProcesses(window, procFunctions, total)];
+    [out appendString:VMProfileStacks(window, classify, VMProfileTop(functions, 3), total)];
 
     if (cacheOpen) gprof_cache_close(&cache);
     free(cacheBytes);
@@ -2653,8 +2733,9 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
  * the address space is the TTBR0, and its name is read from the guest's own
  * RAM -- a page-table walk and one 8 KiB scan -- only when TTBR0 changed since
  * the last sample or kVMProfileReread samples have passed, so a task that
- * exits and hands its tables to a new one is noticed. Emulator thread, with
- * _profileLock held, between chunks.
+ * exits and hands its tables to a new one is noticed. The call stack is the
+ * r7 frame chain, read the same way. Emulator thread, with _profileLock held,
+ * between chunks.
  */
 static const uint16_t kVMProfileReread = 64u;
 static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK */
@@ -2666,13 +2747,21 @@ static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK *
     uint16_t proc = 0;
     if (mmu && !gprof_proc_cached(&_profile, ttbr0, kVMProfileReread, &proc)) {
         char path[GPROF_NAME_MAX];
-        const gprof_ram_t ram = { _machine.ram, _machine.ram_base, _machine.ram_size };
-        gprof_exec_path(&ram, cp->ttbr0, cp->ttbr1, cp->ttbcr, kVMUserStackTop,
+        const gprof_ram_t pathRam = { _machine.ram, _machine.ram_base, _machine.ram_size };
+        gprof_exec_path(&pathRam, cp->ttbr0, cp->ttbr1, cp->ttbcr, kVMUserStackTop,
                         path, sizeof path);
         proc = gprof_proc_intern(&_profile, ttbr0, path);
     }
-    gprof_note_in(&_profile, _machine.cpu.r[15],
+    const uint32_t pc = _machine.cpu.r[15];
+    gprof_note_in(&_profile, pc,
                   (_machine.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR, proc);
+    uint32_t frames[GPROF_STACK_MAX];
+    const gprof_ram_t ram = { _machine.ram, _machine.ram_base, _machine.ram_size };
+    const unsigned depth = mmu
+        ? gprof_backtrace(&ram, cp->ttbr0, cp->ttbr1, cp->ttbcr, pc,
+                          _machine.cpu.r[14], _machine.cpu.r[7], frames, GPROF_STACK_MAX)
+        : 0u;
+    gprof_note_stack(&_profile, frames, depth, proc);
 }
 
 - (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion {
@@ -2681,7 +2770,8 @@ static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK *
     BOOL have = NO;
     uint64_t shortChunks = 0, sinceNs = 0;
     const uint64_t nowNs = vm_now_ns();
-    if (_profileReady && window && gprof_init(window, 17u)) {
+    if (_profileReady && window && gprof_init(window, kVMProfileSlotsLog2) &&
+        gprof_init_stacks(window, kVMProfileStacksLog2)) {
         pthread_mutex_lock(&_profileLock);
         have = gprof_copy(window, &_profile);
         shortChunks = _profileShort;

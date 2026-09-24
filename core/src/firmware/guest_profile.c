@@ -26,7 +26,16 @@ bool gprof_init(gprof_t *p, unsigned cap_log2) {
 void gprof_free(gprof_t *p) {
     if (!p) return;
     free(p->slot);
+    free(p->stack);
     memset(p, 0, sizeof *p);
+}
+
+bool gprof_init_stacks(gprof_t *p, unsigned cap_log2) {
+    if (!p || p->stack || cap_log2 < 4u || cap_log2 > 20u) return false;
+    p->stack = calloc((size_t)1 << cap_log2, sizeof *p->stack);
+    if (!p->stack) return false;
+    p->stack_cap = 1u << cap_log2;
+    return true;
 }
 
 void gprof_reset(gprof_t *p) {
@@ -41,6 +50,9 @@ void gprof_reset(gprof_t *p) {
     p->last_proc = 0;
     p->last_age = 0;
     p->last_valid = false;
+    if (p->stack) memset(p->stack, 0, (size_t)p->stack_cap * sizeof *p->stack);
+    p->stack_used = 0;
+    p->stack_samples = p->stack_dropped = 0;
 }
 
 static uint32_t hash_key(uint32_t pc, uint16_t proc) {
@@ -78,8 +90,44 @@ void gprof_note(gprof_t *p, uint32_t pc, bool user) {
     gprof_note_in(p, pc, user, 0);
 }
 
+void gprof_note_stack(gprof_t *p, const uint32_t *frames, unsigned depth, uint16_t proc) {
+    if (!p || !p->stack || !frames || !depth) return;
+    if (depth > GPROF_STACK_MAX) depth = GPROF_STACK_MAX;
+    if (proc >= p->nproc) proc = 0;
+    p->stack_samples++;
+    uint32_t h = 0x811c9dc5u ^ proc ^ depth << 16;
+    for (unsigned i = 0; i < depth; i++) h = (h ^ (frames[i] & ~1u)) * 0x01000193u;
+    h ^= h >> 15;
+    const uint32_t mask = p->stack_cap - 1u;
+    for (uint32_t probe = 0, i = h & mask; probe < p->stack_cap; probe++, i = (i + 1u) & mask) {
+        gprof_stack_t *e = &p->stack[i];
+        if (!e->count) {
+            if (p->stack_used >= p->stack_cap - p->stack_cap / 4u) break;
+            memset(e, 0, sizeof *e);
+            for (unsigned k = 0; k < depth; k++) e->frame[k] = frames[k] & ~1u;
+            e->depth = (uint8_t)depth;
+            e->proc = proc;
+            e->count = 1;
+            p->stack_used++;
+            return;
+        }
+        if (e->proc != proc || e->depth != depth) continue;
+        unsigned k = 0;
+        while (k < depth && e->frame[k] == (frames[k] & ~1u)) k++;
+        if (k == depth) { e->count++; return; }
+    }
+    p->stack_dropped++;
+}
+
 bool gprof_copy(gprof_t *to, const gprof_t *from) {
-    if (!to || !from || !to->slot || !from->slot || to->cap != from->cap) return false;
+    if (!to || !from || !to->slot || !from->slot || to->cap != from->cap ||
+        to->stack_cap != from->stack_cap)
+        return false;
+    if (from->stack)
+        memcpy(to->stack, from->stack, (size_t)from->stack_cap * sizeof *from->stack);
+    to->stack_used = from->stack_used;
+    to->stack_samples = from->stack_samples;
+    to->stack_dropped = from->stack_dropped;
     memcpy(to->slot, from->slot, (size_t)from->cap * sizeof *from->slot);
     to->used = from->used;
     to->samples = from->samples;
@@ -167,6 +215,52 @@ bool gprof_va_to_pa(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
     default:
         return false;
     }
+}
+
+/* A word at a virtual address, with a one-page translation cache. */
+typedef struct {
+    const gprof_ram_t *ram;
+    uint32_t ttbr0, ttbr1, ttbcr;
+    uint32_t page_va, page_pa;
+    bool     valid;
+} va_reader_t;
+
+static bool va_word(va_reader_t *r, uint32_t va, uint32_t *w) {
+    if (va & 3u) return false;
+    const uint32_t page = va & ~0xfffu;
+    if (!r->valid || r->page_va != page) {
+        uint32_t pa;
+        if (!gprof_va_to_pa(r->ram, r->ttbr0, r->ttbr1, r->ttbcr, page, &pa)) {
+            r->valid = false;
+            return false;
+        }
+        r->page_va = page;
+        r->page_pa = pa;
+        r->valid = true;
+    }
+    return ram_word(r->ram, r->page_pa | (va & 0xfffu), w);
+}
+
+unsigned gprof_backtrace(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                         uint32_t ttbcr, uint32_t pc, uint32_t lr, uint32_t fp,
+                         uint32_t *frames, unsigned max) {
+    if (!frames || !max) return 0;
+    unsigned n = 0;
+    frames[n++] = pc & ~1u;
+    va_reader_t r = { ram, ttbr0, ttbr1, ttbcr, 0, 0, false };
+    uint32_t saved_fp = 0, saved_lr = 0;
+    bool have = fp && !(fp & 3u) && ram &&
+                va_word(&r, fp, &saved_fp) && va_word(&r, fp + 4u, &saved_lr);
+    if (n < max && lr && (!have || (lr & ~1u) != (saved_lr & ~1u)))
+        frames[n++] = lr & ~1u;
+    while (have && n < max && saved_lr) {
+        frames[n++] = saved_lr & ~1u;
+        if (!saved_fp || (saved_fp & 3u) || saved_fp <= fp || saved_fp - fp >= 0x100000u)
+            break;
+        fp = saved_fp;
+        have = va_word(&r, fp, &saved_fp) && va_word(&r, fp + 4u, &saved_lr);
+    }
+    return n;
 }
 
 /* One page of guest memory, or NULL. */

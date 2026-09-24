@@ -55,6 +55,21 @@ typedef struct {
     uint64_t user;
 } gprof_proc_t;
 
+/*
+ * A sampled call stack: the pc, then return addresses from the frame-pointer
+ * chain (iPhone OS code keeps r7 pointing at {saved r7, saved lr} in ARM and
+ * Thumb alike), outermost last. Identical stacks share one entry.
+ */
+#define GPROF_STACK_MAX 12u
+
+typedef struct {
+    uint32_t frame[GPROF_STACK_MAX];   /* Thumb bits cleared                  */
+    uint32_t count;                    /* 0 = empty slot                      */
+    uint16_t proc;
+    uint8_t  depth;
+    uint8_t  pad;
+} gprof_stack_t;
+
 typedef struct {
     gprof_slot_t *slot;     /* open addressing, power-of-two capacity         */
     uint32_t      cap;
@@ -71,6 +86,12 @@ typedef struct {
     uint16_t      last_proc;     /* may be 0: the table was full              */
     uint16_t      last_age;      /* samples since that name was last read     */
     bool          last_valid;
+    /* Optional (gprof_init_stacks): distinct sampled call stacks.            */
+    gprof_stack_t *stack;
+    uint32_t      stack_cap;
+    uint32_t      stack_used;
+    uint64_t      stack_samples;
+    uint64_t      stack_dropped;
 } gprof_t;
 
 /* 1 << cap_log2 distinct (pc, process) pairs (cap_log2 4..22). false on
@@ -81,8 +102,14 @@ void gprof_reset(gprof_t *p);
 void gprof_note(gprof_t *p, uint32_t pc, bool user);
 /* The same, attributed to process `proc` (from gprof_proc_intern). */
 void gprof_note_in(gprof_t *p, uint32_t pc, bool user, uint16_t proc);
-/* Copy `from` into an initialised `to` of the same capacity. */
+/* Copy `from` into an initialised `to` of the same capacity (and the same
+ * stack capacity, if either keeps stacks). */
 bool gprof_copy(gprof_t *to, const gprof_t *from);
+
+/* Also keep call stacks, 1 << cap_log2 distinct ones (4..20). */
+bool gprof_init_stacks(gprof_t *p, unsigned cap_log2);
+/* Count one stack of `depth` frames (clamped to GPROF_STACK_MAX; 0 ignored). */
+void gprof_note_stack(gprof_t *p, const uint32_t *frames, unsigned depth, uint16_t proc);
 
 /*
  * true, with *proc set, if the last lookup was of the same TTBR0 and its name
@@ -111,6 +138,19 @@ typedef struct {
  */
 bool gprof_va_to_pa(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
                     uint32_t ttbcr, uint32_t va, uint32_t *pa);
+
+/*
+ * The call stack at a sample, into frames[0..max): frames[0] = pc, then `lr`
+ * unless it equals the first saved lr (a leaf that has not pushed a frame
+ * returns there, so without it the immediate caller would be missing), then
+ * the saved lr of each frame reached from `fp` (r7) through `ram`'s tables.
+ * The walk stops at a zero or misaligned fp, a zero lr, an unmapped read, or a
+ * next fp that is not above the current one by less than 1 MiB -- stacks grow
+ * down, so a sane chain only climbs. Returns the number of frames (>= 1).
+ */
+unsigned gprof_backtrace(const gprof_ram_t *ram, uint32_t ttbr0, uint32_t ttbr1,
+                         uint32_t ttbcr, uint32_t pc, uint32_t lr, uint32_t fp,
+                         uint32_t *frames, unsigned max);
 
 /*
  * The executable path of the task whose tables are `ttbr0`: the first

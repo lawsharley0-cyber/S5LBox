@@ -350,12 +350,100 @@ static void test_exec_path(void) {
     free(ram);
 }
 
+static void test_backtrace(void) {
+    uint8_t *ram = calloc(1, RAM_SIZE);
+    gprof_ram_t m = { ram, RAM_PA, RAM_SIZE };
+    uint32_t f[GPROF_STACK_MAX];
+    /* Stack pages 0x2fffe000 -> 0x08040000 and 0x2ffff000 -> 0x08050000. */
+    put32(ram, (L1_PA - RAM_PA) + (0x2ffu << 2), L2_PA | 1u);
+    put32(ram, (L2_PA - RAM_PA) + (0xfeu << 2), 0x08040000u | 0x2u);
+    put32(ram, (L2_PA - RAM_PA) + (0xffu << 2), 0x08050000u | 0x2u);
+    /* Frames {saved r7, saved lr}: fe00 -> fe40 -> (page cross) 0x2ffff010
+     * -> 0x2ffff100 -> 0 (the outermost). Thumb return addresses keep bit 0. */
+    uint8_t *lo = ram + 0x40000u, *hi = ram + 0x50000u;
+    put32(lo, 0xe00u, 0x2fffee40u); put32(lo, 0xe04u, 0x3145b001u);
+    put32(lo, 0xe40u, 0x2ffff010u); put32(lo, 0xe44u, 0x3145c100u);
+    put32(hi, 0x010u, 0x2ffff100u); put32(hi, 0x014u, 0x00002f1du);
+    put32(hi, 0x100u, 0x00000000u); put32(hi, 0x104u, 0x00001234u);
+    unsigned n = gprof_backtrace(&m, L1_PA, 0, 0, 0x3145ad59u, 0x3145a001u, 0x2fffee00u,
+                                 f, GPROF_STACK_MAX);
+    CHECK(n == 6u && f[0] == 0x3145ad58u && f[1] == 0x3145a000u && f[2] == 0x3145b000u &&
+          f[3] == 0x3145c100u && f[4] == 0x00002f1cu && f[5] == 0x00001234u,
+          "leaf lr, then the chain across pages: n %u %08x %08x %08x %08x %08x %08x",
+          n, f[0], f[1], f[2], f[3], f[4], f[5]);
+    /* lr equal to the first saved lr: the frame is pushed, no duplicate. */
+    n = gprof_backtrace(&m, L1_PA, 0, 0, 0x3145ad58u, 0x3145b001u, 0x2fffee00u, f, GPROF_STACK_MAX);
+    CHECK(n == 5u && f[1] == 0x3145b000u, "no duplicate lr: n %u f1 %08x", n, f[1]);
+    /* max clamps. */
+    n = gprof_backtrace(&m, L1_PA, 0, 0, 0x3145ad58u, 0x3145a001u, 0x2fffee00u, f, 3u);
+    CHECK(n == 3u && f[2] == 0x3145b000u, "clamped to 3");
+    /* A chain that does not climb stops after the frame it read. */
+    put32(lo, 0xe40u, 0x2fffee00u);
+    n = gprof_backtrace(&m, L1_PA, 0, 0, 0x3145ad58u, 0, 0x2fffee00u, f, GPROF_STACK_MAX);
+    CHECK(n == 3u && f[1] == 0x3145b000u && f[2] == 0x3145c100u,
+          "a loop in the chain stops: n %u", n);
+    /* An unmapped or misaligned fp: pc and lr only. */
+    n = gprof_backtrace(&m, L1_PA, 0, 0, 0x1000u, 0x2001u, 0x10000000u, f, GPROF_STACK_MAX);
+    CHECK(n == 2u && f[0] == 0x1000u && f[1] == 0x2000u, "unmapped fp: n %u", n);
+    n = gprof_backtrace(&m, L1_PA, 0, 0, 0x1000u, 0, 0x2fffee02u, f, GPROF_STACK_MAX);
+    CHECK(n == 1u, "misaligned fp, no lr: n %u", n);
+    CHECK(gprof_backtrace(&m, L1_PA, 0, 0, 0x1000u, 0, 0, f, 0) == 0 &&
+          gprof_backtrace(NULL, 0, 0, 0, 0x1000u, 0x2000u, 0x2fffee00u, f, 4u) == 2u,
+          "no room; no RAM");
+    free(ram);
+}
+
+static void test_stacks(void) {
+    gprof_t p, q, r;
+    CHECK(gprof_init(&p, 6u) && !gprof_init_stacks(&p, 3u) && gprof_init_stacks(&p, 4u) &&
+          !gprof_init_stacks(&p, 4u), "stack table sizes");
+    const uint16_t a = gprof_proc_intern(&p, 0x100000u, "/usr/libexec/lockdownd");
+    const uint32_t s1[3] = { 0x3145ad59u, 0x3145b001u, 0x00002f1du };
+    const uint32_t s2[3] = { 0x3145ad58u, 0x3145b000u, 0x00002f1cu };   /* same, bits clear */
+    const uint32_t s3[2] = { 0x3145ad58u, 0x3145b000u };
+    gprof_note_stack(&p, s1, 3u, a);
+    gprof_note_stack(&p, s2, 3u, a);
+    gprof_note_stack(&p, s3, 2u, a);          /* a prefix is its own stack */
+    gprof_note_stack(&p, s2, 3u, 0);          /* another process          */
+    gprof_note_stack(&p, s2, 0u, a);          /* ignored                  */
+    uint32_t c3 = 0, c2 = 0, other = 0, entries = 0;
+    for (uint32_t i = 0; i < p.stack_cap; i++) {
+        const gprof_stack_t *e = &p.stack[i];
+        if (!e->count) continue;
+        entries++;
+        if (e->proc == a && e->depth == 3u && e->frame[2] == 0x2f1cu) c3 = e->count;
+        if (e->proc == a && e->depth == 2u) c2 = e->count;
+        if (e->proc == 0) other = e->count;
+    }
+    CHECK(entries == 3u && c3 == 2u && c2 == 1u && other == 1u && p.stack_samples == 4u,
+          "stacks: entries %u c3 %u c2 %u other %u", entries, c3, c2, other);
+    /* 12 fit in 16 (a quarter free); the rest are counted as dropped. */
+    for (uint32_t i = 0; i < 20u; i++) {
+        const uint32_t s[1] = { 0x5000u + i * 4u };
+        gprof_note_stack(&p, s, 1u, a);
+    }
+    CHECK(p.stack_used == 12u && p.stack_dropped == 11u, "full: used %u dropped %llu",
+          p.stack_used, (unsigned long long)p.stack_dropped);
+    CHECK(gprof_init(&q, 6u) && !gprof_copy(&q, &p), "copy needs the same stack capacity");
+    CHECK(gprof_init_stacks(&q, 4u) && gprof_copy(&q, &p) && q.stack_used == 12u &&
+          memcmp(q.stack, p.stack, 16u * sizeof *p.stack) == 0, "copy carries stacks");
+    gprof_reset(&p);
+    CHECK(p.stack_used == 0 && p.stack_samples == 0 && p.stack[0].count == 0 &&
+          p.stack_cap == 16u, "reset keeps the table, empties it");
+    CHECK(gprof_init(&r, 6u), "no stacks");
+    gprof_note_stack(&r, s1, 3u, 0);
+    CHECK(r.stack_samples == 0, "a table without stacks ignores them");
+    gprof_free(&p); gprof_free(&q); gprof_free(&r);
+}
+
 int main(void) {
     test_histogram();
     test_cache();
     test_processes();
     test_walk();
     test_exec_path();
+    test_backtrace();
+    test_stacks();
     printf("guest profile: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
