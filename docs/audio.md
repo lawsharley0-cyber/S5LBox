@@ -521,3 +521,65 @@ correct model has to reproduce its protocol rather than set bits. The calling
 logic sits before this excerpt, so the excerpt window was widened to 16 KiB
 before the first accessing pc (and 8 KiB after the last) to capture it.
 Nothing is modelled from this yet.
+
+# 2026-09-24 The whole AMC kext (build 6ec47e8) and what it adds
+
+The Full Test Report carried AppleAMC_r1 from its Mach-O header at
+0xc0712000 through 0xc0758000 (SHA-256 df16fc63...1a31; read in a scratch
+directory, not stored here). Its own load commands put `__text` at
+0xc0713000 (0xa338 bytes, ARM), `__const` at 0xc071d338 (0x4e3e4 bytes),
+`__cstring` at 0xc076b71c (0xadbe bytes) and `__DATA` at 0xc0777000. The
+copy stopped short of `__cstring` and `__DATA`, and the dump window is now
+wide enough to include both next time.
+
+**Observed:**
+
+- The low-level layer is a small C HAL over one global at 0xc07770a0:
+  word 0 is the mapped SRAM, word 1 is the mapped register block. Every
+  register access in the earlier tables goes through it. It holds:
+  - one-word setters for the strobes (+0x0, +0x4, +0x8, +0xc) and for +0xd04;
+  - `+0x2000 = n - 1`;
+  - two DMA starts: ack +0x101c, stop +0x100c, enable +0x1000, then address
+    +0x1004 and length +0x1008. One of them also sets +0xa00 = 1 before
+    +0x100c = 1;
+  - a progress read: +0x1010, returned with `len - (cur - start) / 4`;
+  - a wait routine at 0xc071768c. If +0x10 reads 1 it writes +0xc = 1. It
+    then polls +0xb18 bit 8, with IOSleep(1) between polls, 10 times.
+- The SRAM clear before any use: +0x5000, +0x14000..+0x1c000 and
+  +0x1c000..+0x28000 are zeroed with +0x340 = 0 in between. Then +0x28000
+  and the 16 KiB after it are zeroed.
+- The report's access order is:
+  1. `+0x2000 = 3`;
+  2. a streaming channel on DRAM 0x095b5000, 0xfb1 words, started with
+     +0xa00 = 1;
+  3. `+0x4 = 1`;
+  4. two halfword reads of SRAM +0x28000, which return 0;
+  5. configuration writes (+0xb0c, +0x204, +0xb04);
+  6. the BSU lock, three times;
+  7. the channel torn down four times;
+  8. 44 polls of +0xb18, i.e. four waits of 11 reads, all timing out.
+  The assertions (lines 350, 565, 726, 2097) print in that window.
+- `__const` begins with a table of (pointer, word count) pairs: eight
+  blocks of 0x4ea or 0x4eb 32-bit words, about 5 KiB each, followed by
+  one-word entries. The blocks are not ARM or Thumb code (under 2% of
+  words carry ARM's always-condition, against 75-83% in `__text`).
+  Byte-reversed four-character codes in `__text` read `paac`, `.mp3`,
+  `alac`, `aach`, `lpcm`.
+
+**Inferred, to be checked against `__cstring` in the next report:**
+
+- The eight blocks are microcode for the AMC's own processor, one per
+  codec or mode, and the block decodes compressed audio (MP3/AAC/ALAC) in
+  hardware as well as playing PCM.
+- The driver starts that processor and waits for it to answer. The answer
+  is a halfword in SRAM at +0x28000 or status bit 8/9 in +0xb18, and
+  nothing in this VM ever sets either. That would explain every
+  assertion, and it means the fix is a model of what the firmware
+  reports, not more storage.
+
+A faithful model would have to run that microcode, and its instruction set
+is not documented. The practical model is behavioural: acknowledge what
+the driver starts (status bits, the SRAM reply), and play the PCM that the
+streaming channel reads from DRAM at the rate +0x1010 must advance. The
+next report's `__cstring` names each assertion. That maps the four lines
+to the checks that fail, and so to the exact replies the model owes.
