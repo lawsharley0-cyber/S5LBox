@@ -1673,7 +1673,7 @@ static bool ogl_rect_render_row(const ios3_hle_mem_t *mem, uint32_t ctx,
                                  uint32_t *out_va, uint32_t *out_len) {
     ogl_rect_scan_mem_t shadow;
     ios3_hle_mem_t row_mem;
-    arm_cpu_t row_cpu;
+    arm_cpu_t row_cpu = {0};
     uint32_t chunks = 1u, offset = 0u;
 
     memset(&shadow, 0, sizeof shadow);
@@ -2498,7 +2498,7 @@ bool ios3_hle_oracle_prepare(const arm_cpu_t *cpu,
                              ios3_hle_oracle_t *out,
                              uint8_t *expected, uint32_t expected_capacity) {
     ios3_hle_site_t *site = NULL;
-    arm_cpu_t private_cpu;
+    arm_cpu_t private_cpu = {0};
     ios3_hle_mem_t private_mem;
     oracle_mem_t oracle;
     unsigned site_index = 0u;

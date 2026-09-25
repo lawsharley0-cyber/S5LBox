@@ -404,7 +404,7 @@ static void lockstep16(const char *what, const uint16_t *prog, size_t n) {
  * instruction or partially applying BLX's link/state changes. */
 static void check_thumb_invalid_branch_fallback(const char *what,
                                                 uint16_t insn) {
-    arm_cpu_t jit;
+    arm_cpu_t jit = {0};
     jit_block_t blk;
     uint32_t *code;
     uint32_t before_r[16], before_cpsr;

@@ -110,7 +110,7 @@ static void jit_map_normal_identity(arm_cpu_t *c) {
 }
 
 static void test_memory_helpers_cross_pages_without_replay_side_effects(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint64_t loaded;
 
     /* Halfword success: the two bytes come from non-contiguous frames. */
@@ -199,7 +199,7 @@ static void test_memory_helpers_cross_pages_without_replay_side_effects(void) {
 }
 
 static void test_memory_helpers_honor_sctlr_u_and_a(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint64_t loaded;
 
     memset(g_ram, 0, sizeof g_ram);
@@ -306,7 +306,7 @@ static void dump(const jit_block_t *b) {
 static void test_block_ends_at_branch(void) {
     /* MOV r0,#1 ; ADD r1,r0,#2 ; B .-8 */
     uint32_t p[] = { 0xe3a00001, 0xe2801002, 0xeafffffc };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     bool ok = xlate(&c, 0, p, 3, &b, CODE_WORDS);
     CHECK(ok, "translated");
     CHECK(b.insn_count == 3, "insn_count=%u expect 3", b.insn_count);
@@ -322,7 +322,7 @@ static void test_block_ends_before_unhandled(void) {
      * LDM is not translated, so the block must stop *before* it with two
      * instructions covered, and the runtime interprets the LDM. */
     uint32_t p[] = { 0xe3a00001, 0xe2801002, 0xe8bd0001, 0xe3a02003 };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     bool ok = xlate(&c, 0, p, 4, &b, CODE_WORDS);
     CHECK(ok, "translated");
     CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
@@ -335,7 +335,7 @@ static void test_block_ends_before_unhandled(void) {
 static void test_first_instruction_unhandled(void) {
     /* SWI #0 first: nothing to translate at all. */
     uint32_t p[] = { 0xef000000, 0xe3a00001 };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     bool ok = xlate(&c, 0, p, 2, &b, CODE_WORDS);
     CHECK(!ok, "translation declined");
     CHECK(b.insn_count == 0, "insn_count=%u expect 0", b.insn_count);
@@ -345,7 +345,7 @@ static void test_first_instruction_unhandled(void) {
 static void test_block_ends_at_page_boundary(void) {
     /* Four instructions at 0xff0..0xffc, then a new 4 KB page. */
     uint32_t p[] = { 0xe1a00000, 0xe1a00000, 0xe1a00000, 0xe1a00000, 0xe1a00000 };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     bool ok = xlate(&c, 0xff0, p, 5, &b, CODE_WORDS);
     CHECK(ok, "translated");
     CHECK(b.insn_count == 4, "insn_count=%u expect 4", b.insn_count);
@@ -354,7 +354,7 @@ static void test_block_ends_at_page_boundary(void) {
 
 static void test_block_length_cap(void) {
     uint32_t p[80];
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < 80; i++) p[i] = 0xe1a00000;   /* MOV r0,r0 */
     CHECK(xlate(&c, 0, p, 80, &b, CODE_WORDS), "translated");
@@ -364,7 +364,7 @@ static void test_block_length_cap(void) {
 
 static void test_code_buffer_exhaustion(void) {
     uint32_t p[80];
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < 80; i++) p[i] = 0xe1a00000;
     CHECK(xlate(&c, 0, p, 80, &b, 120), "translated into a small buffer");
@@ -402,7 +402,7 @@ static bool xlate16(arm_cpu_t *c, uint32_t at, const uint16_t *prog, size_t n,
 #define T_SELF 0xe7feu
 
 static void test_thumb_block_shape(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     {   /* MOVS r0,#1 ; ADD r0,#1 ; B . */
         uint16_t p[] = { 0x2001, 0x3001, T_SELF };
         CHECK(xlate16(&c, 0, p, 3, &b, CODE_WORDS), "translated");
@@ -475,7 +475,7 @@ static void test_thumb_refused_encodings(void) {
         { 0xbf00u, "NOP hint" },
         { 0xb910u, "CBNZ r0,.+4        (ARMv7)" }
     };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         bool ok = xlate16(&c, 0, &CASES[i].insn, 1, &b, CODE_WORDS);
@@ -513,7 +513,7 @@ static void test_thumb_bodies_are_exact(void) {
         { 0x0888u, 0x53027e93u, "LSRS r0,r1,#2   -> lsr  w19,w20,#2"      },
         { 0x1108u, 0x13047e93u, "ASRS r0,r1,#4   -> asr  w19,w20,#4"      }
     };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         uint16_t p[2]; p[0] = CASES[i].guest; p[1] = T_SELF;
@@ -536,7 +536,7 @@ static void test_thumb_bodies_are_exact(void) {
  * Rd == Rs is the ordinary case.
  */
 static void test_thumb_shift_carry(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     uint16_t p[2]; p[1] = T_SELF;
 
     p[0] = 0x00c8u;                              /* LSLS r0,r1,#3 */
@@ -616,7 +616,7 @@ static void test_thumb_shift_carry(void) {
 #define W_MOV_PC_S0  0x2a0903e8u   /* mov w8, w9  (exit_reg)   */
 
 static void test_thumb_state_transitions(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     uint16_t p[2];
 
     /* BX r3: T := r3[0], target = r3 & ~1, no link register write. */
@@ -705,7 +705,7 @@ static void test_thumb_state_transitions(void) {
 
 /* B<cond> has two static edges, exactly like its ARM counterpart (§3.5). */
 static void test_thumb_conditional_branch(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     uint16_t p[1];
     p[0] = 0xd002u;                              /* BEQ .+4 -> target 8 */
     CHECK(xlate16(&c, 0, p, 1, &b, CODE_WORDS), "BEQ translated");
@@ -728,7 +728,7 @@ static void test_thumb_conditional_branch(void) {
  * instruction and LR_abt is pc + 8 in Thumb too.
  */
 static void test_thumb_memory(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     uint16_t p[2]; p[1] = T_SELF;
 
     p[0] = 0x6848u;                              /* LDR r0,[r1,#4] */
@@ -794,7 +794,7 @@ static void test_thumb_memory(void) {
  */
 static void test_thumb_decode_agrees_with_the_interpreter(void) {
     const uint32_t STATE = ARM_CPSR_T | ARM_CPSR_MODE_MASK;
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned accepted = 0, bad_undef = 0, bad_flow = 0, bad_state = 0;
     uint32_t i;
 
@@ -845,7 +845,7 @@ static void test_thumb_decode_agrees_with_the_interpreter(void) {
 static void test_thumb_deny(void) {
     /* MOVS r0,#1 ; LDR r0,[r1,#0] ; B . */
     uint16_t p[] = { 0x2001, 0x6808, T_SELF };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
 
     jit_set_deny(JIT_DENY_THUMB);
     CHECK(!xlate16(&c, 0, p, 3, &b, CODE_WORDS), "whole Thumb decoder denied");
@@ -884,7 +884,7 @@ static void test_deny_all_translates_nothing(void) {
      * denied the JIT must decline everything, so the boot runs exactly as it
      * does today. */
     uint32_t p[] = { 0xe3a00001, 0xe5901000, 0xeafffffe };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     jit_set_deny(JIT_DENY_ALL);
     for (i = 0; i < 3; i++) {
@@ -921,7 +921,7 @@ static void test_vfp_is_never_translated(void) {
         { 0xec510b10u, "VMOV r0,r1,d0        (VFP 64-bit transfer)"     },
         { 0xf2000d40u, "VADD.F32             (Advanced SIMD)"           },
     };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         CHECK(!xlate(&c, 0, &CASES[i].insn, 1, &b, CODE_WORDS),
@@ -933,7 +933,7 @@ static void test_vfp_is_never_translated(void) {
 
 static void test_deny_one_class(void) {
     uint32_t p[] = { 0xe3a00001, 0xe5901000, 0xe3a02003, 0xeafffffe };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     jit_set_deny(JIT_DENY_LDST);
     CHECK(xlate(&c, 0, p, 4, &b, CODE_WORDS), "translated");
     CHECK(b.insn_count == 1, "insn_count=%u expect 1 (LDR denied)", b.insn_count);
@@ -976,7 +976,7 @@ static void test_refused_encodings(void) {
         { 0xf5d0f000u, "PLD [r0]  (unconditional space)" },
         { 0xe6bf0070u, "SXTB r0,r0 (media space)" },
     };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         bool ok = xlate(&c, 0, &CASES[i].insn, 1, &b, CODE_WORDS);
@@ -992,7 +992,7 @@ static void test_refused_encodings(void) {
  */
 static void test_imm_dp_not_mistaken_for_multiply(void) {
     uint32_t p[] = { 0xe3a00090, 0xeafffffe };  /* MOV r0,#0x90 ; B . */
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 2, &b, CODE_WORDS), "translated");
     CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
     CHECK(count_word(&b, 0x52801213u) == 1, "movz w19,#0x90 emitted");
@@ -1033,7 +1033,7 @@ static void test_prologue_is_exact(void) {
         0xd51b4209    /* msr  nzcv, x9               */
     };
     uint32_t p[] = { 0xeafffffe };   /* B . */
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i, bad = 0;
     CHECK(xlate(&c, 0, p, 1, &b, CODE_WORDS), "translated");
     for (i = 0; i < sizeof WANT / sizeof WANT[0]; i++)
@@ -1057,7 +1057,7 @@ static void test_dp_bodies_are_exact(void) {
         { 0xe1a00181u, 0x2a140ff3u, "MOV  r0,r1,lsl#3 -> orr w19,wzr,w20,lsl#3" },
         { 0xe0a12003u, 0x1a160295u, "ADC  r2,r1,r3  -> adc  w21,w20,w22"   }
     };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     unsigned i;
     for (i = 0; i < sizeof CASES / sizeof CASES[0]; i++) {
         uint32_t p[2]; p[0] = CASES[i].guest; p[1] = 0xeafffffe;
@@ -1076,7 +1076,7 @@ static void test_dp_bodies_are_exact(void) {
  * flags map exactly.
  */
 static void test_logical_flag_fixup(void) {
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     uint32_t p[2]; p[1] = 0xeafffffe;
 
     p[0] = 0xe21000ffu;                      /* ANDS r0,r0,#255 (rot 0) */
@@ -1109,7 +1109,7 @@ static void test_logical_flag_fixup(void) {
 static void test_conditional_is_one_branch(void) {
     /* ADDEQ r0,r0,#1 ; B . */
     uint32_t p[] = { 0x02800001, 0xeafffffe };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 2, &b, CODE_WORDS), "translated");
     CHECK(b.insn_count == 2, "insn_count=%u expect 2", b.insn_count);
     CHECK(count_word(&b, 0x54000041u) == 1, "b.ne +2 skips the one-word body");
@@ -1123,7 +1123,7 @@ static void test_conditional_is_one_branch(void) {
 static void test_conditional_branch_has_two_exits(void) {
     /* BEQ .+8 (target 0x10 from PC 0) ; ... */
     uint32_t p[] = { 0x0a000002, 0xe1a00000, 0xe1a00000, 0xe1a00000 };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 4, &b, CODE_WORDS), "translated");
     CHECK(b.insn_count == 1, "insn_count=%u expect 1", b.insn_count);
     CHECK(b.end_reason == JIT_END_BRANCH, "ends at the branch");
@@ -1134,7 +1134,7 @@ static void test_conditional_branch_has_two_exits(void) {
 static void test_bl_writes_lr(void) {
     /* BL .+4 from 0: LR = 4, target = 0x10 */
     uint32_t p[] = { 0xeb000002 };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 1, &b, CODE_WORDS), "translated");
     CHECK(count_word(&b, 0x52800089u) == 1, "movz w9,#4 (return address)");
     CHECK(count_word(&b, 0xb9003b89u) == 1, "str w9,[x28,#56] (cpu->r[14])");
@@ -1149,7 +1149,7 @@ static void test_bl_writes_lr(void) {
 static void test_load_sequence(void) {
     /* LDR r1,[r0,#4] ; B . */
     uint32_t p[] = { 0xe5901004, 0xeafffffe };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 2, &b, CODE_WORDS), "translated");
     /* Twice: once here, once in the epilogue that publishes the resume PC. */
     CHECK(count_word(&b, 0xb9003f88u) == 2, "str w8,[x28,#60] publishes cpu->r[15]");
@@ -1166,7 +1166,7 @@ static void test_load_sequence(void) {
 static void test_store_sequence(void) {
     /* STRB r1,[r0,#4] ; B . */
     uint32_t p[] = { 0xe5c01004, 0xeafffffe };
-    arm_cpu_t c; jit_block_t b;
+    arm_cpu_t c = {0}; jit_block_t b;
     CHECK(xlate(&c, 0, p, 2, &b, CODE_WORDS), "translated");
     CHECK(count_word(&b, 0x2a1403e2u) == 1, "mov w2,w20 passes the stored value");
     CHECK(count_word(&b, 0x52800040u) == 1, "movz w0,#JIT_EXIT_ABORT on the fault path");

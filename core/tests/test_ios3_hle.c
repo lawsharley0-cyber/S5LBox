@@ -326,7 +326,7 @@ static void test_the_shipped_sites_carry_a_distinguishing_prologue(void) {
 
 /* And with nothing armed, the hot path must do nothing at all. */
 static void test_nothing_armed_never_intercepts(void) {
-    arm_cpu_t cpu; memset(&cpu, 0, sizeof cpu);
+    arm_cpu_t cpu = {0}; memset(&cpu, 0, sizeof cpu);
     ios3_hle_disarm();
     for (unsigned i = 0; i < ios3_hle_site_count(); i++) {
         ios3_hle_site_t *s = ios3_hle_site_at(i);
@@ -441,7 +441,7 @@ static void test_identity_is_checked_word_for_word(void) {
  * process" looks exactly like "never reached".
  */
 static void test_the_wrong_address_space_is_refused_and_counted(void) {
-    arm_cpu_t cpu; memset(&cpu, 0, sizeof cpu);
+    arm_cpu_t cpu = {0}; memset(&cpu, 0, sizeof cpu);
     ios3_hle_site_t *s = install_test_site(IOS3_HLE_REPLACE);
     g_handler_answer = true; g_handler_calls = 0;
     CHECK(ios3_hle_arm(&FAKE, 0x1000u) == 1u, "setup: site did not arm");
@@ -466,7 +466,7 @@ static void test_the_wrong_address_space_is_refused_and_counted(void) {
 
 /* OBSERVE must never alter execution, however willing the handler is. */
 static void test_observe_mode_never_takes_the_call(void) {
-    arm_cpu_t cpu; memset(&cpu, 0, sizeof cpu);
+    arm_cpu_t cpu = {0}; memset(&cpu, 0, sizeof cpu);
     ios3_hle_site_t *s = install_test_site(IOS3_HLE_OBSERVE);
     g_handler_answer = true; g_handler_calls = 0;
     CHECK(ios3_hle_arm(&FAKE, 0x1000u) == 1u, "setup: site did not arm");
@@ -523,7 +523,7 @@ static void test_trace_cannot_mutate_or_intercept_the_guest(void) {
 
 /* A handler that declines leaves the guest to run its own code. */
 static void test_declining_is_safe(void) {
-    arm_cpu_t cpu; memset(&cpu, 0, sizeof cpu);
+    arm_cpu_t cpu = {0}; memset(&cpu, 0, sizeof cpu);
     cpu.r[15] = 0x1234u;
     ios3_hle_site_t *s = install_test_site(IOS3_HLE_REPLACE);
     g_handler_answer = false; g_handler_calls = 0;
@@ -542,7 +542,7 @@ static void test_declining_is_safe(void) {
 static void test_oracle_captures_disjoint_transactional_spans(void) {
     ios3_hle_oracle_t oracle;
     ios3_hle_site_t *s;
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint8_t expected[8];
     uint32_t first = 0u, second = 0u, guest = UINT32_MAX;
 
@@ -671,7 +671,7 @@ static void test_direct_scanline_preserves_bgra_and_forces_bgrx_alpha(void) {
     CHECK(site && site->mode == IOS3_HLE_REPLACE,
           "sw_scanline common path is not in REPLACE mode");
     for (unsigned pass = 0; pass < 2u; pass++) {
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
         reset_scan_fixture(site);
         configure_direct_scanline(&cpu, sampler[pass]);
         if (!arm_only(site)) continue;
@@ -709,7 +709,7 @@ static void test_direct_scanline_preserves_bgra_and_forces_bgrx_alpha(void) {
 
 static void test_direct_scanline_accepts_the_measured_full_width_bound(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_direct_scanline(&cpu, SAMPLE_BGRA8);
@@ -767,7 +767,7 @@ static void test_identity_bulk_read_falls_back_to_exact_texels(void) {
     const uint32_t source = SCAN_MEM_BASE + 0x8f80u;
     const uint32_t output = SCAN_MEM_BASE + 0xa000u;
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_direct_scanline(&cpu, SAMPLE_BGRA8);
@@ -908,7 +908,7 @@ static void test_rect_root_replaces_textured_and_solid_rows_atomically(void) {
         UINT32_C(0xdfbcd811), UINT32_C(0xe5cbe414)
     };
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     CHECK(site != NULL, "ogl_poly_scan site is missing");
     CHECK(site && site->mode == IOS3_HLE_REPLACE,
@@ -1003,7 +1003,7 @@ static void test_rect_root_replaces_textured_and_solid_rows_atomically(void) {
 static void test_rect_root_chunks_measured_full_width_mode_two(void) {
     static const uint32_t sampler[2] = { SAMPLE_BGRA8, SAMPLE_BGRX8 };
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     for (uint32_t pass = 0; pass < 2u; pass++) {
         reset_scan_fixture(site);
@@ -1289,7 +1289,7 @@ static void test_rect_root_chunks_measured_full_width_mode_two(void) {
 
 static void test_rect_root_applies_integer_clip_bounds(void) {
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_rect_root(&cpu, 0x030bu);
@@ -1351,7 +1351,7 @@ static void test_rect_root_matches_fractional_bilinear_rows(void) {
         UINT32_C(0x708090a0), UINT32_C(0x8090a0b0)
     };
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     /* A measured-style 320-to-1 surface translated by one quarter pixel.
      * Apple's y coverage selects rows 0 and 1. Their pixel-centre v values are
@@ -1483,7 +1483,7 @@ static void test_rect_root_preserves_prior_row_alias_semantics(void) {
         UINT32_C(0x80778899)
     };
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_rect_root(&cpu, 0x030bu);
@@ -1508,7 +1508,7 @@ static void test_rect_root_preserves_prior_row_alias_semantics(void) {
 
 static void test_rect_root_refuses_unproved_or_nonatomic_shapes(void) {
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     for (uint32_t which = 0; which < 8u; which++) {
         reset_scan_fixture(site);
@@ -1603,7 +1603,7 @@ static void test_direct_solid_scanline_repeats_the_context_pixel(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
 
     for (unsigned pass = 0; pass < 2u; pass++) {
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
         reset_scan_fixture(site);
         configure_solid_scanline(&cpu, colors[pass]);
         if (!arm_only(site)) continue;
@@ -1628,7 +1628,7 @@ static void test_direct_solid_scanline_repeats_the_context_pixel(void) {
 
 static void test_blended_solid_scanline_matches_selector_two(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_solid_scanline(&cpu, 0xfd000000u);
@@ -1652,7 +1652,7 @@ static void test_blended_solid_scanline_matches_selector_two(void) {
 
 static void test_blended_solid_scanline_covers_the_measured_display_width(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_solid_scanline(&cpu, UINT32_C(0xfd000000));
@@ -1698,7 +1698,7 @@ static void test_blended_solid_scanline_covers_the_measured_display_width(void) 
 
 static void test_solid_scanline_unknown_shapes_and_faults_decline(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     for (unsigned which = 0; which < 4u; which++) {
         reset_scan_fixture(site);
@@ -1762,7 +1762,7 @@ static void test_live_mode_two_modulates_then_blends(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
 
     for (uint32_t pass = 0; pass < 2u; pass++) {
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
         reset_scan_fixture(site);
         configure_live_mode_two(&cpu, sampler[pass], color[pass]);
         if (!arm_only(site)) continue;
@@ -1783,7 +1783,7 @@ static void test_live_mode_two_modulates_then_blends(void) {
 
     reset_scan_fixture(site);
     {
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
         configure_live_mode_two(&cpu, SAMPLE_BGRA8,
                                 UINT32_C(0x7f804020));
         scan_poke32(SCAN_STACK + 0x0cu, 0x0318u);
@@ -1803,7 +1803,7 @@ static void test_live_bgra_blend_matches_arm_packed_selector_two(void) {
         0x10315273u, 0xc0908080u, 0xff010203u
     };
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_live_bgra_blend(&cpu);
@@ -1831,7 +1831,7 @@ static void test_live_bgra_blend_matches_arm_packed_selector_two(void) {
 
 static void test_live_bgra_blend_faults_and_unproved_shapes_decline(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_live_bgra_blend(&cpu);
@@ -1885,7 +1885,7 @@ static void test_live_bgra_blend_faults_and_unproved_shapes_decline(void) {
 
 static void test_direct_scanline_faults_and_unknown_states_decline_cleanly(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_direct_scanline(&cpu, SAMPLE_BGRA8);
@@ -1941,7 +1941,7 @@ static void test_nearest_leaf_sites_match_the_decoded_32bit_formats(void) {
 
     for (unsigned pass = 0; pass < 2u; pass++) {
         ios3_hle_site_t *site = site_named(names[pass]);
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
 
         reset_scan_fixture(site);
         configure_direct_scanline(&cpu, SAMPLE_BGRA8);
@@ -1990,7 +1990,7 @@ static void test_nearest_leaf_sites_match_the_decoded_32bit_formats(void) {
 
 static void test_buffering_never_changes_alias_or_write_fault_semantics(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
 
     reset_scan_fixture(site);
     configure_direct_scanline(&cpu, SAMPLE_BGRA8);

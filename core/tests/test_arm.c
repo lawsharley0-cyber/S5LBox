@@ -134,7 +134,7 @@ static arm_status_t run_status(arm_cpu_t *c, const uint32_t *prog, size_t words,
 static void test_mov_imm(void) {
     /* MOV r0, #42  -> e3a0002a */
     uint32_t p[] = { 0xe3a0002a };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
     CHECK(c.r[15] == 4, "pc=%u expect 4", c.r[15]);
 }
@@ -142,14 +142,14 @@ static void test_mov_imm(void) {
 static void test_add_reg(void) {
     /* MOV r1,#40 ; MOV r2,#2 ; ADD r0,r1,r2 */
     uint32_t p[] = { 0xe3a01028, 0xe3a02002, 0xe0810002 };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
 }
 
 static void test_sub_flags(void) {
     /* MOV r0,#5 ; SUBS r0,r0,#5  -> Z set, C set (no borrow) */
     uint32_t p[] = { 0xe3a00005, 0xe2500005 };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[0] == 0, "r0=%u expect 0", c.r[0]);
     CHECK((c.cpsr & ARM_CPSR_Z) != 0, "Z should be set");
     CHECK((c.cpsr & ARM_CPSR_C) != 0, "C should be set (no borrow)");
@@ -159,7 +159,7 @@ static void test_sub_flags(void) {
 static void test_subs_negative(void) {
     /* MOV r0,#1 ; SUBS r0,r0,#2 -> result 0xffffffff, N set, C clear (borrow) */
     uint32_t p[] = { 0xe3a00001, 0xe2500002 };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[0] == 0xffffffffu, "r0=%08x expect ffffffff", c.r[0]);
     CHECK((c.cpsr & ARM_CPSR_N) != 0, "N should be set");
     CHECK((c.cpsr & ARM_CPSR_C) == 0, "C should be clear (borrow)");
@@ -173,7 +173,7 @@ static void test_adds_overflow(void) {
        0x80000000 = 0x2 ror 2? 0x02 rotated right by 2 -> 0x80000000. rot field=1 (=2*1). */
     uint32_t p[] = { 0xe3e00102, /* MVN r0,#0x80000000 -> r0=0x7fffffff */
                      0xe2900001  /* ADDS r0,r0,#1 */ };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[0] == 0x80000000u, "r0=%08x expect 80000000", c.r[0]);
     CHECK((c.cpsr & ARM_CPSR_V) != 0, "V should be set on signed overflow");
     CHECK((c.cpsr & ARM_CPSR_N) != 0, "N should be set");
@@ -204,7 +204,7 @@ static void test_nzcv_updates_preserve_the_rest_of_cpsr(void) {
     for (size_t i = 0; i < sizeof arithmetic / sizeof arithmetic[0]; i++) {
         memset(g_ram, 0, sizeof g_ram);
         m_w32(NULL, 0u, arithmetic[i].insn);
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_reset(&c, &g_bus);
         c.cpsr = preserved | ARM_CPSR_N | ARM_CPSR_Z | ARM_CPSR_V |
                  (arithmetic[i].input_carry ? ARM_CPSR_C : 0u);
@@ -249,7 +249,7 @@ static void test_nzcv_updates_preserve_the_rest_of_cpsr(void) {
     for (size_t i = 0; i < sizeof logical / sizeof logical[0]; i++) {
         memset(g_ram, 0, sizeof g_ram);
         m_w32(NULL, 0u, logical[i].insn);
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_reset(&c, &g_bus);
         c.cpsr = preserved | ARM_CPSR_V |
                  ((~logical[i].nzc) & (ARM_CPSR_N | ARM_CPSR_Z)) |
@@ -269,7 +269,7 @@ static void test_nzcv_updates_preserve_the_rest_of_cpsr(void) {
 static void test_barrel_lsl(void) {
     /* MOV r1,#1 ; MOV r0, r1, LSL #4 -> 16 */
     uint32_t p[] = { 0xe3a01001, 0xe1a00201 };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[0] == 16, "r0=%u expect 16", c.r[0]);
 }
 
@@ -282,7 +282,7 @@ static void test_register_shifted_pc_operands_are_unpredictable(void) {
     };
 
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         uint32_t before[16], cpsr;
         memset(g_ram, 0, sizeof g_ram);
         m_w32(NULL, 0u, cases[i].insn);
@@ -300,7 +300,7 @@ static void test_register_shifted_pc_operands_are_unpredictable(void) {
 }
 
 static void test_str_and_stm_store_pc_plus_12(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* STR pc,[r0] at 0x100 stores 0x10c, not the ordinary visible PC 0x108. */
     memset(g_ram, 0, sizeof g_ram);
@@ -332,14 +332,14 @@ static void test_branch(void) {
     uint32_t p[] = { 0xea000000, /* B #8 -> lands at 0x8 */
                      0xe3a00001, /* MOV r0,#1 (skipped) */
                      0xe3a00007  /* MOV r0,#7 */ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 2);
     CHECK(c.r[0] == 7, "r0=%u expect 7 (branch skipped the #1)", c.r[0]);
 }
 
 static void test_bl_sets_lr(void) {
     /* BL to somewhere; check LR = pc+4 */
     uint32_t p[] = { 0xeb000002 /* BL #... */ };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[14] == 4, "lr=%u expect 4", c.r[14]);
 }
 
@@ -347,7 +347,7 @@ static void test_ldr_str(void) {
     /* MOV r0,#0xAB ; MOV r1,#0x400 ; STR r0,[r1] ; LDR r2,[r1] */
     uint32_t p[] = { 0xe3a000ab, 0xe3a01b01 /*MOV r1,#0x400*/,
                      0xe5810000 /*STR r0,[r1]*/, 0xe5912000 /*LDR r2,[r1]*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[2] == 0xab, "r2=%08x expect ab", c.r[2]);
     CHECK(m_r32(NULL, 0x400) == 0xab, "mem[0x400]=%08x expect ab", m_r32(NULL,0x400));
 }
@@ -360,7 +360,7 @@ static void test_ldrb(void) {
                      0xe5810000 /*STR  r0,[r1]          addr 8 */,
                      0xe5d12000 /*LDRB r2,[r1]          addr 0xC */,
                      0x11223344 /*literal               addr 0x10 */ };
-    arm_cpu_t c; load_and_run(&c, p, 5, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 5, 4);
     CHECK(c.r[0] == 0x11223344u, "r0=%08x expect 11223344", c.r[0]);
     CHECK(c.r[2] == 0x44, "r2=%02x expect 44 (LE low byte)", c.r[2]);
 }
@@ -368,14 +368,14 @@ static void test_ldrb(void) {
 static void test_cond_not_taken(void) {
     /* MOVEQ r0,#9 with Z clear -> not executed; r0 stays 0 */
     uint32_t p[] = { 0x03a00009 /*MOVEQ r0,#9*/ };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[0] == 0, "r0=%u expect 0 (cond failed)", c.r[0]);
 }
 
 static void test_mul(void) {
     /* MOV r1,#6 ; MOV r2,#7 ; MUL r0,r1,r2 -> 42  (MUL rd,rm,rs: e0000291) */
     uint32_t p[] = { 0xe3a01006, 0xe3a02007, 0xe0000291 };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
 }
 
@@ -394,7 +394,7 @@ static void test_dsp_smul_halfword_selectors_and_real_alias(void) {
     };
 
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         load_and_run(&c, &cases[i].insn, 1, 0);
         c.r[1] = 0xfffe0003u;
         c.r[2] = 0x0004fffbu;
@@ -411,7 +411,7 @@ static void test_dsp_smul_halfword_selectors_and_real_alias(void) {
     /* Exact instruction and live register values at the current real-guest
      * stop.  Rd aliases Rs, so all sources must be read before writeback. */
     const uint32_t blocker = 0xe1630381u;       /* SMULBB r3,r1,r3 */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     load_and_run(&c, &blocker, 1, 0);
     c.r[1] = 1u;
     c.r[3] = 0x34u;
@@ -421,7 +421,7 @@ static void test_dsp_smul_halfword_selectors_and_real_alias(void) {
 
 static void test_dsp_smla_wraps_and_sets_sticky_q(void) {
     const uint32_t smlabb = 0xe1003281u;        /* SMLABB r0,r1,r2,r3 */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     load_and_run(&c, &smlabb, 1, 0);
     c.r[1] = 1u; c.r[2] = 1u; c.r[3] = 0x7fffffffu;
@@ -463,7 +463,7 @@ static void test_dsp_smlal_sign_carry_wrap_and_alias(void) {
     };
 
     for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         load_and_run(&c, &smlalbb, 1, 0);
         c.r[0] = cases[i].lo; c.r[1] = cases[i].hi;
         c.r[2] = cases[i].rm; c.r[3] = cases[i].rs;
@@ -481,7 +481,7 @@ static void test_dsp_smlal_sign_carry_wrap_and_alias(void) {
     /* Rm aliases RdLo. The old low accumulator value is both an input to the
      * multiplication and part of the 64-bit add. */
     const uint32_t alias = 0xe1410280u;         /* SMLALBB r0,r1,r0,r2 */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     load_and_run(&c, &alias, 1, 0);
     c.r[0] = 2u; c.r[1] = 0u; c.r[2] = 3u;
     CHECK(arm_step(&c) == ARM_OK && c.r[0] == 8u && c.r[1] == 0u,
@@ -491,7 +491,7 @@ static void test_dsp_smlal_sign_carry_wrap_and_alias(void) {
 static void test_dsp_word_halfword_extract_and_accumulate(void) {
     const uint32_t smulwb = 0xe12002a1u;        /* SMULWB r0,r1,r2 */
     const uint32_t smulwt = 0xe12002e1u;        /* SMULWT r0,r1,r2 */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* Bits[47:16] of -1 are all ones. C division by 65536 would incorrectly
      * truncate toward zero here, so this pins the required arithmetic extract. */
@@ -561,7 +561,7 @@ static void test_dsp_multiply_unpredictable_and_reserved_forms_trap(void) {
 #undef SMULW
 
     for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         load_and_run(&c, &bad[i], 1, 0);
         for (unsigned r = 0; r < 15u; r++) c.r[r] = 0x11110000u + r;
         c.cpsr |= ARM_CPSR_N | ARM_CPSR_C | ARM_CPSR_Q;
@@ -575,7 +575,7 @@ static void test_dsp_multiply_unpredictable_and_reserved_forms_trap(void) {
 
     /* A legal instruction with a failed condition is a true NOP. */
     const uint32_t eq = 0x01630381u;          /* SMULBBEQ r3,r1,r3 */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     load_and_run(&c, &eq, 1, 0);
     c.r[1] = 7u; c.r[3] = 9u;                /* Z is clear after reset */
     uint32_t cpsr = c.cpsr;
@@ -587,7 +587,7 @@ static void test_dsp_multiply_unpredictable_and_reserved_forms_trap(void) {
 static void test_orr_bic_mvn(void) {
     /* MOV r0,#0xF0 ; ORR r0,r0,#0x0F -> 0xFF ; BIC r0,r0,#0x0F -> 0xF0 ; MVN r1,#0 -> 0xffffffff */
     uint32_t p[] = { 0xe3a000f0, 0xe380000f, 0xe3c0000f, 0xe3e01000 };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[0] == 0xf0, "r0=%08x expect f0", c.r[0]);
     CHECK(c.r[1] == 0xffffffffu, "r1=%08x expect ffffffff", c.r[1]);
 }
@@ -596,7 +596,7 @@ static void test_bx_branches(void) {
     /* MOV r1,#0x100 ; BX r1  -> PC = 0x100 (regression: BX must actually branch,
      * not silently execute as a TEQ comparison). */
     uint32_t p[] = { 0xe3a01c01 /*MOV r1,#0x100*/, 0xe12fff11 /*BX r1*/ };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[15] == 0x100, "pc=%08x expect 100 (BX branched)", c.r[15]);
 }
 
@@ -617,7 +617,7 @@ static void test_bx_branches(void) {
  */
 static void test_exception_return_to_thumb_keeps_halfword(void) {
     uint32_t p[] = { 0xe1b0f00e };   /* MOVS pc, lr */
-    arm_cpu_t c; load_and_run(&c, p, 1, 0);   /* load only; we set up state */
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 0);   /* load only; we set up state */
 
     arm_set_mode(&c, ARM_MODE_FIQ);
     c.spsr[arm_bank_of_mode(ARM_MODE_FIQ)] = ARM_MODE_SVC | ARM_CPSR_T;
@@ -636,7 +636,7 @@ static void test_exception_return_to_thumb_keeps_halfword(void) {
 /* The same return into ARM code must still be word-aligned. */
 static void test_exception_return_to_arm_stays_word_aligned(void) {
     uint32_t p[] = { 0xe1b0f00e };   /* MOVS pc, lr */
-    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 0);
 
     arm_set_mode(&c, ARM_MODE_FIQ);
     c.spsr[arm_bank_of_mode(ARM_MODE_FIQ)] = ARM_MODE_SVC;  /* T clear */
@@ -659,7 +659,7 @@ static void test_exception_return_to_arm_stays_word_aligned(void) {
 static void test_ldm_exception_return_takes_state_from_spsr(void) {
     /* LDMIA sp, {pc}^  ->  0xe8dd8000 */
     uint32_t p[] = { 0xe8dd8000u };
-    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 0);
 
     arm_set_mode(&c, ARM_MODE_IRQ);
     c.spsr[arm_bank_of_mode(ARM_MODE_IRQ)] = ARM_MODE_SVC | ARM_CPSR_T;
@@ -701,7 +701,7 @@ static void test_ldm_exception_return_takes_state_from_spsr(void) {
 static void test_rfe_aligns_for_the_restored_state(void) {
     /* RFEIA r0 -> 0xf8900a00 (P=0, U=1: read from [r0], not [r0-4]) */
     uint32_t p[] = { 0xf8900a00u };
-    arm_cpu_t c; load_and_run(&c, p, 1, 0);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 0);
 
     arm_set_mode(&c, ARM_MODE_IRQ);
     c.r[0] = 0x900;
@@ -731,7 +731,7 @@ static void test_rfe_aligns_for_the_restored_state(void) {
 }
 
 static void test_srs_and_rfe_reject_unprivileged_execution(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* A User-mode SRS must be rejected before touching the target mode's stack. */
     memset(g_ram, 0, sizeof g_ram);
@@ -782,7 +782,7 @@ static void test_srs_and_rfe_reject_unprivileged_execution(void) {
 }
 
 static void test_exception_returns_reject_invalid_modes_before_mutation(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* An invalid current mode must not alias to the User bank and then execute
      * with the privilege checks accidentally passing. Reject it before fetch. */
@@ -867,11 +867,11 @@ static void test_exception_returns_reject_invalid_modes_before_mutation(void) {
  */
 static void test_setend_le_runs_be_traps(void) {
     uint32_t le[] = { 0xf1010000u, 0xe3a0002au };   /* SETEND LE ; MOV r0,#42 */
-    arm_cpu_t c; load_and_run(&c, le, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, le, 2, 2);
     CHECK(c.r[0] == 42, "r0=%u expect 42 (SETEND LE must be a no-op)", c.r[0]);
 
     uint32_t be[] = { 0xf1010200u };                /* SETEND BE */
-    arm_cpu_t d; arm_status_t st = run_status(&d, be, 1, 1);
+    arm_cpu_t d = {0}; arm_status_t st = run_status(&d, be, 1, 1);
     CHECK(st == ARM_UNDEFINED,
           "status=%d expect ARM_UNDEFINED for SETEND BE", (int)st);
 }
@@ -888,7 +888,7 @@ static void test_umull_and_smull(void) {
     uint32_t p[] = { 0xe3e02000 /* MVN r2,#0  -> 0xffffffff */,
                      0xe3e03000 /* MVN r3,#0  -> 0xffffffff */,
                      0xe0810392 /* UMULL r0,r1,r2,r3        */ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 0x00000001u, "lo=%08x expect 00000001", c.r[0]);
     CHECK(c.r[1] == 0xfffffffeu, "hi=%08x expect fffffffe", c.r[1]);
 
@@ -897,7 +897,7 @@ static void test_umull_and_smull(void) {
      * unsigned implementation of the signed form. */
     uint32_t q[] = { 0xe3e02000, 0xe3e03000,
                      0xe0c10392 /* SMULL r0,r1,r2,r3 */ };
-    arm_cpu_t d; load_and_run(&d, q, 3, 3);
+    arm_cpu_t d = {0}; load_and_run(&d, q, 3, 3);
     CHECK(d.r[0] == 0x00000001u, "lo=%08x expect 00000001 (-1 * -1)", d.r[0]);
     CHECK(d.r[1] == 0x00000000u,
           "hi=%08x expect 00000000 — a signed multiply done unsigned gives "
@@ -911,7 +911,7 @@ static void test_umlal_accumulates(void) {
                      0xe3a02003 /* MOV r2,#3 */,
                      0xe3a03007 /* MOV r3,#7 */,
                      0xe0a10392 /* UMLAL r0,r1,r2,r3 */ };
-    arm_cpu_t c; load_and_run(&c, p, 5, 5);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 5, 5);
     CHECK(c.r[0] == 26, "lo=%u expect 26 (5 + 3*7)", c.r[0]);
     CHECK(c.r[1] == 0,  "hi=%u expect 0", c.r[1]);
 }
@@ -921,7 +921,7 @@ static void test_clz(void) {
     uint32_t p[] = { 0xe3a01001 /* MOV r1,#1        */, 0xe16f0f11 /* CLZ r0,r1 */,
                      0xe3a01000 /* MOV r1,#0        */, 0xe16f2f11 /* CLZ r2,r1 */,
                      0xe3e01000 /* MVN r1,#0 -> ~0  */, 0xe16f3f11 /* CLZ r3,r1 */ };
-    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 6, 6);
     CHECK(c.r[0] == 31, "clz(1)=%u expect 31", c.r[0]);
     CHECK(c.r[2] == 32, "clz(0)=%u expect 32 — the case that tempts a loop bug", c.r[2]);
     CHECK(c.r[3] == 0,  "clz(0xffffffff)=%u expect 0", c.r[3]);
@@ -937,7 +937,7 @@ static void test_qadd_saturates_and_sets_q(void) {
     uint32_t p[] = { 0xe3e01102 /* MVN r1,#0x80000000 -> 0x7fffffff */,
                      0xe3a02001 /* MOV r2,#1                        */,
                      0xe1010052 /* QADD r0,r2,r1                    */ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 0x7fffffffu,
           "r0=%08x expect 7fffffff (clamped, not wrapped to 80000000)", c.r[0]);
     CHECK((c.cpsr & ARM_CPSR_Q) != 0, "Q must be set on saturation");
@@ -945,7 +945,7 @@ static void test_qadd_saturates_and_sets_q(void) {
     /* Without saturation Q must stay clear and the result is ordinary. */
     uint32_t q[] = { 0xe3a01005 /* MOV r1,#5 */, 0xe3a02003 /* MOV r2,#3 */,
                      0xe1010052 /* QADD r0,r2,r1 */ };
-    arm_cpu_t d; load_and_run(&d, q, 3, 3);
+    arm_cpu_t d = {0}; load_and_run(&d, q, 3, 3);
     CHECK(d.r[0] == 8, "r0=%u expect 8", d.r[0]);
     CHECK((d.cpsr & ARM_CPSR_Q) == 0, "Q must not be set without saturation");
 }
@@ -961,13 +961,13 @@ static void test_swp_exchanges(void) {
                      0xe3a004bb /* MOV r0,#0xBB000000 */,
                      0xe1012090 /* SWP r2,r0,[r1]  */,
                      0xe5913000 /* LDR r3,[r1]     */ };
-    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 6, 6);
     CHECK(c.r[2] == 0xaa, "r2=%08x expect aa (SWP returns the OLD word)", c.r[2]);
     CHECK(c.r[3] == 0xbb000000, "r3=%08x expect bb000000 (SWP stored Rm)", c.r[3]);
 }
 
 static void test_swp_legacy_unaligned_word_semantics(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* U=0,A=0 defines SWP as WLoad followed by WStore: align down, rotate the
      * loaded word by the byte offset, then store the new word unrotated at the
@@ -1033,7 +1033,7 @@ static void test_ldrexd_strexd_roundtrip(void) {
                      0xe1a13f96 /* STREXD r3,r6,r7,[r1] */,
                      0xe5918000 /* LDR r8,[r1]          */,
                      0xe5919004 /* LDR r9,[r1,#4]       */ };
-    arm_cpu_t c; load_and_run(&c, p, 11, 11);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 11, 11);
     CHECK(c.r[4] == 0x12, "r4=%08x expect 12 (LDREXD low)",  c.r[4]);
     CHECK(c.r[5] == 0x34, "r5=%08x expect 34 (LDREXD high)", c.r[5]);
     CHECK(c.r[3] == 0,    "r3=%08x expect 0 (STREXD succeeded)", c.r[3]);
@@ -1051,12 +1051,12 @@ static void test_clrex_makes_strex_fail(void) {
                      0xe1910f9f /* LDREX r0,[r1]   */,
                      0xf57ff01f /* CLREX           */,
                      0xe1812f90 /* STREX r2,r0,[r1]*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[2] == 1, "r2=%08x expect 1 (STREX must fail after CLREX)", c.r[2]);
 }
 
 static void test_failed_strex_still_checks_write_permission(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     const uint32_t va = 0x80000800u;
 
     memset(g_ram, 0, sizeof g_ram);
@@ -1105,7 +1105,7 @@ static void test_exception_clears_exclusive_monitor(void) {
                      0xe1910f9f /* 0x14 LDREX r0,[r1] */,
                      0xef000000 /* 0x18 SWI #0        */,
                      0xe1812f90 /* 0x1c STREX r2,r0,[r1] */ };
-    arm_cpu_t c; load_and_run(&c, p, 8, 6);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 8, 6);
     CHECK(c.r[2] == 1, "r2=%08x expect 1 (STREX must fail after an exception)",
           c.r[2]);
 }
@@ -1116,7 +1116,7 @@ static void test_strh_ldrh(void) {
                      0xe3a01b02 /*MOV r1,#0x800*/,
                      0xe1c100b0 /*STRH r0,[r1]*/,
                      0xe1d120b0 /*LDRH r2,[r1]*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[2] == 0xab, "r2=%08x expect ab (LDRH)", c.r[2]);
 }
 
@@ -1126,7 +1126,7 @@ static void test_ldrsb_sign_extends(void) {
                      0xe3a01b02 /*MOV r1,#0x800*/,
                      0xe5c10000 /*STRB r0,[r1]*/,
                      0xe1d120d0 /*LDRSB r2,[r1]*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[2] == 0xffffffffu, "r2=%08x expect ffffffff (LDRSB)", c.r[2]);
 }
 
@@ -1136,7 +1136,7 @@ static void test_ldrsh_sign_extends(void) {
                      0xe3a01b02 /*MOV r1,#0x800*/,
                      0xe1c100b0 /*STRH r0,[r1]*/,
                      0xe1d120f0 /*LDRSH r2,[r1]*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[2] == 0xffff8000u, "r2=%08x expect ffff8000 (LDRSH)", c.r[2]);
 }
 
@@ -1148,7 +1148,7 @@ static void test_stmia_ldmia(void) {
                      0xe8a10005 /*STMIA r1!,{r0,r2}*/,
                      0xe3a01b02 /*MOV r1,#0x800*/,
                      0xe8910018 /*LDMIA r1,{r3,r4}*/ };
-    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 6, 6);
     CHECK(c.r[3] == 0x11, "r3=%08x expect 11", c.r[3]);
     CHECK(c.r[4] == 0x22, "r4=%08x expect 22", c.r[4]);
 }
@@ -1161,7 +1161,7 @@ static void test_push_pop(void) {
                      0xe3a010bb /*MOV r1,#0xBB*/,
                      0xe92d0003 /*STMDB sp!,{r0,r1}  (push)*/,
                      0xe8bd000c /*LDMIA sp!,{r2,r3}  (pop)*/ };
-    arm_cpu_t c; load_and_run(&c, p, 5, 5);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 5, 5);
     CHECK(c.r[2] == 0xaa, "r2=%08x expect aa", c.r[2]);
     CHECK(c.r[3] == 0xbb, "r3=%08x expect bb", c.r[3]);
     CHECK(c.r[13] == 0x900, "sp=%08x expect 900 (balanced)", c.r[13]);
@@ -1173,12 +1173,12 @@ static void test_ldm_to_pc_branches(void) {
                      0xe3a00c03 /*MOV r0,#0x300*/,
                      0xe92d0001 /*STMDB sp!,{r0}*/,
                      0xe8bd8000 /*LDMIA sp!,{pc}*/ };
-    arm_cpu_t c; load_and_run(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 4, 4);
     CHECK(c.r[15] == 0x300, "pc=%08x expect 300 (LDM to PC branched)", c.r[15]);
 }
 
 static void test_plain_loads_to_pc_reject_arm_halfword_targets(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0u, 0xe590f000u);               /* LDR pc,[r0] */
@@ -1202,7 +1202,7 @@ static void test_plain_loads_to_pc_reject_arm_halfword_targets(void) {
 static void test_unaligned_ldr_to_pc_never_reads_memory(void) {
     for (unsigned a = 0; a < 2u; a++) {
         for (unsigned u = 0; u < 2u; u++) {
-            arm_cpu_t c;
+            arm_cpu_t c = {0};
             memset(g_ram, 0, sizeof g_ram);
             m_w32(NULL, 0u, 0xe590f000u);       /* LDR pc,[r0] */
             arm_reset(&c, &g_bus);
@@ -1237,7 +1237,7 @@ static void test_imm_dp_not_trapped(void) {
     /* Regression for the extra-load/store mask: MOV r0,#0x90 has imm8 bits 7 and
      * 4 set, but is immediate data-processing (bit25=1) and must execute. */
     uint32_t p[] = { 0xe3a00090 /*MOV r0,#0x90*/ };
-    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    arm_cpu_t c = {0}; arm_status_t st = run_status(&c, p, 1, 1);
     CHECK(st == ARM_OK, "status=%d expect ARM_OK for MOV imm", (int)st);
     CHECK(c.r[0] == 0x90, "r0=%08x expect 90", c.r[0]);
 }
@@ -1245,7 +1245,7 @@ static void test_imm_dp_not_trapped(void) {
 static void test_banked_sp_per_mode(void) {
     /* r13 is banked per mode: a value written in SVC must not be visible in IRQ,
      * and must come back when we switch back. */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     arm_set_mode(&c, ARM_MODE_SVC);
     c.r[13] = 0xAAAA0000u;
     arm_set_mode(&c, ARM_MODE_IRQ);
@@ -1259,7 +1259,7 @@ static void test_banked_sp_per_mode(void) {
 
 static void test_fiq_banks_r8_r12(void) {
     /* FIQ additionally banks r8-r12. */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     arm_set_mode(&c, ARM_MODE_SVC);
     c.r[8] = 0x1234;
     arm_set_mode(&c, ARM_MODE_FIQ);
@@ -1272,7 +1272,7 @@ static void test_fiq_banks_r8_r12(void) {
 static void test_mrs_reads_cpsr(void) {
     /* MRS r0, CPSR */
     uint32_t p[] = { 0xe10f0000 };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[0] == c.cpsr, "r0=%08x expect cpsr=%08x", c.r[0], c.cpsr);
 }
 
@@ -1280,7 +1280,7 @@ static void test_msr_switches_mode(void) {
     /* MOV r0,#0xD2 (IRQ mode, I set) ; MSR CPSR_c, r0 -> mode becomes IRQ */
     uint32_t p[] = { 0xe3a000d2 /*MOV r0,#0xD2*/,
                      0xe121f000 /*MSR CPSR_c, r0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_IRQ,
           "mode=%02x expect IRQ(12)", c.cpsr & ARM_CPSR_MODE_MASK);
 }
@@ -1288,7 +1288,7 @@ static void test_msr_switches_mode(void) {
 static void test_swi_enters_svc(void) {
     /* SWI #0 from SYS mode: vectors to 0x08, enters SVC, LR=return, SPSR=old. */
     uint32_t p[] = { 0xef000000 /*SWI #0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[15] == ARM_VEC_SWI, "pc=%08x expect 08 (SWI vector)", c.r[15]);
     CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
           "mode=%02x expect SVC(13)", c.cpsr & ARM_CPSR_MODE_MASK);
@@ -1306,7 +1306,7 @@ static void test_exception_return_restores_mode(void) {
     p[2] = 0xe3a0dc09;                 /* 0x08: MOV sp,#0x900 (sp_svc)    */
     p[3] = 0xe92d4000;                 /* 0x0c: STMDB sp!,{lr}            */
     p[4] = 0xe8fd8000;                 /* 0x10: LDMIA sp!,{pc}^  (return) */
-    arm_cpu_t c; load_and_run(&c, p, 16, 4);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 16, 4);
     CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SYS,
           "mode=%02x expect back in SYS(1f)", c.cpsr & ARM_CPSR_MODE_MASK);
     CHECK(c.r[15] == 4, "pc=%08x expect 4 (returned after the SWI)", c.r[15]);
@@ -1316,7 +1316,7 @@ static void test_cp15_reads_midr(void) {
     /* MRC p15,0,r0,c0,c0,0 -> the ARM1176JZF-S main ID. The kernel reads this
      * to identify the CPU it is running on. */
     uint32_t p[] = { 0xee100f10 };
-    arm_cpu_t c; load_and_run(&c, p, 1, 1);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 1, 1);
     CHECK(c.r[0] == ARM1176_MIDR, "r0=%08x expect %08x (MIDR)", c.r[0], ARM1176_MIDR);
 }
 
@@ -1331,7 +1331,7 @@ static void test_cp15_cpuid_feature_bank(void) {
                      0xee103f32 /*MRC p15,0,r3,c0,c2,1  ID_ISAR1*/,
                      0xee104f92 /*MRC p15,0,r4,c0,c2,4  ID_ISAR4*/,
                      0xee105f31 /*MRC p15,0,r5,c0,c1,1  ID_PFR1 */ };
-    arm_cpu_t c; load_and_run(&c, p, 6, 6);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 6, 6);
     CHECK(c.r[0] == ARM1176_ID_PFR0,  "ID_PFR0=%08x expect %08x",  c.r[0], ARM1176_ID_PFR0);
     CHECK(c.r[1] == ARM1176_ID_MMFR0, "ID_MMFR0=%08x expect %08x", c.r[1], ARM1176_ID_MMFR0);
     CHECK(c.r[2] == ARM1176_ID_ISAR0, "ID_ISAR0=%08x expect %08x", c.r[2], ARM1176_ID_ISAR0);
@@ -1360,7 +1360,7 @@ static void test_cp15_cpuid_scheme_grades_as_armv6(void) {
                      0xe3530020 /*CMP   r3, #0x20        Jazelle == 2 */,
                      0x03c13702 /*BICEQ r3, r1, #0x80000              */,
                      0x03833807 /*ORREQ r3, r3, #0x70000              */ };
-    arm_cpu_t c; load_and_run(&c, p, 7, 7);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 7, 7);
     CHECK(((c.r[1] >> 16) & 0xfu) == 0xfu,
           "MIDR arch nibble=%x expect f (CPUID scheme)", (c.r[1] >> 16) & 0xfu);
     CHECK(((c.r[3] >> 16) & 0xfu) == 7u,
@@ -1375,7 +1375,7 @@ static void test_cp15_id_dfr0_matches_absent_debug_unit(void) {
      * DBGDIDR, so the two answers have to be consistent with each other. */
     uint32_t p[] = { 0xee100f51 /*MRC p15,0,r0,c0,c1,2   ID_DFR0 */,
                      0xee101e10 /*MRC p14,0,r1,c0,c0,0   DBGDIDR */ };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK(c.r[0] == 0, "ID_DFR0=%08x expect 0 (no debug unit modelled)", c.r[0]);
     CHECK(c.r[1] == 0, "DBGDIDR=%08x expect 0", c.r[1]);
 }
@@ -1387,7 +1387,7 @@ static void test_cp15_sctlr_roundtrip(void) {
     uint32_t p[] = { 0xe3a00004 /*MOV r0,#4 (SCTLR.C)*/,
                      0xee010f10 /*MCR p15,0,r0,c1,c0,0*/,
                      0xee111f10 /*MRC p15,0,r1,c1,c0,0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[1] == 4, "r1=%08x expect 4 (SCTLR readback)", c.r[1]);
     CHECK((c.cp15.sctlr & ARM_SCTLR_C) != 0, "SCTLR.C should be set");
 }
@@ -1408,7 +1408,7 @@ static void test_cp15_c1_is_gated_on_crm_zero(void) {
                      0xee010f51 /*MCR p15,0,r0,c1,c1,2 (NSACR)    */,
                      0xee111f11 /*MRC p15,0,r1,c1,c1,0            */,
                      0xee112f10 /*MRC p15,0,r2,c1,c0,0            */ };
-    arm_cpu_t c; load_and_run(&c, p, 9, 9);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 9, 9);
     CHECK(c.cp15.sctlr == 4u,
           "sctlr=%08x expect 4 — c1,c1,0 must not write SCTLR", c.cp15.sctlr);
     CHECK(c.cp15.cpacr == 0x80u,
@@ -1424,7 +1424,7 @@ static void test_cp15_ttbr0_roundtrip(void) {
     uint32_t p[] = { 0xe3a00b02 /*MOV r0,#0x800*/,
                      0xee020f10 /*MCR p15,0,r0,c2,c0,0  (TTBR0)*/,
                      0xee121f10 /*MRC p15,0,r1,c2,c0,0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.cp15.ttbr0 == 0x800, "ttbr0=%08x expect 800", c.cp15.ttbr0);
     CHECK(c.r[1] == 0x800, "r1=%08x expect 800", c.r[1]);
 }
@@ -1434,7 +1434,7 @@ static void test_cp15_ttbcr_masks_only_reserved_bits(void) {
     uint32_t p[] = { 0xe3a000ff /*MOV r0,#0xff*/,
                      0xee020f50 /*MCR p15,0,r0,c2,c0,2 (TTBCR)*/,
                      0xee121f50 /*MRC p15,0,r1,c2,c0,2*/ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.cp15.ttbcr == 0x37u, "ttbcr=%08x expect 00000037", c.cp15.ttbcr);
     CHECK(c.r[1] == 0x37u, "TTBCR readback=%08x expect 00000037", c.r[1]);
 }
@@ -1442,7 +1442,7 @@ static void test_cp15_ttbcr_masks_only_reserved_bits(void) {
 static void test_cp15_cache_op_is_accepted(void) {
     /* MCR p15,0,r0,c7,c5,0 (invalidate I-cache) must not trap. */
     uint32_t p[] = { 0xee070f15 };
-    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    arm_cpu_t c = {0}; arm_status_t st = run_status(&c, p, 1, 1);
     CHECK(st == ARM_OK, "status=%d expect ARM_OK for cache maintenance", (int)st);
 }
 
@@ -1459,7 +1459,7 @@ static void test_cp15_wfi_uses_only_the_exact_privileged_hook(void) {
 
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, wfi);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     c.cpsr = ARM_MODE_SYS | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_N;
     arm_status_t st = arm_step(&c);
@@ -1538,7 +1538,7 @@ static void test_high_vectors(void) {
     uint32_t p[] = { 0xe3a00a02 /*MOV r0,#0x2000 (SCTLR.V)*/,
                      0xee010f10 /*MCR p15,0,r0,c1,c0,0*/,
                      0xef000000 /*SWI #0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[15] == 0xffff0008u, "pc=%08x expect ffff0008 (high vectors)", c.r[15]);
 }
 
@@ -1558,7 +1558,7 @@ static void mmu_setup_section(arm_cpu_t *c, uint32_t va, uint32_t pa,
 }
 
 static void test_mmu_disabled_is_identity(void) {
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     uint32_t pa = 0;
     uint32_t f = arm_mmu_translate(&c, 0xdeadb000u, ARM_ACCESS_READ, true, &pa);
     CHECK(f == 0, "fsr=%u expect 0 with MMU off", f);
@@ -1566,7 +1566,7 @@ static void test_mmu_disabled_is_identity(void) {
 }
 
 static void test_mmu_section_translation(void) {
-    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
+    arm_cpu_t c = {0}; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
     uint32_t pa = 0;
     uint32_t f = arm_mmu_translate(&c, 0x80001234u, ARM_ACCESS_READ, true, &pa);
     CHECK(f == 0, "fsr=%u expect 0", f);
@@ -1574,7 +1574,7 @@ static void test_mmu_section_translation(void) {
 }
 
 static void test_mmu_unmapped_faults(void) {
-    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
+    arm_cpu_t c = {0}; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 3, 0);
     uint32_t pa = 0;
     /* 0x90000000 has no descriptor at all. */
     uint32_t f = arm_mmu_translate(&c, 0x90000000u, ARM_ACCESS_READ, true, &pa);
@@ -1584,7 +1584,7 @@ static void test_mmu_unmapped_faults(void) {
 
 static void test_mmu_user_write_permission(void) {
     /* AP=10: privileged RW, user read-only. A user write must fault. */
-    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 2, 0);
+    arm_cpu_t c = {0}; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 2, 0);
     uint32_t pa = 0;
     CHECK(arm_mmu_translate(&c, 0x80000000u, ARM_ACCESS_READ, false, &pa) == 0,
           "user read should be permitted with AP=10");
@@ -1596,7 +1596,7 @@ static void test_mmu_user_write_permission(void) {
 static void test_mmu_small_page_translation(void) {
     /* Two-level walk: L1 coarse pointer -> L2 small page. */
     const uint32_t l1 = 0x4000, l2 = 0x5000;
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, l1 + ((0x80000000u >> 20) << 2), (l2 & 0xfffffc00u) | 1u); /* coarse */
     m_w32(NULL, l2 + (((0x80000000u >> 12) & 0xff) << 2),
@@ -1613,7 +1613,7 @@ static void test_mmu_small_page_translation(void) {
 static void test_data_abort_taken(void) {
     /* With the MMU on and nothing mapped at the load address, LDR must raise a
      * data abort: ABT mode, vector 0x10, and DFAR recording the address. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     /* identity-map the low section so the fetch itself succeeds */
     m_w32(NULL, 0x4000 + 0, (0x00000000u) | (3u << 10) | 2u);
@@ -1640,7 +1640,7 @@ static void test_pld_is_a_nop_not_a_branch(void) {
     uint32_t p[] = { 0xe3a01a01 /*MOV r1,#0x1000*/,
                      0xf5d1f000 /*PLD [r1]*/,
                      0xe3a00007 /*MOV r0,#7*/ };
-    arm_cpu_t c; load_and_run(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 3);
     CHECK(c.r[0] == 7, "r0=%u expect 7 (execution continued past PLD)", c.r[0]);
     CHECK(c.r[15] == 12, "pc=%08x expect 0c (PLD did not branch)", c.r[15]);
 }
@@ -1648,7 +1648,7 @@ static void test_pld_is_a_nop_not_a_branch(void) {
 static void test_unconditional_space_traps(void) {
     /* Unimplemented cond==0xF encodings (e.g. SETEND) must trap, not execute. */
     uint32_t p[] = { 0xf1010200 /*SETEND BE*/ };
-    arm_cpu_t c; arm_status_t st = run_status(&c, p, 1, 1);
+    arm_cpu_t c = {0}; arm_status_t st = run_status(&c, p, 1, 1);
     CHECK(st == ARM_UNDEFINED, "status=%d expect ARM_UNDEFINED for SETEND", (int)st);
 }
 
@@ -1656,7 +1656,7 @@ static void test_clz_does_not_corrupt_cpsr(void) {
     /* CLZ sits in the same opcode space as MSR. With a loose MSR mask it would
      * rewrite CPSR (including the mode field) instead of trapping. */
     uint32_t p[] = { 0xe16f0f11 /*CLZ r0,r1*/ };
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, p[0]);
     c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SYS;
@@ -1672,7 +1672,7 @@ static void test_clz_does_not_corrupt_cpsr(void) {
 static void test_msr_still_works(void) {
     /* The tightened mask must not break real MSR. */
     uint32_t p[] = { 0xe3a000d2 /*MOV r0,#0xD2*/, 0xe121f000 /*MSR CPSR_c,r0*/ };
-    arm_cpu_t c; load_and_run(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 2, 2);
     CHECK((c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_IRQ,
           "mode=%02x expect IRQ", c.cpsr & ARM_CPSR_MODE_MASK);
 }
@@ -1688,7 +1688,7 @@ static void test_arm_media_extend_and_reverse(void) {
                      0xe6ff4071 /*UXTH r4,r1 */,
                      0xeafffffe /*B .        */,
                      0x11228344 /*literal    */ };
-    arm_cpu_t c; load_and_run(&c, p, 7, 5);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 7, 5);
     CHECK(c.r[1] == 0x11228344u, "r1=%08x expect 11228344", c.r[1]);
     CHECK(c.r[0] == 0x44832211u, "r0=%08x expect 44832211 (REV)", c.r[0]);
     CHECK(c.r[2] == 0x44, "r2=%08x expect 44 (UXTB)", c.r[2]);
@@ -1704,7 +1704,7 @@ static void test_arm_media_pair_extend(void) {
 #define PAIR_EXT(cond, op, rn, rd, rot, rm) \
     (((cond) << 28) | 0x06000070u | ((op) << 20) | ((rn) << 16) | \
      ((rd) << 12) | ((rot) << 10) | (rm))
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_status_t st;
     const uint32_t blocker = 0xe6cf3073u;       /* UXTB16 r3,r3 */
 
@@ -1841,7 +1841,7 @@ static void test_arm_media_reverse_edges(void) {
         { 0xe6ff0fb1u, 0x00004483u, "REVSH positive" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         memset(g_ram, 0, sizeof g_ram);
         m_w32(NULL, 0, cases[i].insn);
         arm_reset(&c, &g_bus);
@@ -1865,7 +1865,7 @@ static void test_arm_media_reverse_edges(void) {
 
     /* REVSH must sign-extend bit 15 of the byte-reversed halfword. */
     uint32_t revsh = 0xe6ff0fb1u;
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram); m_w32(NULL, 0, revsh);
     arm_reset(&c, &g_bus); c.r[1] = 0x11224483u;
     CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0xffff8344u,
@@ -1896,7 +1896,7 @@ static void test_arm_media_saturate(void) {
 #define SAT16(cond, uns, field, rd, rn) \
     (((cond) << 28) | 0x06a00f30u | ((uns) << 22) | ((field) << 16) | \
      ((rd) << 12) | (rn))
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_status_t st;
 
     /* Both observed UI stops used this exact word. ASR #14 produces 256 here,
@@ -2018,7 +2018,7 @@ static void test_arm_media_saturate(void) {
 
 static void test_apx_makes_mapping_read_only(void) {
     /* APX=1, AP=01 is privileged read-only: a privileged write must fault. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0x4000 + ((0x80000000u >> 20) << 2),
           0x00200000u | (1u << 15) | (1u << 10) | 2u);   /* APX=1, AP=01 */
@@ -2035,7 +2035,7 @@ static void test_apx_makes_mapping_read_only(void) {
 }
 
 static void test_xp0_ignores_extended_apx_bits(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0;
     memset(g_ram, 0, sizeof g_ram);
 
@@ -2062,7 +2062,7 @@ static void test_xp0_ignores_extended_apx_bits(void) {
 }
 
 static void test_xp0_large_and_small_ap_subpages(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0;
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0x4000 + (0x800u << 2), 0x8000u | 1u);
@@ -2113,7 +2113,7 @@ static void test_xp0_large_and_small_ap_subpages(void) {
 }
 
 static void test_sctlr_sr_legacy_permissions(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0;
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0x4000 + (0x800u << 2), 0x00200000u | 2u); /* AP=00 */
@@ -2148,7 +2148,7 @@ static void test_sctlr_sr_legacy_permissions(void) {
 }
 
 static void test_arm1176_rejects_fine_page_tables(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0;
     memset(g_ram, 0, sizeof g_ram);
     /* ARM1176 removed the old L1 fine-table descriptor. It is a translation
@@ -2166,7 +2166,7 @@ static void test_arm1176_rejects_fine_page_tables(void) {
 }
 
 static void test_page_translation_fault_precedes_page_domain_fault(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0;
     const uint32_t l1 = 0x4000u, l2 = 0x8000u, domain = 7u;
     memset(g_ram, 0, sizeof g_ram);
@@ -2193,7 +2193,7 @@ static void test_page_translation_fault_precedes_page_domain_fault(void) {
 }
 
 static void test_force_access_flag_faults_precede_domain_permissions(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa, fsr;
 
     /* Extended section AP[0]=0 is an access-flag fault when SCTLR.FA is set.
@@ -2273,7 +2273,7 @@ static void test_force_access_flag_faults_precede_domain_permissions(void) {
 
 static void test_fetch_cache_refill_requires_an_exact_live_witness(void) {
     arm_bus_t bus = g_bus;
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t pa = 0u;
     uint64_t hits, misses, flushes;
     const uint32_t mapped_va = UINT32_C(0x80000420);
@@ -2367,7 +2367,7 @@ static void test_fetch_cache_refill_requires_an_exact_live_witness(void) {
 static void test_abort_restores_base_register(void) {
     /* Base Restored Abort Model: after a data abort the base and destination
      * registers must be unchanged so the handler can retry the instruction. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0x4000 + 0, 0x00000000u | (3u << 10) | 2u);   /* identity map VA 0 */
     uint32_t prog[] = { 0xe4901004 };    /* LDR r1,[r0],#4  (post-indexed) */
@@ -2403,7 +2403,7 @@ static void alignment_map_normal_identity(arm_cpu_t *c) {
 }
 
 static void test_sctlr_a_faults_ordinary_unaligned_accesses(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     alignment_setup(&c, 0xe5901000u);             /* LDR r1,[r0] */
     c.cp15.sctlr |= ARM_SCTLR_A | ARM_SCTLR_U;
     c.r[0] = 0x801u;
@@ -2434,7 +2434,7 @@ static void test_sctlr_a_faults_ordinary_unaligned_accesses(void) {
 }
 
 static void test_sctlr_u_selects_legacy_or_armv6_unaligned_data(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* Legacy U=0 word loads align down, then rotate right by the byte offset. */
     alignment_setup(&c, 0xe5901000u);             /* LDR r1,[r0] */
@@ -2490,7 +2490,7 @@ static void test_sctlr_u_selects_legacy_or_armv6_unaligned_data(void) {
 }
 
 static void test_multiword_alignment_depends_on_sctlr_u_a(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* U=1 makes an unaligned LDM an alignment fault even though A is clear. */
     alignment_setup(&c, 0xe8900006u);             /* LDMIA r0,{r1,r2} */
@@ -2544,7 +2544,7 @@ static void test_multiword_alignment_depends_on_sctlr_u_a(void) {
 }
 
 static void test_arm_multiword_base_writeback_restrictions(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     alignment_setup(&c, 0xe8b10002u);           /* LDMIA r1!,{r1} */
     c.r[1] = 0x800u;
@@ -2577,7 +2577,7 @@ static void test_arm_multiword_base_writeback_restrictions(void) {
 static void check_unpredictable_single_transfer(uint32_t insn,
                                                 uint32_t target,
                                                 const char *what) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t sentinel = 0x5a96c33cu;
 
     g_watch_addr = 0xffffffffu;
@@ -2613,7 +2613,7 @@ static void check_unpredictable_single_transfer(uint32_t insn,
 }
 
 static void test_single_transfer_zero_post_same_base_load(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     g_watch_addr = 0xffffffffu;
     memset(g_ram, 0, sizeof g_ram);
@@ -2693,7 +2693,7 @@ static void test_single_transfer_unpredictable_forms_trap_before_bus(void) {
  * about the addressing modes is shared with the halfword forms above.
  */
 static void test_ldrd_strd_transfer_the_register_pair(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* LDRD r0,r1,[r2]: low word into Rd, high word into Rd+1. */
     alignment_setup(&c, 0xe1c200d0u);             /* LDRD r0,r1,[r2] */
@@ -2762,7 +2762,7 @@ static void test_ldrd_strd_transfer_the_register_pair(void) {
 }
 
 static void test_ldrd_strd_alignment_is_the_armv6_word_rule(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /*
      * The case most likely to be got wrong. ARMv5TE required a doubleword-
@@ -2873,7 +2873,7 @@ static void test_ldrd_strd_operand_restrictions_trap_before_bus(void) {
 }
 
 static void test_exclusive_alignment_is_never_silently_fixed(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     alignment_setup(&c, 0xe1901f9fu);             /* LDREX r1,[r0] */
     c.cp15.sctlr = (c.cp15.sctlr & ~ARM_SCTLR_A) | ARM_SCTLR_U;
     c.r[0] = 0x801u;
@@ -2908,7 +2908,7 @@ static void test_exclusive_alignment_is_never_silently_fixed(void) {
 }
 
 static void check_unpredictable_atomic_operands(uint32_t insn, const char *what) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t before[16];
 
     memset(g_ram, 0, sizeof g_ram);
@@ -2970,7 +2970,7 @@ static void load_thumb(arm_cpu_t *c, const uint16_t *prog, size_t n, int steps) 
 static void test_thumb_mov_add(void) {
     /* MOV r0,#40 ; MOV r1,#2 ; ADD r0,r0,r1 */
     uint16_t p[] = { 0x2028, 0x2102, 0x1840 };
-    arm_cpu_t c; load_thumb(&c, p, 3, 3);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 3, 3);
     CHECK(c.r[0] == 42, "r0=%u expect 42", c.r[0]);
     CHECK(c.r[15] == 6, "pc=%u expect 6 (2 bytes per instruction)", c.r[15]);
 }
@@ -2978,7 +2978,7 @@ static void test_thumb_mov_add(void) {
 static void test_thumb_lsl_flags(void) {
     /* MOV r0,#1 ; LSL r1,r0,#31 -> N set */
     uint16_t p[] = { 0x2001, 0x07c1 };
-    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 2, 2);
     CHECK(c.r[1] == 0x80000000u, "r1=%08x expect 80000000", c.r[1]);
     CHECK((c.cpsr & ARM_CPSR_N) != 0, "N should be set");
 }
@@ -2989,7 +2989,7 @@ static void test_thumb_push_pop(void) {
                      0x21bb,        /* MOV r1,#0xBB */
                      0xb403,        /* PUSH {r0,r1} */
                      0xbc0c };      /* POP  {r2,r3} */
-    arm_cpu_t c; load_thumb(&c, p, 4, 0);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 4, 0);
     c.r[13] = 0x900;
     for (int i = 0; i < 4; i++) arm_step(&c);
     CHECK(c.r[2] == 0xaa, "r2=%08x expect aa", c.r[2]);
@@ -3008,7 +3008,7 @@ static void thumb_alignment_setup(arm_cpu_t *c, uint16_t insn) {
 }
 
 static void test_thumb_multiword_alignment_uses_strict_rules(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* Thumb LDMIA is a multiple transfer too: U=1 makes a misaligned base an
      * alignment abort before the first read, rather than an ordinary unaligned
@@ -3087,7 +3087,7 @@ static void test_thumb_multiword_alignment_uses_strict_rules(void) {
 static void test_thumb_conditional_branch(void) {
     /* MOV r0,#1 ; CMP r0,#1 ; BNE +4 (not taken) ; MOV r1,#7 */
     uint16_t p[] = { 0x2001, 0x2801, 0xd101, 0x2107 };
-    arm_cpu_t c; load_thumb(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 4, 4);
     CHECK(c.r[1] == 7, "r1=%u expect 7 (BNE not taken)", c.r[1]);
 }
 
@@ -3103,7 +3103,7 @@ static void test_arm_to_thumb_and_back(void) {
     m_w16(NULL, 0x12, 0x4710);          /* Thumb: BX r2 -> ARM */
     m_w32(NULL, 0x20, 0xe3a03009);      /* ARM:   MOV r3,#9    */
 
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     c.cpsr = (c.cpsr & ~0x1fu) | ARM_MODE_SYS;
     for (int i = 0; i < 6; i++) arm_step(&c);
 
@@ -3113,7 +3113,7 @@ static void test_arm_to_thumb_and_back(void) {
 }
 
 static void test_bx_blx_register_reject_invalid_targets_without_side_effects(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0u, 0xe12fff3fu);              /* BLX pc: UNPREDICTABLE */
@@ -3178,7 +3178,7 @@ static void test_thumb_bl_pair(void) {
      * 4 + 4 = 8. LR must be the address after the pair, with the Thumb bit set
      * so the eventual BX LR returns to Thumb state. */
     uint16_t p[] = { 0xf000, 0xf802 };
-    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 2, 2);
     CHECK(c.r[15] == 0x08, "pc=%08x expect 08", c.r[15]);
     CHECK(c.r[14] == 0x05, "lr=%08x expect 05 (return addr | Thumb bit)", c.r[14]);
 }
@@ -3190,7 +3190,7 @@ static void test_thumb_extend_and_reverse(void) {
                      0xb2ca,   /* UXTB r2,r1  -> 0xff  */
                      0xb24b,   /* SXTB r3,r1  -> -1    */
                      0xb289 }; /* UXTH r1,r1  -> 0xff  */
-    arm_cpu_t c; load_thumb(&c, p, 4, 4);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 4, 4);
     CHECK(c.r[2] == 0xff, "r2=%08x expect ff (UXTB)", c.r[2]);
     CHECK(c.r[3] == 0xffffffffu, "r3=%08x expect ffffffff (SXTB)", c.r[3]);
     CHECK(c.r[1] == 0xff, "r1=%08x expect ff (UXTH)", c.r[1]);
@@ -3200,7 +3200,7 @@ static void test_thumb_rev(void) {
     /* Build 0x11223344 a byte at a time, then REV it. */
     uint16_t p[] = { 0x2011, 0x0200, 0x3022, 0x0200,
                      0x3033, 0x0200, 0x3044, 0xba01 };
-    arm_cpu_t c; load_thumb(&c, p, 8, 8);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 8, 8);
     CHECK(c.r[0] == 0x11223344u, "r0=%08x expect 11223344", c.r[0]);
     CHECK(c.r[1] == 0x44332211u, "r1=%08x expect 44332211 (REV)", c.r[1]);
 }
@@ -3208,7 +3208,7 @@ static void test_thumb_rev(void) {
 static void test_thumb_cps(void) {
     /* CPSID i then CPSIE i must set and clear the CPSR I bit. */
     uint16_t p[] = { 0xb672, 0xb662 };
-    arm_cpu_t c; load_thumb(&c, p, 2, 1);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 2, 1);
     CHECK((c.cpsr & ARM_CPSR_I) != 0, "CPSID should mask IRQs");
     arm_step(&c);
     CHECK((c.cpsr & ARM_CPSR_I) == 0, "CPSIE should unmask IRQs");
@@ -3220,7 +3220,7 @@ static void test_mmu_supersection(void) {
      * from va[23:0] — a different split from the 1 MB section. Treating one as
      * a section silently resolves the wrong physical address, and the kernel
      * read garbage where a valid pointer lived. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     /* Bits[8:5] are not a domain in a supersection. Give them a value whose
      * corresponding DACR domain is disabled: a walker that decodes them as a
@@ -3252,7 +3252,7 @@ static void test_thumb_blx_suffix_is_not_a_branch(void) {
      * to ARM state. Treating the whole 0xExxx range as a branch sent BLX to a
      * garbage address, and the kernel executed a pointer table as code. */
     uint16_t p[] = { 0xf000, 0xe802 };
-    arm_cpu_t c; load_thumb(&c, p, 2, 2);
+    arm_cpu_t c = {0}; load_thumb(&c, p, 2, 2);
     CHECK((c.cpsr & ARM_CPSR_T) == 0, "BLX suffix must switch back to ARM state");
     CHECK((c.r[15] & 3u) == 0, "pc=%08x must be word-aligned after BLX", c.r[15]);
     CHECK(c.r[14] == 0x05, "lr=%08x expect 05 (return addr | Thumb bit)", c.r[14]);
@@ -3267,7 +3267,7 @@ static void test_user_bank_stm(void) {
     /* STM with the S bit transfers the USER bank whatever mode we are in —
      * how a kernel saves user context on exception entry. Real XNU uses
      * "STMIA sp,{r0-r14}^". */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     arm_set_mode(&c, ARM_MODE_USR);
     c.r[13] = 0xaaaa0000u; c.r[14] = 0xbbbb0000u;
@@ -3331,7 +3331,7 @@ static void test_mmu_ttbcr_n0_ignores_ttbr1(void) {
     /* N == 0 is the reset state and must keep behaving exactly as the walker did
      * before the split existed: a single 4096-entry TTBR0 table covering the
      * whole 4 GB, based at TTBR0[31:14], with TTBR1 never consulted. */
-    arm_cpu_t c; mmu_setup_split(&c, 0, 0x4200u, 0x8000u); /* base masks to 0x4000 */
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 0, 0x4200u, 0x8000u); /* base masks to 0x4000 */
     mmu_put_section(0x4000, 0x001, 0x00400000u);   /* VA 0x00100000 */
     mmu_put_section(0x4000, 0xc00, 0x00200000u);   /* VA 0xc0000000 */
     mmu_put_section(0x4000, 0xfff, 0x00500000u);   /* VA 0xfff00000, last entry */
@@ -3351,7 +3351,7 @@ static void test_mmu_ttbcr_n2_low_va_uses_shrunk_ttbr0(void) {
     /* N == 2 is what XNU-ARM runs with. TTBR0's table shrinks to 2^(14-2) = 4 KB
      * / 1024 entries, its base is TTBR0[31:12] (the low 12 bits of the register
      * are not part of the address), and it is indexed by VA[29:20] — ten bits. */
-    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5400u, 0x8000u); /* base masks to 0x5000 */
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 2, 0x5400u, 0x8000u); /* base masks to 0x5000 */
     mmu_put_section(0x5000, 0x001, 0x00700000u);   /* VA 0x00100000 */
     mmu_put_section(0x5000, 0x3ff, 0x00800000u);   /* VA 0x3ff00000, last entry */
     mmu_put_section(0x5400, 0x001, 0x00900000u);   /* decoy: unmasked TTBR0 base */
@@ -3368,7 +3368,7 @@ static void test_mmu_ttbcr_n2_kernel_va_uses_ttbr1(void) {
     /* With N == 2 everything at or above 0x40000000 walks TTBR1: all of kernel
      * text at 0xc0000000 and the 0xffff0000 exception-vector page. TTBR1's table
      * is a full 16 KB indexed by VA[31:20] regardless of N. */
-    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5000u, 0x8234u); /* base masks to 0x8000 */
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 2, 0x5000u, 0x8234u); /* base masks to 0x8000 */
     mmu_put_section(0x8000, 0xc00, 0x00200000u);   /* kernel text  0xc0000000 */
     mmu_put_section(0x8000, 0xfff, 0x00300000u);   /* vector page  0xffff0000 */
     mmu_put_section(0x8234, 0xc00, 0x00900000u);   /* decoy: unmasked TTBR1 base */
@@ -3392,7 +3392,7 @@ static void test_mmu_ttbcr_n2_kernel_va_uses_ttbr1(void) {
 static void test_mmu_ttbcr_n2_split_boundary(void) {
     /* The selector with N == 2 is VA[31:30]: 0x3ff00000 is the last VA that
      * still walks TTBR0 and 0x40000000 is the first that crosses to TTBR1. */
-    arm_cpu_t c; mmu_setup_split(&c, 2, 0x5000u, 0x8000u);
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 2, 0x5000u, 0x8000u);
     mmu_put_section(0x5000, 0x3ff, 0x00100000u);   /* TTBR0 side of the line */
     mmu_put_section(0x8000, 0x400, 0x00200000u);   /* TTBR1 side of the line */
     /* 0x40000000's index truncated to ten bits is 0 — where the walk would land
@@ -3416,7 +3416,7 @@ static void test_mmu_kernel_mapping_survives_ttbr0_pmap_switch(void) {
      * used TTBR0 lost kernel text and the 0xffff0000 vector page the instant
      * that happened, and the CPU stormed on prefetch aborts at 0xffff000c. */
     const uint32_t pmap_a = 0x5000u, pmap_b = 0x6000u, kernel = 0x8000u;
-    arm_cpu_t c; mmu_setup_split(&c, 2, pmap_a, kernel);
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 2, pmap_a, kernel);
     mmu_put_section(kernel, 0xc00, 0x00200000u);   /* kernel text  0xc0000000 */
     mmu_put_section(kernel, 0xfff, 0x00300000u);   /* vector page  0xffff0000 */
     mmu_put_section(pmap_a, 0x001, 0x00500000u);   /* user 0x00100000 under A */
@@ -3448,7 +3448,7 @@ static void test_mmu_kernel_mapping_survives_ttbr0_pmap_switch(void) {
 static void test_mmu_ttbcr_n1_table_geometry(void) {
     /* N == 1: TTBR0's table is 2^(14-1) = 8 KB / 2048 entries based at
      * TTBR0[31:13] and indexed by VA[30:20]; the split falls at 0x80000000. */
-    arm_cpu_t c; mmu_setup_split(&c, 1, 0x6800u, 0x8000u); /* base masks to 0x6000 */
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 1, 0x6800u, 0x8000u); /* base masks to 0x6000 */
     mmu_put_section(0x6000, 0x001, 0x00300000u);   /* VA 0x00100000 */
     mmu_put_section(0x6000, 0x7ff, 0x00100000u);   /* VA 0x7ff00000, last entry */
     mmu_put_section(0x8000, 0x800, 0x00200000u);   /* VA 0x80000000, first TTBR1 VA */
@@ -3470,7 +3470,7 @@ static void test_mmu_ttbcr_n3_table_geometry(void) {
     /* N == 3: TTBR0's table is 2^(14-3) = 2 KB / 512 entries based at
      * TTBR0[31:11] and indexed by VA[28:20]; the split falls at 0x20000000.
      * TTBR1's table stays a full 16 KB indexed by VA[31:20] whatever N is. */
-    arm_cpu_t c; mmu_setup_split(&c, 3, 0x6400u, 0x8000u); /* base masks to 0x6000 */
+    arm_cpu_t c = {0}; mmu_setup_split(&c, 3, 0x6400u, 0x8000u); /* base masks to 0x6000 */
     mmu_put_section(0x6000, 0x001, 0x00300000u);   /* VA 0x00100000 */
     mmu_put_section(0x6000, 0x1ff, 0x00100000u);   /* VA 0x1ff00000, last entry */
     mmu_put_section(0x8000, 0x200, 0x00200000u);   /* VA 0x20000000, first TTBR1 VA */
@@ -3494,7 +3494,7 @@ static void test_mmu_ttbcr_n3_table_geometry(void) {
 
 static void test_mmu_ttbcr_pd_bits_suppress_selected_walk(void) {
     uint32_t pa, fsr;
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* PD0 disables a low-VA TTBR0 walk even when a valid descriptor exists. */
     mmu_setup_split(&c, 2u, 0x5000u, 0x8000u);
@@ -3572,7 +3572,7 @@ static void test_dfsr_wnr_write_vs_read(void) {
     /* At the translator itself: the SAME fault, reached by a read and by a
      * write, must differ in exactly one bit. AP=00 is "no access", so both
      * directions fault with the same status and the only difference is WnR. */
-    arm_cpu_t c; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 0, 0);
+    arm_cpu_t c = {0}; mmu_setup_section(&c, 0x80000000u, 0x00200000u, 0, 0);
     uint32_t pa = 0;
     uint32_t rd = arm_mmu_translate(&c, 0x80000abcu, ARM_ACCESS_READ, true, &pa);
     uint32_t wr = arm_mmu_translate(&c, 0x80000abcu, ARM_ACCESS_WRITE, true, &pa);
@@ -3605,7 +3605,7 @@ static void test_data_abort_write_sets_dfsr_wnr(void) {
      * livelocked ~2.8 million times with WnR missing. */
     uint32_t p[] = { 0xe3a01102 /*MOV r1,#0x80000000*/,
                      0xe5812000 /*STR r2,[r1]        */ };
-    arm_cpu_t c; fsr_setup(&c, p, 2, 1 /*AP=01: privileged RW only*/, ARM_MODE_USR);
+    arm_cpu_t c = {0}; fsr_setup(&c, p, 2, 1 /*AP=01: privileged RW only*/, ARM_MODE_USR);
     arm_step(&c);
     uint32_t before = c.cpsr;
     arm_step(&c);
@@ -3633,7 +3633,7 @@ static void test_data_abort_write_sets_dfsr_wnr(void) {
     /* The same page, same instruction shape, read instead of write. */
     uint32_t q[] = { 0xe3a01102 /*MOV r1,#0x80000000*/,
                      0xe5912000 /*LDR r2,[r1]        */ };
-    arm_cpu_t d; fsr_setup(&d, q, 2, 1, ARM_MODE_USR);
+    arm_cpu_t d = {0}; fsr_setup(&d, q, 2, 1, ARM_MODE_USR);
     arm_step(&d); arm_step(&d);
     CHECK(d.r[15] == ARM_VEC_DATA_ABORT, "pc=%08x expect 10 (data abort)", d.r[15]);
     CHECK((d.cp15.dfsr & 0xfu) == ARM_FSR_SECTION_PERMISSION,
@@ -3649,7 +3649,7 @@ static void test_prefetch_abort_never_sets_wnr(void) {
      * otherwise rewrite the kernel's view of the earlier fault. */
     uint32_t p[] = { 0xe3a00102 /*MOV r0,#0x80000000*/,
                      0xe1a0f000 /*MOV pc,r0         */ };
-    arm_cpu_t c; fsr_setup(&c, p, 2, 3, ARM_MODE_SYS);
+    arm_cpu_t c = {0}; fsr_setup(&c, p, 2, 3, ARM_MODE_SYS);
     c.cp15.dfsr = 0xdeadbeefu; c.cp15.dfar = 0xcafebabeu;   /* sentinels */
     arm_step(&c);
     /* 0x80100000 is not an encodable ARM immediate, so aim the branch there by
@@ -3692,7 +3692,7 @@ static void test_dfar_is_the_faulting_word_of_a_block_transfer(void) {
                      0xeafffffe /*B .                                    */,
                      0x00000000 /*(pad)                                  */,
                      0x800ffff8 /*literal: 8 bytes before the page end   */ };
-    arm_cpu_t c; fsr_setup(&c, p, 5, 3, ARM_MODE_SYS);
+    arm_cpu_t c = {0}; fsr_setup(&c, p, 5, 3, ARM_MODE_SYS);
     c.r[0] = 0x11111111u; c.r[2] = 0x33333333u;
     arm_step(&c);
     CHECK(c.r[1] == 0x800ffff8u, "r1=%08x expect 800ffff8", c.r[1]);
@@ -3712,7 +3712,7 @@ static void test_dfar_is_the_faulting_word_of_a_block_transfer(void) {
     /* The mirror-image STM must set WnR and report the same address. */
     uint32_t q[] = { 0xe59f1008, 0xe8810007 /*STMIA r1,{r0,r1,r2}*/,
                      0xeafffffe, 0x00000000, 0x800ffff8 };
-    arm_cpu_t d; fsr_setup(&d, q, 5, 3, ARM_MODE_SYS);
+    arm_cpu_t d = {0}; fsr_setup(&d, q, 5, 3, ARM_MODE_SYS);
     arm_step(&d); arm_step(&d);
     CHECK(d.cp15.dfar == 0x80100000u,
           "dfar=%08x expect 80100000 for the storing form too", d.cp15.dfar);
@@ -3728,7 +3728,7 @@ static void test_cps_is_a_nop_in_user_mode(void) {
     uint32_t p[] = { 0xf1020013 /*CPS #0x13 (to SVC)*/,
                      0xf1080080 /*CPSIE i           */,
                      0xe3a00007 /*MOV r0,#7         */ };
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     for (unsigned i = 0; i < 3; i++) m_w32(NULL, i * 4, p[i]);
     arm_set_mode(&c, ARM_MODE_USR);
@@ -3745,7 +3745,7 @@ static void test_cps_is_a_nop_in_user_mode(void) {
 
     /* From a privileged mode it must still work, or the kernel cannot mask
      * interrupts at all. */
-    arm_cpu_t d; arm_reset(&d, &g_bus);
+    arm_cpu_t d = {0}; arm_reset(&d, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xf1020013u);
     arm_set_mode(&d, ARM_MODE_SYS);
@@ -3792,7 +3792,7 @@ static void test_vfp_disabled_vectors_the_guest(void) {
         { 0xec510b10u, "VMOV r0,r1,d0 (VFP 64-bit transfer)"      },
     };
     for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_status_t st = run_vfp(&c, v[i].insn, false);
         CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED,
               "%s with FPEXC.EN=0: status=%d pc=%08x, expect a guest vector to 0x04",
@@ -3817,7 +3817,7 @@ static void test_vfp_enabled_still_halts(void) {
         { 0xee400b10u, "VMOV.8 d0[0],r0 (Advanced SIMD scalar transfer)"   },
     };
     for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_status_t st = run_vfp(&c, v[i].insn, true);
         CHECK(st == ARM_UNDEFINED,
               "%s with FPEXC.EN=1: status=%d, expect ARM_UNDEFINED — we would "
@@ -3836,7 +3836,7 @@ static void test_non_vfp_undefined_still_halts(void) {
         { 0xee000d10u, "MCR p13 (a coprocessor we do not model)" },
     };
     for (unsigned i = 0; i < sizeof v / sizeof v[0]; i++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_status_t st = run_vfp(&c, v[i].insn, false);
         CHECK(st == ARM_UNDEFINED,
               "%s: status=%d, expect ARM_UNDEFINED even with VFP disabled",
@@ -3850,7 +3850,7 @@ static void test_vfp_undef_entry_state(void) {
      * PC + 4 in ARM state, or the kernel resumes at the wrong instruction. */
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0x100u, 0xee300a00u);            /* VADD.F32 s0,s0,s0 */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     arm_set_mode(&c, ARM_MODE_USR);
     c.cpsr &= ~(ARM_CPSR_I | ARM_CPSR_A);
     c.cp15.cpacr = 0xfu << ARM_CPACR_CP10_SHIFT;
@@ -3875,7 +3875,7 @@ static void test_vfp_undef_entry_state(void) {
     CHECK((c.cpsr & ARM_CPSR_T) == 0, "cpsr=%08x: entry is always ARM state", c.cpsr);
 
     /* SCTLR.V moves the whole table, this vector included. */
-    arm_cpu_t d; arm_reset(&d, &g_bus);
+    arm_cpu_t d = {0}; arm_reset(&d, &g_bus);
     d.cpsr = (d.cpsr & ~0x1fu) | ARM_MODE_SYS;
     d.cp15.sctlr |= ARM_SCTLR_V;
     d.cp15.cpacr  = 0xfu << ARM_CPACR_CP10_SHIFT;
@@ -3893,7 +3893,7 @@ static void test_vfp_sysreg_access_follows_fpexc(void) {
      * enabling possible, and _get_vfp_enabled (0xc006994c) does exactly this
      * VMRS with EN clear. FPSCR does not: accessing it with EN==0 is
      * UNDEFINED, and _vfp_switch is careful to set FPEXC.EN first. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_status_t st = run_vfp(&c, 0xeef80a10u, false);   /* VMRS r0, FPEXC */
     CHECK(st == ARM_OK && c.r[0] == 0,
           "VMRS FPEXC with EN=0: status=%d r0=%08x, must read back, not trap",
@@ -3923,7 +3923,7 @@ static void test_vfp_cpacr_denial_vectors(void) {
     /* CPACR gates CP10/CP11 ahead of FPEXC. XNU's _init_vfp writes 0xf<<20 to
      * grant both; before that runs, or if a field is set to "privileged only",
      * the access is UNDEFINED and the guest must see it. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xee300a00u);                  /* VADD.F32 */
     arm_reset(&c, &g_bus);
@@ -3937,7 +3937,7 @@ static void test_vfp_cpacr_denial_vectors(void) {
           (int)st, c.r[15]);
 
     /* "Privileged only" (0b01 in both fields) denies User mode and permits SYS. */
-    arm_cpu_t d; arm_reset(&d, &g_bus);
+    arm_cpu_t d = {0}; arm_reset(&d, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xeef10a10u);                  /* VMRS r0, FPSCR */
     arm_set_mode(&d, ARM_MODE_USR);
@@ -3949,7 +3949,7 @@ static void test_vfp_cpacr_denial_vectors(void) {
           "CPACR=privileged-only from User mode: status=%d pc=%08x, expect the "
           "guest vector", (int)st, d.r[15]);
 
-    arm_cpu_t e; arm_reset(&e, &g_bus);
+    arm_cpu_t e = {0}; arm_reset(&e, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xeef10a10u);
     e.cpsr = (e.cpsr & ~0x1fu) | ARM_MODE_SYS;
@@ -3972,7 +3972,7 @@ static void test_vfp_lazy_trap_cannot_loop(void) {
      * the enabled case halts). It has to be an encoding we do not implement:
      * one we DO implement simply executes on the retry, which is the whole
      * point of the milestone and is covered by test_vfp.c. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_status_t st = run_vfp(&c, 0xeeb00b00u, false);
     CHECK(st == ARM_OK && c.r[15] == ARM_VEC_UNDEFINED, "first pass must vector");
 
@@ -4038,7 +4038,7 @@ static void test_privileged_svc_hook_handles_a32(void) {
     probe.result = ARM_SVC_HANDLED;
     probe.mutate = true;
     arm_bus_t bus = bus_with_svc_probe(&probe);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_SYS);
     c.cpsr = ARM_MODE_SYS | ARM_CPSR_Z | ARM_CPSR_C;
@@ -4093,7 +4093,7 @@ static void test_privileged_svc_hook_redirects_a32_to_thumb(void) {
     probe.redirect_thumb = true;
     probe.redirect_pc = 0x202u;
     arm_bus_t bus = bus_with_svc_probe(&probe);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_SYS);
     c.cpsr = ARM_MODE_SYS | ARM_CPSR_Z | ARM_CPSR_C;
@@ -4153,7 +4153,7 @@ static void test_privileged_svc_hook_nonhandled_is_transactional(void) {
         probe.result = results[i];
         probe.mutate = true;
         arm_bus_t bus = bus_with_svc_probe(&probe);
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         arm_reset(&c, &bus);
         arm_set_mode(&c, ARM_MODE_IRQ);
         const uint32_t old_cpsr = ARM_MODE_IRQ | ARM_CPSR_C;
@@ -4199,7 +4199,7 @@ static void test_privileged_svc_hook_a32_error_halts_transactionally(void) {
     probe.result = ARM_SVC_ERROR;
     probe.mutate = true;
     arm_bus_t bus = bus_with_svc_probe(&probe);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_IRQ);
     const uint32_t old_cpsr = ARM_MODE_IRQ | ARM_CPSR_C;
@@ -4243,7 +4243,7 @@ static void test_privileged_svc_hook_obeys_a32_guards(void) {
      * would handle that encoding. */
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xef000080u);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_USR);
     c.cpsr = ARM_MODE_USR;
@@ -4296,7 +4296,7 @@ static void test_privileged_svc_hook_handles_thumb(void) {
     probe.result = ARM_SVC_HANDLED;
     probe.mutate = true;
     arm_bus_t bus = bus_with_svc_probe(&probe);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_SYS);
     c.cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_Z;
@@ -4338,7 +4338,7 @@ static void test_privileged_svc_hook_redirects_thumb_to_a32(void) {
     probe.redirect_thumb = false;
     probe.redirect_pc = 0x200u;
     arm_bus_t bus = bus_with_svc_probe(&probe);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_SYS);
     c.cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_C;
@@ -4388,7 +4388,7 @@ static void test_privileged_svc_hook_thumb_error_and_user_guard(void) {
 
     memset(g_ram, 0, sizeof g_ram);
     m_w16(NULL, 0x100u, svc);
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     arm_reset(&c, &bus);
     arm_set_mode(&c, ARM_MODE_SYS);
     const uint32_t old_cpsr = ARM_MODE_SYS | ARM_CPSR_T | ARM_CPSR_C;
@@ -4443,7 +4443,7 @@ static void test_swi_entry_state_from_user_mode(void) {
      * mode — the only mode it will ever be taken from once launchd runs. */
     uint32_t p[0x44] = {0};
     p[0x40] = 0xef000080u;                    /* 0x100: SWI #0x80 */
-    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    arm_cpu_t c = {0}; user_mode_at(&c, p, 0x44, 0x100);
     arm_set_mode(&c, ARM_MODE_SVC);
     c.r[13] = 0x900; c.r[14] = 0xdeadbeefu;   /* SVC bank, must be overwritten */
     arm_set_mode(&c, ARM_MODE_USR);
@@ -4474,7 +4474,7 @@ static void test_thumb_swi_lr_is_the_next_halfword(void) {
      * PC+4. Getting this wrong resumes the process one instruction early. */
     uint32_t p[0x44] = {0};
     m_w32(NULL, 0, 0);
-    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    arm_cpu_t c = {0}; user_mode_at(&c, p, 0x44, 0x100);
     m_w16(NULL, 0x100, 0xdf80u);              /* SWI #0x80, Thumb */
     c.cpsr |= ARM_CPSR_T;
     arm_step(&c);
@@ -4493,11 +4493,11 @@ static void test_irq_sets_a_but_swi_does_not(void) {
     /* The distinction take_exception draws, pinned from both sides so neither
      * half can regress alone. */
     uint32_t p[] = { 0xef000000u };           /* SWI #0 */
-    arm_cpu_t c; user_mode_at(&c, p, 1, 0);
+    arm_cpu_t c = {0}; user_mode_at(&c, p, 1, 0);
     arm_step(&c);
     CHECK((c.cpsr & ARM_CPSR_A) == 0, "SWI must leave A alone");
 
-    arm_cpu_t d; user_mode_at(&d, p, 1, 0);
+    arm_cpu_t d = {0}; user_mode_at(&d, p, 1, 0);
     d.irq_line = true;
     arm_step(&d);
     CHECK(d.r[15] == ARM_VEC_IRQ, "pc=%08x expect 18 (IRQ)", d.r[15]);
@@ -4511,7 +4511,7 @@ static void test_exception_entry_takes_cpsr_e_from_sctlr_ee(void) {
     uint32_t p[] = { 0xe3a00c02u,   /* MOV r0,#0x200  (the E bit)  */
                      0xe122f000u,   /* MSR CPSR_x, r0 -> sets E    */
                      0xef000000u }; /* SWI #0                      */
-    arm_cpu_t c; load_and_run(&c, p, 3, 2);
+    arm_cpu_t c = {0}; load_and_run(&c, p, 3, 2);
     CHECK((c.cpsr & ARM_CPSR_E) != 0, "MSR should have set E for this test");
     arm_step(&c);
     CHECK((c.cpsr & ARM_CPSR_E) == 0, "exception entry must clear E from SCTLR.EE");
@@ -4537,7 +4537,7 @@ static void test_xnu_syscall_frame_round_trip(void) {
     p[0x08] = 0xe1b0f00eu;   /* 0x20: MOVS pc,lr                          */
     p[0x40] = 0xef000000u;   /* 0x100: SWI #0                             */
 
-    arm_cpu_t c; user_mode_at(&c, p, 0x44, 0x100);
+    arm_cpu_t c = {0}; user_mode_at(&c, p, 0x44, 0x100);
     arm_set_mode(&c, ARM_MODE_SVC);
     c.r[13] = 0x900;                       /* the per-thread save area   */
     c.r[14] = 0xcccc0000u;                 /* SVC LR, must not leak out  */
@@ -4588,7 +4588,7 @@ static void test_syscall_error_flag_reaches_user_through_the_spsr(void) {
      */
     uint32_t p[] = { 0xe16ff000u,   /* 0x00: MSR spsr_fsxc, r0 */
                      0xe1b0f00eu }; /* 0x04: MOVS pc, lr       */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, p[0]); m_w32(NULL, 4, p[1]);
     arm_set_mode(&c, ARM_MODE_SVC);
@@ -4611,7 +4611,7 @@ static void test_syscall_error_flag_reaches_user_through_the_spsr(void) {
 
 static void test_user_bank_ldm_writes_the_user_bank(void) {
     /* The load direction of the same rule, isolated. */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     arm_set_mode(&c, ARM_MODE_USR);
     c.r[13] = 0x1111; c.r[14] = 0x2222;
@@ -4635,7 +4635,7 @@ static void test_user_bank_stm_from_fiq_uses_the_user_r8_r12(void) {
      * r8-r12 as well as r13/r14, so a save that reads the live registers would
      * write FIQ's private copies into the interrupted thread's frame and hand
      * them back to it on resume. */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     arm_set_mode(&c, ARM_MODE_USR);
     for (unsigned i = 8; i <= 12; i++) c.r[i] = 0xd0000000u + i;
@@ -4665,11 +4665,11 @@ static void test_user_bank_transfer_with_writeback_traps(void) {
      * r13 — the only base XNU uses with this form. Trap rather than pick one. */
     uint32_t st[] = { 0xe8ed7fffu };      /* STMIA sp!,{r0-r14}^ */
     uint32_t ld[] = { 0xe8fd7fffu };      /* LDMIA sp!,{r0-r14}^ */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     CHECK(run_status(&c, st, 1, 1) == ARM_UNDEFINED, "STM^ with writeback must trap");
     CHECK(run_status(&c, ld, 1, 1) == ARM_UNDEFINED, "LDM^ with writeback must trap");
     /* ...but the exception-return LDM, which legitimately writes back, must not. */
-    arm_cpu_t d;
+    arm_cpu_t d = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xe8fd8000u);          /* LDMIA sp!,{pc}^ */
     m_w32(NULL, 0x800, 0x00001020u);
@@ -4697,7 +4697,7 @@ static void test_user_bank_transfers_reject_user_and_system_modes(void) {
 
     for (unsigned mi = 0; mi < 2u; mi++) {
         for (unsigned ii = 0; ii < 2u; ii++) {
-            arm_cpu_t c;
+            arm_cpu_t c = {0};
             g_watch_addr = 0xffffffffu;
             g_watch_reads32 = g_watch_writes32 = 0u;
             memset(g_ram, 0, sizeof g_ram);
@@ -4724,7 +4724,7 @@ static void test_srs_stores_lr_and_spsr_of_the_current_mode(void) {
      * (in lr_svc) and the user CPSR (in spsr_svc) to the frame at +0x3c/+0x40,
      * which is exactly where _thread_exception_return reads them back from. */
     uint32_t p[] = { 0xf8cd0513u };
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, p[0]);
     arm_set_mode(&c, ARM_MODE_SVC);
@@ -4743,7 +4743,7 @@ static void test_subs_pc_lr_4_returns_from_fiq(void) {
     /* _fleh_fiq_generic ends with "SUBSPL pc,lr,#4" — the third exception-return
      * form, and the only one that arrives at the resume address by arithmetic. */
     uint32_t p[] = { 0xe25ef004u };       /* SUBS pc,lr,#4 */
-    arm_cpu_t c; arm_reset(&c, &g_bus);
+    arm_cpu_t c = {0}; arm_reset(&c, &g_bus);
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, p[0]);
     arm_set_mode(&c, ARM_MODE_FIQ);
@@ -4784,7 +4784,7 @@ static void test_ldrt_from_svc_translates_as_unprivileged(void) {
                      0xe3811c03u,   /* ORR r1,r1,#0x300   */
                      0xe5910000u,   /* LDR  r0,[r1]       (privileged: ok)   */
                      0xe4b12000u }; /* LDRT r2,[r1]       (unprivileged: fault) */
-    arm_cpu_t c; kernel_only_page_setup(&c, p, 4);
+    arm_cpu_t c = {0}; kernel_only_page_setup(&c, p, 4);
     m_w32(NULL, 0x300, 0x5a5aa5a5u);
     arm_step(&c); arm_step(&c); arm_step(&c);
     CHECK(c.r[0] == 0x5a5aa5a5u,
@@ -4805,7 +4805,7 @@ static void test_strt_from_svc_translates_as_unprivileged(void) {
                      0xe3811c03u,   /* ORR r1,r1,#0x300   */
                      0xe5810000u,   /* STR  r0,[r1]       (privileged: ok)   */
                      0xe4a12000u }; /* STRT r2,[r1]       (unprivileged: fault) */
-    arm_cpu_t c; kernel_only_page_setup(&c, p, 4);
+    arm_cpu_t c = {0}; kernel_only_page_setup(&c, p, 4);
     c.r[0] = 0x11223344u;
     arm_step(&c); arm_step(&c); arm_step(&c);
     CHECK(m_r32(NULL, 0x300) == 0x11223344u, "a plain STR from SVC must land");
@@ -4820,7 +4820,7 @@ static void test_user_mode_load_uses_user_permissions(void) {
      * to come from the CURRENT mode and not only from the instruction form. */
     uint32_t p[] = { 0xe3a01102u,   /* MOV r1,#0x80000000 */
                      0xe5910000u }; /* LDR r0,[r1]        */
-    arm_cpu_t c; kernel_only_page_setup(&c, p, 2);
+    arm_cpu_t c = {0}; kernel_only_page_setup(&c, p, 2);
     arm_set_mode(&c, ARM_MODE_USR);
     arm_step(&c); arm_step(&c);
     CHECK(c.r[15] == ARM_VEC_DATA_ABORT,
@@ -4847,7 +4847,7 @@ static void test_cp15_is_privileged_from_user_mode(void) {
      * shape as the CPS-in-User-mode hole: invisible for the entire kernel-only
      * boot, live from launchd's first instruction.
      */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     CHECK(run_one_in_user(&c, 0xee110f10u) == ARM_UNDEFINED, "MRC SCTLR must trap");
     CHECK(run_one_in_user(&c, 0xee010f10u) == ARM_UNDEFINED, "MCR SCTLR must trap");
     CHECK(run_one_in_user(&c, 0xee020f10u) == ARM_UNDEFINED, "MCR TTBR0 must trap");
@@ -4856,7 +4856,7 @@ static void test_cp15_is_privileged_from_user_mode(void) {
     CHECK(run_one_in_user(&c, 0xee110f30u) == ARM_UNDEFINED, "MRC CP14 must trap");
     /* The same accesses from a privileged mode must still work. */
     uint32_t p[] = { 0xee110f10u };
-    arm_cpu_t d; load_and_run(&d, p, 1, 1);
+    arm_cpu_t d = {0}; load_and_run(&d, p, 1, 1);
     CHECK(d.r[0] == d.cp15.sctlr, "SCTLR must still be readable from SYS mode");
 }
 
@@ -4864,7 +4864,7 @@ static void test_cp15_thread_id_registers_stay_user_accessible(void) {
     /* The three CP15 accesses the ARM1176 does grant User mode. TPIDRURO is the
      * load-bearing one: _thread_set_cthread_self (0xc0061da0) writes it with
      * "MCR p15,0,r0,c13,c0,3" and libSystem reads it back from User mode. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     CHECK(run_one_in_user(&c, 0xee1d0f70u) == ARM_OK, "MRC TPIDRURO must be allowed");
     CHECK(run_one_in_user(&c, 0xee0d0f70u) == ARM_UNDEFINED,
           "MCR TPIDRURO is READ-only from User mode");
@@ -4874,7 +4874,7 @@ static void test_cp15_thread_id_registers_stay_user_accessible(void) {
           "the c7 barrier/cache operations stay accessible from User mode");
 
     /* And the value really round-trips through the kernel-side write. */
-    arm_cpu_t d;
+    arm_cpu_t d = {0};
     memset(g_ram, 0, sizeof g_ram);
     m_w32(NULL, 0, 0xee1d0f70u);            /* MRC p15,0,r0,c13,c0,3 */
     arm_reset(&d, &g_bus);
@@ -4931,7 +4931,7 @@ static void split_setup(arm_cpu_t *c, const uint32_t *prog, size_t words,
  * carry or borrow must never cross a lane boundary.
  */
 static void test_parallel_add_sub_family(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     static const struct {
         uint32_t insn, a, b, expect, ge;
         bool check_ge;
@@ -5030,7 +5030,7 @@ static void test_parallel_add_sub_family(void) {
  * of otherwise working code.
  */
 static void test_pack_halfword_and_select(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     static const struct {
         uint32_t insn, rn, rm, ge, expect;
         const char *what;
@@ -5107,7 +5107,7 @@ static void test_pack_halfword_and_select(void) {
  * family rather than discovering each member at forty minutes a run.
  */
 static void test_signed_dual_multiply_family(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     static const struct {
         uint32_t insn, rn, rm, ra, expect;
         bool     expect_q;
@@ -5228,7 +5228,7 @@ static void test_integer_divide_is_armv7_only(void) {
      * important half: it pins the CURRENT target's behaviour, so adding a second
      * machine profile cannot quietly start executing an instruction that the
      * real hardware under iPhone OS 3 would have trapped. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     static const struct {
         uint32_t insn, n, m, expect;
         const char *what;
@@ -5304,7 +5304,7 @@ static void test_movw_movt_are_armv7_only(void) {
     /* MOVW/MOVT are ARMv6T2; the ARM1176 is ARMv6K and does not have them.
      * ARMv7 compilers build every 32-bit constant this way, so they matter far
      * more than their size suggests. */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* MOVW r3, #0xbeef  -> imm4 = 0xb (19:16), imm12 = 0xeef, Rd = r3. */
     const uint32_t movw = 0xe30b3eefu;
@@ -5366,7 +5366,7 @@ static void test_srs_and_rfe_stop_after_the_first_fault(void) {
      * watched device-like address. Once the first access faults, neither SRS nor
      * RFE may issue the second bus transaction. */
     uint32_t srs[] = { 0xf8cd0513u };             /* SRSIA sp,#SVC */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     split_setup(&c, srs, 1, 0u, 0x60000u, false);
     arm_set_mode(&c, ARM_MODE_IRQ);
     c.bank_r13[ARM_BANK_SVC] = 0x80000ffcu;
@@ -5381,7 +5381,7 @@ static void test_srs_and_rfe_stop_after_the_first_fault(void) {
           g_watch_writes32);
 
     uint32_t rfe[] = { 0xf8900a00u };             /* RFEIA r0 */
-    arm_cpu_t d;
+    arm_cpu_t d = {0};
     split_setup(&d, rfe, 1, 0u, 0x60000u, false);
     arm_set_mode(&d, ARM_MODE_IRQ);
     d.r[0] = 0x80000ffcu;
@@ -5401,7 +5401,7 @@ static void test_ldrd_strd_stop_after_the_first_faulting_word(void) {
      * in the absent page; the second word at 0x80001000 is mapped and watched,
      * so a stray access shows up as a bus read/write that must not exist. */
     uint32_t ldrd[] = { 0xe1c200d0u };            /* LDRD r0,r1,[r2] */
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     split_setup(&c, ldrd, 1, 0u /* first page absent */, 0x60000u, false);
     c.r[0] = 0xdeadbeefu; c.r[1] = 0xfeedfaceu; c.r[2] = 0x80000ffcu;
     c.r[15] = 0;
@@ -5421,7 +5421,7 @@ static void test_ldrd_strd_stop_after_the_first_faulting_word(void) {
 
     /* The mirror: the SECOND word faults. DFAR names it, and the base-restored
      * abort model still forbids committing the half that did arrive. */
-    arm_cpu_t d;
+    arm_cpu_t d = {0};
     split_setup(&d, ldrd, 1, 0x30000u, 0u /* second page absent */, false);
     m_w32(NULL, 0x30ffcu, 0x11223344u);
     d.r[0] = 0xdeadbeefu; d.r[1] = 0xfeedfaceu; d.r[2] = 0x80000ffcu;
@@ -5435,7 +5435,7 @@ static void test_ldrd_strd_stop_after_the_first_faulting_word(void) {
           d.r[0], d.r[1], d.r[2]);
 
     uint32_t strd[] = { 0xe1c200f0u };            /* STRD r0,r1,[r2] */
-    arm_cpu_t e;
+    arm_cpu_t e = {0};
     split_setup(&e, strd, 1, 0u, 0x60000u, false);
     e.r[0] = 0x11223344u; e.r[1] = 0x55667788u; e.r[2] = 0x80000ffcu;
     e.r[15] = 0;
@@ -5464,7 +5464,7 @@ static void test_unaligned_access_spanning_two_pages(void) {
                      0xeafffffe /*B .                              */,
                      0x00000000,
                      0x80000ffeu };
-    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
+    arm_cpu_t c = {0}; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
     m_w8(NULL, 0x30ffeu, 0xaa); m_w8(NULL, 0x30fffu, 0xbb);
     m_w8(NULL, 0x60000u, 0xcc); m_w8(NULL, 0x60001u, 0xdd);
     m_w8(NULL, 0x31000u, 0x99); m_w8(NULL, 0x31001u, 0x88);  /* the decoy */
@@ -5477,7 +5477,7 @@ static void test_unaligned_access_spanning_two_pages(void) {
      * be written past the end of the first one. */
     uint32_t q[] = { 0xe59f1008, 0xe5810000 /*STR r0,[r1]*/, 0xeafffffe,
                      0x00000000, 0x80000ffeu };
-    arm_cpu_t d; split_setup(&d, q, 5, 0x30000u, 0x60000u, false);
+    arm_cpu_t d = {0}; split_setup(&d, q, 5, 0x30000u, 0x60000u, false);
     arm_step(&d);
     d.r[0] = 0x11223344u;
     arm_step(&d);
@@ -5495,13 +5495,13 @@ static void test_unaligned_access_spanning_two_pages(void) {
      * must still be served by a single whole-word bus access. */
     uint32_t h[] = { 0xe59f1008, 0xe1d100b0 /*LDRH r0,[r1]*/, 0xeafffffe,
                      0x00000000, 0x80000fffu };
-    arm_cpu_t e; split_setup(&e, h, 5, 0x30000u, 0x60000u, false);
+    arm_cpu_t e = {0}; split_setup(&e, h, 5, 0x30000u, 0x60000u, false);
     m_w8(NULL, 0x30fffu, 0xbb); m_w8(NULL, 0x60000u, 0xcc);
     arm_step(&e); arm_step(&e);
     CHECK(e.r[0] == 0xccbbu, "r0=%08x expect ccbb for a straddling LDRH", e.r[0]);
 
     uint32_t w[] = { 0xe59f1008, 0xe5910000, 0xeafffffe, 0x00000000, 0x80000ffcu };
-    arm_cpu_t g; split_setup(&g, w, 5, 0x30000u, 0x60000u, false);
+    arm_cpu_t g = {0}; split_setup(&g, w, 5, 0x30000u, 0x60000u, false);
     m_w32(NULL, 0x30ffcu, 0x12345678u);
     arm_step(&g); arm_step(&g);
     CHECK(g.r[0] == 0x12345678u,
@@ -5516,7 +5516,7 @@ static void test_unaligned_access_faulting_on_the_second_page(void) {
      * re-executes the same instruction forever. */
     uint32_t p[] = { 0xe59f1008, 0xe5910000 /*LDR r0,[r1]*/, 0xeafffffe,
                      0x00000000, 0x80000ffeu };
-    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0u /*second page absent*/, false);
+    arm_cpu_t c = {0}; split_setup(&c, p, 5, 0x30000u, 0u /*second page absent*/, false);
     arm_step(&c);
     c.r[0] = 0xdeadbeefu;
     arm_step(&c);
@@ -5540,7 +5540,7 @@ static void test_unaligned_access_faulting_on_the_second_page(void) {
      * Re-execution after the handler maps the page rewrites the same bytes. */
     uint32_t q[] = { 0xe59f1008, 0xe5810000 /*STR r0,[r1]*/, 0xeafffffe,
                      0x00000000, 0x80000ffeu };
-    arm_cpu_t d; split_setup(&d, q, 5, 0x30000u, 0u, false);
+    arm_cpu_t d = {0}; split_setup(&d, q, 5, 0x30000u, 0u, false);
     arm_step(&d);
     d.r[0] = 0x11223344u;
     arm_step(&d);
@@ -5556,7 +5556,7 @@ static void test_unaligned_access_faulting_on_the_second_page(void) {
 
     /* And when it is the FIRST page that is missing, the base is the right
      * answer and nothing is written anywhere. */
-    arm_cpu_t e; split_setup(&e, q, 5, 0u, 0x60000u, false);
+    arm_cpu_t e = {0}; split_setup(&e, q, 5, 0u, 0x60000u, false);
     arm_step(&e);
     e.r[0] = 0x11223344u;
     arm_step(&e);
@@ -5587,13 +5587,13 @@ static void test_xn_blocks_fetch_from_a_small_page(void) {
 
     /* The permitted case first, so the fault below is known to be the XN bit
      * and not the mapping being broken: same page, XN clear, executes. */
-    arm_cpu_t c; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
+    arm_cpu_t c = {0}; split_setup(&c, p, 5, 0x30000u, 0x60000u, false);
     m_w32(NULL, 0x60000u, 0xe3a02007u);             /* MOV r2,#7 at the target */
     arm_step(&c); arm_step(&c); arm_step(&c);
     CHECK(c.r[2] == 7, "r2=%u expect 7 — a page without XN must execute", c.r[2]);
 
     /* The same mapping with XN set. */
-    arm_cpu_t d; split_setup(&d, p, 5, 0x30000u, 0x60000u, true);
+    arm_cpu_t d = {0}; split_setup(&d, p, 5, 0x30000u, 0x60000u, true);
     m_w32(NULL, 0x60000u, 0xe3a02007u);
     d.cp15.dfsr = 0xdeadbeefu; d.cp15.dfar = 0xcafebabeu;
     arm_step(&d);
@@ -5640,7 +5640,7 @@ static void test_xn_on_a_section_and_the_xp_gate(void) {
                      0x80000008u };
     struct { bool xn, xp; } cases[] = { {false, true}, {true, true}, {true, false} };
     for (unsigned k = 0; k < 3; k++) {
-        arm_cpu_t c;
+        arm_cpu_t c = {0};
         memset(g_ram, 0, sizeof g_ram);
         for (unsigned i = 0; i < 5; i++) m_w32(NULL, i * 4, p[i]);
         m_w32(NULL, 0x4000 + (0x000u << 2), (3u << 10) | 2u);
@@ -5682,7 +5682,7 @@ static void test_direct_write_cache_requires_explicit_consent(void) {
         0xe5801000u,
     };
     arm_bus_t bus = g_bus;
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t value = 0u;
 
     memset(g_ram, 0, sizeof g_ram);

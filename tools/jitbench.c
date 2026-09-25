@@ -4743,7 +4743,7 @@ static bool validate_static_oracles(void) {
     for (i = 0u; i < sizeof STATIC_CASES / sizeof STATIC_CASES[0]; i++) {
         const static_case_t *sc = &STATIC_CASES[i];
         a64_static_block_t block;
-        arm_cpu_t cpu;
+        arm_cpu_t cpu = {0};
         final_state_t interp, statik;
         arm_status_t status = ARM_OK;
         unsigned retired;
@@ -4790,7 +4790,7 @@ static uint32_t branch_nzcv(unsigned mask) {
 
 static bool branch_condition_flags(unsigned condition, bool passed,
                                    uint32_t *flags_out) {
-    arm_cpu_t probe;
+    arm_cpu_t probe = {0};
     if (!flags_out || condition >= 14u) return false;
     memset(&probe, 0, sizeof probe);
     for (unsigned mask = 0u; mask < 16u; mask++) {
@@ -4826,8 +4826,8 @@ static bool validate_static_branch_oracles(void) {
                     ? pc + 4u : UINT32_C(0xdead00ff);
                 uint32_t flags = 0u;
                 a64_static_block_t block;
-                arm_cpu_t interp_cpu;
-                arm_cpu_t static_cpu;
+                arm_cpu_t interp_cpu = {0};
+                arm_cpu_t static_cpu = {0};
                 final_state_t interp;
                 final_state_t statik;
                 arm_status_t status;
@@ -4890,8 +4890,8 @@ static bool validate_static_branch_oracles(void) {
             (uint8_t)(insn >> 16), (uint8_t)(insn >> 24)
         };
         a64_static_block_t block;
-        arm_cpu_t cpu;
-        arm_cpu_t before;
+        arm_cpu_t cpu = {0};
+        arm_cpu_t before = {0};
         unsigned completed = UINT_MAX;
         uint32_t flags;
 
@@ -4944,8 +4944,8 @@ static bool validate_static_thumb_cond_branch_oracles(void) {
             const uint32_t expected_pc = passed ? target : pc + 2u;
             uint32_t flags = 0u;
             a64_static_block_t block;
-            arm_cpu_t interp_cpu;
-            arm_cpu_t static_cpu;
+            arm_cpu_t interp_cpu = {0};
+            arm_cpu_t static_cpu = {0};
             final_state_t interp;
             final_state_t statik;
             arm_status_t status;
@@ -5002,8 +5002,8 @@ static bool validate_static_thumb_cond_branch_oracles(void) {
         const uint16_t insn = UINT16_C(0xd0fc);
         const uint8_t bytes[2] = {(uint8_t)insn, (uint8_t)(insn >> 8)};
         a64_static_block_t block;
-        arm_cpu_t cpu;
-        arm_cpu_t before;
+        arm_cpu_t cpu = {0};
+        arm_cpu_t before = {0};
         unsigned completed = UINT_MAX;
         uint32_t flags;
 
@@ -5060,8 +5060,8 @@ static bool run_static_indirect_case(bool thumb, bool link,
     uint16_t tinsn = (uint16_t)(UINT16_C(0x4700) |
                                 ((link ? 1u : 0u) << 7) | (rm << 3));
     const void *program = thumb ? (const void *)&tinsn : (const void *)&a32;
-    arm_cpu_t reference;
-    arm_cpu_t statik;
+    arm_cpu_t reference = {0};
+    arm_cpu_t statik = {0};
     a64_static_block_t block;
     arm_status_t status;
     unsigned completed = UINT_MAX;
@@ -5177,9 +5177,9 @@ static bool validate_static_indirect_branch_oracles(void) {
             uint16_t tinsn = (uint16_t)(UINT16_C(0x4700) | (link << 7));
             const void *program = thumb ? (const void *)&tinsn
                                         : (const void *)&a32;
-            arm_cpu_t reference;
-            arm_cpu_t statik;
-            arm_cpu_t before;
+            arm_cpu_t reference = {0};
+            arm_cpu_t statik = {0};
+            arm_cpu_t before = {0};
             a64_static_block_t block;
             arm_status_t reference_status;
             arm_status_t static_status;
@@ -5232,8 +5232,8 @@ static bool validate_static_indirect_branch_oracles(void) {
     {
         const uint32_t pc = UINT32_C(0x1d00);
         const uint32_t insn = UINT32_C(0xe12fff10);
-        arm_cpu_t cpu;
-        arm_cpu_t before;
+        arm_cpu_t cpu = {0};
+        arm_cpu_t before = {0};
         a64_static_block_t block;
         unsigned completed = UINT_MAX;
         seed_cpu_at(&cpu, &insn, 1u, false, pc);
@@ -5267,7 +5267,7 @@ static bool validate_static_indirect_branch_oracles(void) {
 
 static bool run_interpreter(const bench_case_t *bc, uint64_t total,
                             final_state_t *out, double *seconds) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     arm_status_t status = ARM_OK;
     uint64_t i;
     double start, end;
@@ -5287,7 +5287,7 @@ static bool run_interpreter(const bench_case_t *bc, uint64_t total,
 static bool run_native(const bench_case_t *bc, const jit_buf_t *arena,
                        const jit_block_t *block, uint64_t blocks,
                        final_state_t *out, double *seconds) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint64_t i;
     int exit_reason = JIT_EXIT_INTERPRET;
     double start, end;
@@ -5307,7 +5307,7 @@ static bool run_native(const bench_case_t *bc, const jit_buf_t *arena,
 static bool run_static(const bench_case_t *bc,
                        const a64_static_block_t *block, uint64_t blocks,
                        final_state_t *out, double *seconds) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     double start, end;
 
     seed_cpu(&cpu, bc);
@@ -5321,7 +5321,7 @@ static bool run_static(const bench_case_t *bc,
 
 static bool run_compact_raw(const bench_case_t *bc, uint64_t total,
                             final_state_t *out, double *seconds) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint64_t done = 0u;
     double start, end;
 
@@ -5405,7 +5405,7 @@ static bool validate_compact_raw_admission_shapes(void) {
         { VFP_UN_S(0, 0, 0, 1), false, A64_COMPACT_RAW_REJECT_VFP },
         { UINT32_C(0xef000000), false, A64_COMPACT_RAW_REJECT_CLASS },
     };
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint32_t seed = UINT32_C(0xe2800001);
 
     seed_cpu_at(&cpu, &seed, 1u, false, UINT32_C(0x1000));
@@ -5673,7 +5673,7 @@ static bool validate_compact_raw_admission_shapes(void) {
 static unsigned compact_raw_modeled_prefix(const uint32_t *program,
                                             unsigned insns, uint32_t pc,
                                             unsigned budget) {
-    arm_cpu_t model;
+    arm_cpu_t model = {0};
     unsigned completed = 0u;
 
     seed_cpu_at(&model, program, insns, false, pc);
@@ -5825,8 +5825,8 @@ static bool compact_raw_thumb_program_compare(
         const char *name, const uint16_t *program, unsigned insns,
         uint32_t pc, unsigned reference_steps, unsigned budget,
         unsigned expected_completed) {
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     final_state_t reference_state;
     final_state_t compact_state;
     arm_status_t status = ARM_OK;
@@ -5912,9 +5912,9 @@ static bool compact_raw_a32_register_shift_exact_case(
 
 static bool compact_raw_a32_register_shift_refusal_case(
         const char *name, uint32_t insn, uint32_t pc) {
-    arm_cpu_t reference;
-    arm_cpu_t compact;
-    arm_cpu_t before;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
+    arm_cpu_t before = {0};
     arm_status_t reference_status;
     arm_status_t compact_status;
     unsigned completed = UINT_MAX;
@@ -6004,7 +6004,7 @@ static bool validate_compact_raw_a32_register_shift_oracles(void) {
                                 compact_raw_a32_register_shift_instruction(
                                     opcode, set_flags != 0u, 0u, 1u,
                                     2u, 3u, type);
-                            arm_cpu_t initial;
+                            arm_cpu_t initial = {0};
 
                             seed_compact_raw_a32_register_shift(
                                 &initial, insn, pc);
@@ -6033,7 +6033,7 @@ static bool validate_compact_raw_a32_register_shift_oracles(void) {
         const uint32_t insn = compact_raw_a32_register_shift_instruction(
             ac->opcode, ac->set_flags, ac->rn, ac->rd,
             ac->rm, ac->rs, ac->type);
-        arm_cpu_t initial;
+        arm_cpu_t initial = {0};
 
         seed_compact_raw_a32_register_shift(&initial, insn, pc);
         for (unsigned reg = 0u; reg < 4u; reg++) initial.r[reg] = ac->r[reg];
@@ -6082,8 +6082,8 @@ static bool run_compact_raw_a32_indirect_case(
                                ARM_CPSR_C | ARM_CPSR_V;
     const uint32_t insn = (condition << 28) | UINT32_C(0x012fff10) |
                           ((link ? 1u : 0u) << 5) | rm;
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     arm_status_t status;
     unsigned completed = UINT_MAX;
     uint32_t source;
@@ -6178,9 +6178,9 @@ static bool validate_compact_raw_a32_indirect_oracles(void) {
         const uint32_t pc = UINT32_C(0x7800) + invalid_case * 4u;
         const uint32_t insn = UINT32_C(0xe12fff10) |
                               ((link ? 1u : 0u) << 5) | rm;
-        arm_cpu_t reference;
-        arm_cpu_t compact;
-        arm_cpu_t before;
+        arm_cpu_t reference = {0};
+        arm_cpu_t compact = {0};
+        arm_cpu_t before = {0};
         arm_status_t reference_status;
         arm_status_t compact_status;
         unsigned completed = UINT_MAX;
@@ -7472,7 +7472,7 @@ static bool compact_raw_vfp_resident_memory_case(
 static bool validate_compact_raw_vfp_memory_oracles(void) {
     uint8_t *baseline = (uint8_t *)malloc(sizeof g_ram);
     uint8_t *expected = (uint8_t *)malloc(sizeof g_ram);
-    arm_cpu_t initial;
+    arm_cpu_t initial = {0};
     arm_bus_t write_bus = g_bus;
     bool ok = false;
 
@@ -7614,9 +7614,9 @@ static bool compact_raw_thumb_multi_exact_case(
         uint8_t *baseline, uint8_t *expected) {
     const bool load = (sc->insn & (1u << 11)) != 0u;
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t initial;
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t initial = {0};
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t status;
     unsigned completed = UINT_MAX;
@@ -7685,9 +7685,9 @@ static bool compact_raw_thumb_multi_exact_case(
 static bool compact_raw_thumb_multi_refusal_case(
         const compact_raw_thumb_multi_case_t *sc,
         uint8_t *baseline, uint8_t *expected) {
-    arm_cpu_t reference;
-    arm_cpu_t compact;
-    arm_cpu_t before;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
+    arm_cpu_t before = {0};
     arm_status_t reference_status;
     arm_status_t compact_status;
     unsigned completed = UINT_MAX;
@@ -7728,8 +7728,8 @@ static bool compact_raw_thumb_multi_resident_fallback_case(
     const bool load = (sc->insn & (1u << 11)) != 0u;
     const bool no_retire = mode == 4u;
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t reference;
-    arm_cpu_t resident;
+    arm_cpu_t reference = {0};
+    arm_cpu_t resident = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t reference_status;
     unsigned completed = UINT_MAX;
@@ -7932,9 +7932,9 @@ static bool compact_raw_single_exact_case(
     const bool load = (sc->insn & (1u << 20)) != 0u;
     const bool access_priv = !(!pre && write);
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t initial;
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t initial = {0};
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t status;
     unsigned completed = UINT_MAX;
@@ -8003,9 +8003,9 @@ static bool compact_raw_single_exact_case(
 static bool compact_raw_single_refusal_case(
         const compact_raw_single_case_t *sc,
         uint8_t *baseline, uint8_t *expected) {
-    arm_cpu_t reference;
-    arm_cpu_t compact;
-    arm_cpu_t before;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
+    arm_cpu_t before = {0};
     arm_status_t reference_status;
     arm_status_t compact_status;
     unsigned completed = UINT_MAX;
@@ -8049,8 +8049,8 @@ static bool compact_raw_single_resident_fallback_case(
     const bool access_priv = !(!pre && write);
     const bool no_retire = mode == 4u;
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t reference;
-    arm_cpu_t resident;
+    arm_cpu_t reference = {0};
+    arm_cpu_t resident = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t reference_status;
     unsigned completed = UINT_MAX;
@@ -8331,9 +8331,9 @@ static bool compact_raw_block_exact_case(
         uint8_t *baseline, uint8_t *expected) {
     const bool load = (sc->insn & (1u << 20)) != 0u;
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t initial;
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t initial = {0};
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t status;
     unsigned completed = UINT_MAX;
@@ -8403,9 +8403,9 @@ static bool compact_raw_block_exact_case(
 static bool compact_raw_block_refusal_case(
         const compact_raw_block_case_t *sc,
         uint8_t *baseline, uint8_t *expected) {
-    arm_cpu_t reference;
-    arm_cpu_t compact;
-    arm_cpu_t before;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
+    arm_cpu_t before = {0};
     arm_status_t reference_status;
     arm_status_t compact_status;
     unsigned completed = UINT_MAX;
@@ -8446,8 +8446,8 @@ static bool compact_raw_block_resident_fallback_case(
     const bool load = (sc->insn & (1u << 20)) != 0u;
     const bool no_retire = mode == 4u;
     arm_bus_t write_bus = g_bus;
-    arm_cpu_t reference;
-    arm_cpu_t resident;
+    arm_cpu_t reference = {0};
+    arm_cpu_t resident = {0};
     compact_raw_resident_oracle_context_t context;
     arm_status_t reference_status;
     unsigned completed = UINT_MAX;
@@ -8775,8 +8775,8 @@ static bool validate_compact_raw_mode_continuity_oracle(void) {
         UINT32_C(0xe2833001), /* A32 ADD r3,r3,#1 */
         UINT32_C(0xe2844001), /* unexecuted padding */
     };
-    arm_cpu_t reference;
-    arm_cpu_t compact;
+    arm_cpu_t reference = {0};
+    arm_cpu_t compact = {0};
     final_state_t reference_state;
     final_state_t compact_state;
     arm_status_t status = ARM_OK;
@@ -8901,7 +8901,7 @@ static bool validate_compact_raw_oracles(void) {
         UINT16_C(0x6032), /* native STR r2,[r6,#0] */
         UINT16_C(0xb401), /* unexecuted padding for a 12-byte window */
     };
-    arm_cpu_t contract;
+    arm_cpu_t contract = {0};
     final_state_t before, after;
     unsigned completed = UINT_MAX;
 
@@ -9130,7 +9130,7 @@ static bool run_product_entry(const bench_case_t *bc,
                               const a64_static_block_t *block,
                               uint64_t blocks, bool decoded,
                               final_state_t *out, double *seconds) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint64_t i;
     unsigned completed = 0u;
     double start, end;
@@ -13474,7 +13474,7 @@ static bool bench_one(const bench_case_t *bc, uint64_t requested,
     jit_buf_t arena;
     jit_block_t block;
     a64_static_block_t static_block;
-    arm_cpu_t translate_cpu;
+    arm_cpu_t translate_cpu = {0};
     uint32_t *code;
     double *interp_rates = NULL, *static_rates = NULL, *native_rates = NULL;
     uint64_t blocks = (requested + bc->insns - 1u) / bc->insns;
@@ -13603,7 +13603,7 @@ static bool parse_unsigned(const char *s, unsigned *out) {
 }
 
 static bool validate_case_translation(const bench_case_t *bc) {
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     jit_block_t block;
     a64_static_block_t static_block;
     uint32_t code[CODE_WORDS];

@@ -15547,7 +15547,7 @@ static bool springboard_target_trace_selfcheck(void) {
         closed->trap_number == 0u;
 
     springboard_pending_user_t mach_pending;
-    arm_cpu_t mach_cpu;
+    arm_cpu_t mach_cpu = {0};
     memset(&ring, 0, sizeof ring);
     memset(&mach_pending, 0, sizeof mach_pending);
     memset(&mach_cpu, 0, sizeof mach_cpu);
@@ -15997,7 +15997,7 @@ static bool springboard_target_trace_selfcheck(void) {
         ring.target_low_flow_first_valid &&
         ring.target_low_flow_first.at == 0u;
 
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     /*
      * Reuse the large trace scratch instead of putting a second 180+ KiB
      * instance in this startup selfcheck's stack frame. The ring assertions
