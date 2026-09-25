@@ -1178,11 +1178,19 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     }
 
     /*
-     * The emulator is an S5L8900 machine. An IPSW for anything else will
-     * unpack into files its gate rejects, so the useful answer is the specific
-     * one: what this archive is FOR.
+     * The emulator's own machine is the S5L8900. The iPhone 3GS is the iOS 6
+     * preview machine, and only a caller with a separate place for its files
+     * takes it (vm_fw_import_t.accept_iphone_3gs). An IPSW for anything else
+     * will unpack into files nothing boots, so the useful answer is the
+     * specific one: what this archive is FOR.
      */
-    if (report->platform[0] && strcmp(report->platform, "s5l8900x") != 0) {
+    if (!report->platform[0] || strcmp(report->platform, "s5l8900x") == 0)
+        report->machine = VM_FW_MACHINE_S5L8900;
+    else if (strcmp(report->platform, "s5l8920x") == 0 &&
+             strcmp(report->product_type, "iPhone2,1") == 0)
+        report->machine = VM_FW_MACHINE_IPHONE_3GS;
+    if (report->machine == VM_FW_MACHINE_UNKNOWN ||
+        (report->machine == VM_FW_MACHINE_IPHONE_3GS && !cfg->accept_iphone_3gs)) {
         report->status = VM_FW_ERR_UNSUPPORTED_DEVICE;
         snprintf(report->detail, sizeof report->detail,
                  "This is %s %s (%s, %s). NEON emulates the S5L8900 -- the "
@@ -1196,6 +1204,21 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
             set_detail(report->artefacts[i].detail,
                        sizeof report->artefacts[i].detail,
                        "Not attempted: this firmware is for a different SoC.");
+        }
+        return report->status;
+    }
+
+    if (cfg->identified && !cfg->identified(cfg->identified_ctx, report)) {
+        report->status = VM_FW_ERR_OUTPUT_REFUSED;
+        snprintf(report->detail, sizeof report->detail,
+                 "This is %s %s; there is nowhere to put its files.",
+                 report->product_type, report->build);
+        for (int i = 0; i < VM_FW_ARTEFACT_COUNT; i++) {
+            report->artefacts[i].state = VM_FW_STATE_FAILED;
+            report->artefacts[i].reason = VM_FW_ERR_OUTPUT_REFUSED;
+            set_detail(report->artefacts[i].detail,
+                       sizeof report->artefacts[i].detail,
+                       "Not attempted: no destination for this firmware.");
         }
         return report->status;
     }
@@ -1273,6 +1296,18 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     } else if (cancelled(&r)) {
         report->status = VM_FW_ERR_CANCELLED;
         return report->status;
+    } else if (report->machine == VM_FW_MACHINE_IPHONE_3GS) {
+        /* The iOS 6 preview boots its kernel to the root-device wait and
+         * mounts nothing, and iOS 6's disk image is a format this unpacker
+         * does not read yet -- so it is located and left in the archive
+         * rather than copied out (785 MB for 10B500) only to fail. */
+        vm_fw_artefact_report_t *ar = &report->artefacts[VM_FW_ROOT_FILESYSTEM];
+        ar->state = VM_FW_STATE_FOUND;
+        ar->member_size = entry.uncompressed_size;
+        set_detail(ar->member, sizeof ar->member, entry.name);
+        set_detail(ar->detail, sizeof ar->detail,
+                   "Located and left in the IPSW: the iPhone 3GS preview does "
+                   "not mount a root filesystem yet.");
     } else {
         import_root_filesystem(&r, &entry, cfg->keys);
     }
@@ -1357,6 +1392,8 @@ size_t vm_fw_report_render(const vm_fw_report_t *rep, char *out, size_t cap) {
              rep->member_count);
     else
         EMIT("  the manifest could not be read\n");
+    if (rep->machine == VM_FW_MACHINE_IPHONE_3GS)
+        EMIT("  for the iPhone 3GS machine (the iOS 6 preview)\n");
 
     if (rep->status != VM_FW_OK)
         EMIT("  STOPPED: %s\n", vm_fw_strerror(rep->status));

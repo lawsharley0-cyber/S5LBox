@@ -382,6 +382,24 @@ static void count_progress(void *ctx, vm_fw_artefact_t which,
     g_progress_calls++;
 }
 
+/* The destination callback: records what it saw and whether any output had
+ * been opened by then, and answers `allow`. */
+typedef struct {
+    unsigned        calls;
+    vm_fw_machine_t machine;
+    unsigned        opened_before;
+    const memfs_t  *fs;
+    bool            allow;
+} identified_ctx_t;
+
+static bool on_identified(void *ctx, const vm_fw_report_t *rep) {
+    identified_ctx_t *c = (identified_ctx_t *)ctx;
+    c->calls++;
+    c->machine = rep->machine;
+    c->opened_before = c->fs->count;
+    return c->allow;
+}
+
 void vmfw_test_import(vmfw_test_t *t) {
     static ipsw_t ip;
     static memfs_t fs;
@@ -931,6 +949,104 @@ void vmfw_test_import(vmfw_test_t *t) {
         VMFW_T_EQ_STR(t, rep.platform, "s5l8920x", "and its platform named");
         VMFW_T_CHECK(t, rep.detail[0] != '\0', "with an explanation");
         VMFW_T_EQ_U(t, fs.count, 0u, "and nothing was written");
+        VMFW_T_EQ_U(t, rep.machine, VM_FW_MACHINE_IPHONE_3GS,
+                    "named as the iPhone 3GS even when refused");
+    }
+
+    /* ---------------- the iPhone 3GS preview --------------------------- */
+    /*
+     * Accepted only when the caller asks, with the destination chosen after
+     * identification and before any file is opened, and the root filesystem
+     * left in the archive (the preview mounts none).
+     */
+    VMFW_T_SECTION(t, "import/iphone 3gs");
+    {
+        static ipsw_t gs;
+        ipsw_spec_t spec = k_reference_spec;
+        spec.product_type = "iPhone2,1";
+        spec.platform = "s5l8920x";
+        spec.board = "n88ap";
+        spec.build = "10B500";
+        VMFW_T_CHECK(t, build_ipsw(&gs, &spec), "built");
+
+        vm_fw_keys_t keys;
+        vm_fw_keys_clear(&keys);
+        vm_fw_keys_set_img3(&keys, VM_FW_KERNEL, k_kernel_key_hex, k_kernel_iv_hex);
+        vm_fw_keys_set_img3(&keys, VM_FW_DEVICE_TREE, k_dtree_key_hex, k_dtree_iv_hex);
+        vm_fw_keys_set_root(&keys, k_root_key_hex);
+
+        memset(&fs, 0, sizeof fs);
+        vm_fw_files_t files = { mem_open, mem_write, mem_pread, mem_close, &fs };
+        static fx_blob_t blob;
+        blob.data = gs.archive; blob.len = gs.len; blob.fail_next = false;
+        identified_ctx_t idc = { 0, VM_FW_MACHINE_UNKNOWN, 99u, &fs, true };
+        vm_fw_import_t imp;
+        memset(&imp, 0, sizeof imp);
+        imp.pread = fx_blob_pread;
+        imp.pread_ctx = &blob;
+        imp.size = gs.len;
+        imp.files = &files;
+        imp.keys = &keys;
+        imp.accept_iphone_3gs = true;
+        imp.identified = on_identified;
+        imp.identified_ctx = &idc;
+
+        vm_fw_report_t rep;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_OK, "accepted when asked");
+        VMFW_T_EQ_U(t, rep.machine, VM_FW_MACHINE_IPHONE_3GS, "identified as the 3GS");
+        VMFW_T_EQ_U(t, idc.calls, 1u, "the destination was asked for once");
+        VMFW_T_EQ_U(t, idc.machine, VM_FW_MACHINE_IPHONE_3GS, "knowing the machine");
+        VMFW_T_EQ_U(t, idc.opened_before, 0u, "before any file was opened");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_KERNEL].state, VM_FW_STATE_EXTRACTED,
+                    "the kernel was produced (no reference hash: unverified)");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_DEVICE_TREE].state, VM_FW_STATE_EXTRACTED,
+                    "the device tree was produced");
+        VMFW_T_CHECK(t, mem_find(&fs, "kernel.macho") && mem_find(&fs, "devicetree.bin"),
+                     "and both kept");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_ROOT_FILESYSTEM].state, VM_FW_STATE_FOUND,
+                    "the root filesystem is located, not unpacked");
+        VMFW_T_CHECK(t, rep.artefacts[VM_FW_ROOT_FILESYSTEM].member[0] != '\0',
+                     "and named");
+        VMFW_T_EQ_U(t, fs.count, 2u, "nothing else was opened, not even the .part");
+
+        char text[4096];
+        vm_fw_report_render(&rep, text, sizeof text);
+        VMFW_T_CHECK(t, strstr(text, "iPhone 3GS") != NULL, "the rendering says which machine");
+
+        /* The destination refused: stopped before anything was written. */
+        memset(&fs, 0, sizeof fs);
+        idc.calls = 0; idc.allow = false;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_ERR_OUTPUT_REFUSED,
+                    "no destination stops the run");
+        VMFW_T_EQ_U(t, fs.count, 0u, "with nothing opened");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_KERNEL].reason, VM_FW_ERR_OUTPUT_REFUSED,
+                    "and each row says why");
+
+        /* An S5L8920 that is not an iPhone2,1 is still refused. */
+        static ipsw_t other;
+        spec.product_type = "iPhone9,9";
+        VMFW_T_CHECK(t, build_ipsw(&other, &spec), "built");
+        memset(&fs, 0, sizeof fs);
+        blob.data = other.archive; blob.len = other.len;
+        imp.size = other.len;
+        idc.calls = 0; idc.allow = true;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_ERR_UNSUPPORTED_DEVICE,
+                    "another product on the same SoC is refused");
+        VMFW_T_EQ_U(t, rep.machine, VM_FW_MACHINE_UNKNOWN, "and names no machine");
+        VMFW_T_EQ_U(t, idc.calls, 0u, "without asking for a destination");
+        VMFW_T_EQ_U(t, fs.count, 0u, "or writing");
+
+        /* The S5L8900 reference archive reports its machine and still asks. */
+        memset(&fs, 0, sizeof fs);
+        blob.data = ip.archive; blob.len = ip.len;
+        imp.size = ip.len;
+        imp.accept_iphone_3gs = false;
+        idc.calls = 0;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_OK, "the S5L8900 archive");
+        VMFW_T_EQ_U(t, rep.machine, VM_FW_MACHINE_S5L8900, "is the S5L8900 machine's");
+        VMFW_T_EQ_U(t, idc.calls, 1u, "and the destination was asked for");
+        VMFW_T_EQ_U(t, idc.machine, VM_FW_MACHINE_S5L8900, "with that machine");
+        vm_fw_keys_clear(&keys);
     }
 
     /* ---------------- archives that are not IPSWs ---------------------- */

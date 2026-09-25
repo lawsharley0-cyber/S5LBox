@@ -448,6 +448,12 @@ static const uint64_t kVMInstructionCaps[] = {
     return [root stringByAppendingPathComponent:@"firmware"];
 }
 
+- (NSString *)iPhone3GSFirmwareDirectory {
+    NSString *root = [self documentsDirectory];
+    if (root.length == 0) return nil;
+    return [root stringByAppendingPathComponent:@"firmware-iphone3gs"];
+}
+
 - (NSString *)firmwarePathForFile:(NSString *)file {
     NSString *directory = [self firmwareDirectory];
     if (!directory || file.length == 0) return nil;

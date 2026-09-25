@@ -191,6 +191,11 @@ typedef NS_ENUM(NSInteger, VMGraphicsMode) {
 
 - (NSString *)firmwareDirectory;
 
+/* Where iPhone 3GS (iOS 6 preview) firmware goes: a folder of its own, so
+ * importing it never replaces the S5L8900 machine's three files. The same
+ * file names inside it (kernel.macho, devicetree.bin). */
+- (NSString *)iPhone3GSFirmwareDirectory;
+
 /* The full path if that file is present there, or nil. */
 - (NSString *)firmwarePathForFile:(NSString *)file;
 

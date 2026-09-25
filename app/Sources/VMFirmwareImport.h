@@ -283,10 +283,25 @@ typedef struct {
     vmfw_dmg_status_t dmg_reason;
 } vm_fw_artefact_report_t;
 
+/*
+ * Which machine the firmware is for. The S5L8900 (iPhone, iPhone 3G) is the
+ * machine the three files above have always meant. The iPhone 3GS (iPhone2,1,
+ * S5L8920) is the iOS 6 preview machine (core/include/n88.h), accepted only
+ * when the caller asks for it (vm_fw_import_t.accept_iphone_3gs) because its
+ * files must go somewhere else: the S5L8900 machine's gate would reject them,
+ * and they would replace the files it boots.
+ */
+typedef enum {
+    VM_FW_MACHINE_UNKNOWN = 0,
+    VM_FW_MACHINE_S5L8900,
+    VM_FW_MACHINE_IPHONE_3GS
+} vm_fw_machine_t;
+
 typedef struct {
     vm_fw_status_t status;
 
     bool     manifest_read;
+    vm_fw_machine_t machine;        /* from product type and platform       */
     char     product_type[32];      /* "iPhone1,2"  */
     char     product_version[32];   /* "3.1.3"      */
     char     build[16];             /* "7E18"       */
@@ -323,6 +338,17 @@ typedef struct {
     void             *progress_ctx;
     vm_fw_cancel_fn   cancel;
     void             *cancel_ctx;
+
+    /* Accept iPhone 3GS (iPhone2,1, s5l8920x) firmware instead of refusing
+     * it. Off unless the caller has somewhere separate to put it. */
+    bool accept_iphone_3gs;
+
+    /* Optional. Called once, after the manifest has identified the firmware
+     * (report->machine is set) and before any output is opened, so a caller
+     * can choose where this machine's files go. Returning false stops the run
+     * with VM_FW_ERR_OUTPUT_REFUSED and nothing written. */
+    bool (*identified)(void *ctx, const vm_fw_report_t *report);
+    void *identified_ctx;
 } vm_fw_import_t;
 
 /*

@@ -169,6 +169,23 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
     choose(@"CPU graphics (stable)", @"iPhone OS 3.1.3", NO, YES);
     choose(@"GPU for apps and games (experimental)", @"iPhone OS 3.1.3 GPU apps", YES, YES);
     choose(@"Full GPU (experimental)", @"iPhone OS 3.1.3 GPU", YES, NO);
+    /* A different machine, not a renderer choice: the iPhone 3GS running the
+     * iOS 6 kernel. Preview: it prints the kernel's console and stops where
+     * the kernel waits for a root filesystem. */
+    [sheet addAction:[UIAlertAction actionWithTitle:@"iPhone 3GS \u00b7 iOS 6 (preview)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        VMInstanceListViewController *self_ = weakSelf;
+        [self_ promptWithTitle:@"iPhone 3GS \u00b7 iOS 6 (preview)"
+                          text:@"iOS 6.1.6 (preview)"
+                        accept:@"Create"
+                       handler:^(NSString *name) {
+            NSError *err = nil;
+            if (![[VMInstanceStore sharedStore] createIPhone3GSInstanceNamed:name
+                                                                       error:&err])
+                [self_ showError:err doing:@"Could not create the machine"];
+        }];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];

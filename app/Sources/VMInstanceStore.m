@@ -14,6 +14,10 @@ NSString *const VMInstanceStoreDidChangeNotification =
 
 static NSString *const kStoreFile = @"machines.txt";
 static NSString *const kGraphicsRecordFile = @".graphics-v1";
+/* Which hardware a machine is. Absent means the S5L8900 machine, so every
+ * machine made before the record existed stays exactly what it was. */
+static NSString *const kDeviceRecordFile = @".device-v1";
+static NSString *const kDeviceRecordIPhone3GS = @"neon-machine-device 1\niPhone2,1\n";
 static NSString *const kErrorDomain = @"VMInstanceStore";
 static const NSInteger kGraphicsRecordError = 1000;
 
@@ -506,7 +510,49 @@ static NSString *VMGraphicsRecordText(BOOL mbxEnabled,
     return identifier;
 }
 
+- (NSString *)createIPhone3GSInstanceNamed:(NSString *)name
+                                     error:(NSError **)error {
+    NSString *identifier = [self createInstanceNamed:name error:error];
+    if (!identifier) return nil;
+    NSString *path = [[self directoryForInstanceWithID:identifier]
+        stringByAppendingPathComponent:kDeviceRecordFile];
+    NSError *writeError = nil;
+    if (![kDeviceRecordIPhone3GS writeToFile:path
+                                  atomically:YES
+                                    encoding:NSUTF8StringEncoding
+                                       error:&writeError]) {
+        int row = [self indexOfID:identifier];
+        if (row >= 0) (void)vm_instance_remove(&_list, (unsigned)row);
+        NSString *dir = [[self containerDirectory]
+            stringByAppendingPathComponent:identifier];
+        (void)[[NSFileManager defaultManager] removeItemAtPath:dir error:NULL];
+        [self changed];
+        if (error) {
+            NSString *why = writeError.localizedDescription
+                ?: @"the device record could not be written";
+            *error = [NSError errorWithDomain:kErrorDomain
+                                         code:kGraphicsRecordError
+                                     userInfo:@{ NSLocalizedDescriptionKey: why }];
+        }
+        return nil;
+    }
+    return identifier;
+}
+
+- (BOOL)isIPhone3GSInstanceWithID:(NSString *)identifier {
+    if (!identifier.length || [self indexOfID:identifier] < 0) return NO;
+    NSString *dir = [[self containerDirectory]
+        stringByAppendingPathComponent:identifier];
+    NSString *text = [NSString stringWithContentsOfFile:
+        [dir stringByAppendingPathComponent:kDeviceRecordFile]
+                                               encoding:NSUTF8StringEncoding
+                                                  error:NULL];
+    return [text isEqualToString:kDeviceRecordIPhone3GS];
+}
+
 - (NSString *)graphicsSummaryForInstanceWithID:(NSString *)identifier {
+    if ([self isIPhone3GSInstanceWithID:identifier])
+        return @"iPhone 3GS \u00b7 iOS 6 preview";
     BOOL mbxEnabled = NO, softwareRendererEnabled = NO;
     if (!identifier.length ||
         ![self recordedGraphicsForInstanceWithID:identifier
@@ -615,6 +661,15 @@ static NSString *VMGraphicsRecordText(BOOL mbxEnabled,
         if (error) *error = graphicsError;
         return nil;
     }
+    /* A copy of a 3GS machine is a 3GS machine. Best-effort like the rest
+     * of the copy: without the record it would open as the S5L8900 machine. */
+    if ([self isIPhone3GSInstanceWithID:source[@"id"]])
+        (void)[kDeviceRecordIPhone3GS
+            writeToFile:[[self directoryForInstanceWithID:identifier]
+                            stringByAppendingPathComponent:kDeviceRecordFile]
+             atomically:YES
+               encoding:NSUTF8StringEncoding
+                  error:NULL];
     [self changed];
     return identifier;
 }

@@ -33,6 +33,7 @@
 #import "EmulatorViewController.h"
 #import "VMButtonBar.h"
 #import "VMEngine.h"
+#import "VMN88Engine.h"
 #import "VMConsoleViewController.h"
 #import "VMFramebufferView.h"
 #import "VMGuest.h"
@@ -175,6 +176,11 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     BOOL               _consoleDirty;
 
     VMEngine          *_engine;
+    /* The iPhone 3GS preview machine's engine, used instead of _engine (which
+     * stays nil, so every S5L8900 feature is inert) when this machine carries
+     * the iPhone 3GS device record. */
+    VMN88Engine       *_n88;
+    BOOL               _isIPhone3GS;
     CADisplayLink     *_link;
     uint8_t           *_frame;        // main thread's copy of the guest's pixels
     NSUInteger         _ticks;
@@ -279,6 +285,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 - (void)viewDidLoad {
     [super viewDidLoad];
     _checkpointBackgroundTask = UIBackgroundTaskInvalid;
+    _isIPhone3GS =
+        [[VMInstanceStore sharedStore] isIPhone3GSInstanceWithID:self.instanceID];
     self.view.backgroundColor = [UIColor blackColor];
 
     /* Machines benefits from a large browsing title; the running guest does
@@ -445,8 +453,36 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         [self appDidEnterBackground:nil];
 }
 
+/*
+ * The iPhone 3GS preview: no framebuffer, touch or buttons yet, so the screen
+ * area shows the kernel's console (see -viewDidLayoutSubviews), the way a
+ * verbose boot does on a real phone. A refusal is printed there too, because
+ * this runs before the screen is on a window and an alert would be lost.
+ */
+- (void)launchIPhone3GS {
+    [_n88 stop];
+    _n88 = nil;
+    VMN88Engine *engine = [[VMN88Engine alloc] init];
+    NSString *why = nil;
+    if (![engine startWithError:&why]) {
+        [self appendConsole:[engine takePendingConsoleText]];
+        [self append:[@"[neon] " stringByAppendingString:
+                         why ?: @"the machine could not be started"]];
+        [self refreshRunControls];
+        return;
+    }
+    _n88 = engine;
+    [self appendConsole:[_n88 takePendingConsoleText]];
+    [self applyPauseState];
+    [self refreshRunControls];
+}
+
 - (void)launchEngine {
     if (!_frame) return;
+    if (_isIPhone3GS) {
+        [self launchIPhone3GS];
+        return;
+    }
 
     _engine = [[VMEngine alloc] initWithInstanceID:self.instanceID];
     if (![_engine start]) {
@@ -515,6 +551,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_link invalidate];
     [_engine stop];
+    [_n88 stop];
     free(_frame);
 }
 
@@ -581,6 +618,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * state left to serialize. Leaving is still safe and must not trap the
      * user behind a save button that can never succeed. */
     if (!_engine || ![_engine isRunning]) {
+        /* The iPhone 3GS preview has nothing to save yet. */
+        [_n88 stop];
         [self.navigationController popViewControllerAnimated:YES];
         return;
     }
@@ -681,6 +720,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                      : backgroundPause ? @"background"
                                        : nil;
     [_engine setPaused:paused reason:reason];
+    [_n88 setPaused:paused];
 
     /*
      * The link stops only when the app is hidden — NOT when the machine is
@@ -704,8 +744,9 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
  * tapped, so a machine that stopped on its own — a halt, or a reached
  * instruction cap — is shown as stopped without anything having to notice. */
 - (void)refreshRunControls {
-    const BOOL showPlay = (_engine == nil) || [_engine isPaused] ||
-                          ![_engine isRunning];
+    const BOOL showPlay = _isIPhone3GS
+        ? (_n88 == nil || [_n88 isPaused] || ![_n88 isRunning])
+        : ((_engine == nil) || [_engine isPaused] || ![_engine isRunning]);
     if (_toolbarBuilt && showPlay == _toolbarShowsPlay) return;
     _toolbarShowsPlay = showPlay;
     _toolbarBuilt = YES;
@@ -767,8 +808,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     /* A halted machine cannot resume because its s5l8900_t is gone. Older
      * builds silently routed Play through Reset, disguising a terminal stop as
      * a failed resume and destroying the evidence. Ask before a fresh boot. */
-    if (!_engine || ![_engine isRunning]) {
-        NSString *state = _engine ? [_engine statusDescription] : @"no machine";
+    const BOOL alive = _isIPhone3GS ? (_n88 && [_n88 isRunning])
+                                    : (_engine && [_engine isRunning]);
+    if (!alive) {
+        NSString *state = _isIPhone3GS
+            ? (_n88 ? [_n88 statusLine] : @"not started")
+            : (_engine ? [_engine statusDescription] : @"no machine");
         NSString *message = [NSString stringWithFormat:
             @"The machine cannot resume because it is %@. Restarting performs "
              "a fresh boot; it does not continue the stopped CPU state.", state];
@@ -792,7 +837,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
     /* Play clears a stale lifecycle pause in one tap instead of layering a new
      * user pause on top of an engine which is already suspended. */
-    _userPaused = ![_engine isPaused];
+    _userPaused = _isIPhone3GS ? ![_n88 isPaused] : ![_engine isPaused];
     [self applyPauseState];
     [self refreshStatusLine];
 }
@@ -805,6 +850,18 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * Its final publication — the last of the guest's output, and the engine's
      * own "stopped" line — happens on a thread whose only reader is about to
      * be dropped, so anything not collected here is lost. */
+    if (_isIPhone3GS) {
+        /* Nothing on disk to protect: stop, then boot again. */
+        [self appendConsole:[_n88 takePendingConsoleText]];
+        [_n88 stop];
+        [self appendConsole:[_n88 takePendingConsoleText]];
+        _n88 = nil;
+        _userPaused = NO;
+        [self append:@"\n[neon] reset: booting the iPhone 3GS again"];
+        [self launchEngine];
+        [self refreshStatusLine];
+        return;
+    }
     [self appendConsole:[_engine takePendingConsoleText]];
     [self append:@"\n[vm] reset requested; waiting for the old machine"];
 
@@ -1004,6 +1061,13 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _console.hidden = !inlineConsole;
     _console.frame = CGRectMake(safe.left, y + statsHeight,
         fmax(0, b.size.width - safe.left - safe.right), consoleHeight);
+    if (_isIPhone3GS) {
+        /* The preview has no display: its console IS the screen. */
+        _console.hidden = NO;
+        _console.frame = [_phoneShell.guestContainer
+            convertRect:_phoneShell.guestContainer.bounds toView:self.view];
+        [self.view bringSubviewToFront:_console];
+    }
     [self flushConsole];
 }
 
@@ -1375,6 +1439,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                           argb:argb];
 
     [self appendConsole:[_engine takePendingConsoleText]];
+    [self appendConsole:[_n88 takePendingConsoleText]];
     [self flushConsole];
 
     // The status line reads as noise if it changes 30 times a second.
@@ -1417,7 +1482,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     /* One source for the machine's state: the engine. It reports "paused"
      * itself now, so prefixing "paused" here as well would produce
      * "paused · running", which is a contradiction rather than a status. */
-    NSString *machine = _engine ? ([_engine statusLine] ?: @"?") : @"no machine";
+    NSString *machine = _n88 ? [_n88 statusLine]
+                      : _engine ? ([_engine statusLine] ?: @"?") : @"no machine";
 
     /* The touch path's own account of itself. "Delivered" here means the
      * emulated controller ACCEPTED the report — not that the guest acted on

@@ -387,6 +387,18 @@ first step below.
    (62.1 M instructions/s, Linux x86-64 container, one run; single-stepping
    ran about 24 M/s on the same host).
 
+   **In the app, as a preview (2026-09-25).** New Machine offers "iPhone
+   3GS · iOS 6 (preview)", a machine with an iPhone 3GS device record
+   (`.device-v1`) that runs `n88` through `VMN88Engine` instead of
+   `VMEngine`, and shows the kernel's console in the phone's screen area.
+   The importer accepts an iPhone2,1 IPSW (`accept_iphone_3gs`) and writes its
+   kernel and device tree to `Documents/firmware-iphone3gs`, never over the
+   S5L8900 files; it leaves the root filesystem in the archive, because the
+   preview mounts none and the unpacker does not yet read iOS 6's disk image.
+   On this host's copy of 10B500 it produces a kernel and device tree
+   byte-identical to the ones the harness boots. The guest clock is paced to
+   the wall clock, so the kernel's once-a-minute messages arrive once a minute.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 

@@ -438,7 +438,9 @@ titleForFooterInSection:(NSInteger)section {
                     @"known-good file for this build. \"extracted, "
                     @"unverified\" means it was produced, but NEON holds no "
                     @"reference hash for this build to check it against.",
-                    [[VMSettings sharedSettings] firmwareDirectory]
+                    ((_haveReport && _report.machine == VM_FW_MACHINE_IPHONE_3GS)
+                        ? [[VMSettings sharedSettings] iPhone3GSFirmwareDirectory]
+                        : [[VMSettings sharedSettings] firmwareDirectory])
                         ?: @"(no documents directory)"];
 
         case VMImportSectionReadiness:

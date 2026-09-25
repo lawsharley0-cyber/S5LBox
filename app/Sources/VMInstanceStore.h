@@ -57,6 +57,17 @@ extern NSString *const VMInstanceStoreDidChangeNotification;
                    softwareRendererEnabled:(BOOL)softwareRendererEnabled
                                      error:(NSError **)error;
 
+/*
+ * Create an iPhone 3GS machine: the iOS 6 preview (core/include/n88.h). Its
+ * device record is written before this returns; a machine without one is
+ * the original S5L8900 machine, which is what every existing machine is.
+ */
+- (nullable NSString *)createIPhone3GSInstanceNamed:(NSString *)name
+                                              error:(NSError **)error;
+
+/* YES only when the machine carries an exact iPhone 3GS device record. */
+- (BOOL)isIPhone3GSInstanceWithID:(NSString *)identifier;
+
 /* A short description of a machine's recorded renderer pair ("CPU graphics",
  * "GPU for apps", "GPU graphics", "GPU off, MBX2D on"), or nil when it has no
  * trustworthy record yet. For display only. */

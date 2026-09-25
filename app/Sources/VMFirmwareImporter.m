@@ -116,7 +116,31 @@ typedef struct {
      */
     bool open_failed;
     char open_error[192];
+
+    /* Where iPhone 3GS firmware goes instead of out_dir; chosen once the
+     * manifest has said which machine the archive is for. */
+    char iphone3gs_dir[VMFW_PATH_CAP];
 } vmfw_file_ctx_t;
+
+/* The importer's destination question, asked after identification and before
+ * any file is opened: the S5L8900 machine's files stay in out_dir, and the
+ * iPhone 3GS preview's go to their own folder, created here. */
+static bool vmfw_identified_cb(void *ctx, const vm_fw_report_t *report) {
+    vmfw_file_ctx_t *fc = (vmfw_file_ctx_t *)ctx;
+    if (!fc || !report) return false;
+    if (report->machine != VM_FW_MACHINE_IPHONE_3GS) return true;
+    if (!fc->iphone3gs_dir[0]) return false;
+    NSString *dir = [[NSFileManager defaultManager]
+        stringWithFileSystemRepresentation:fc->iphone3gs_dir
+                                    length:strlen(fc->iphone3gs_dir)];
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:NULL])
+        return false;
+    memcpy(fc->out_dir, fc->iphone3gs_dir, sizeof fc->out_dir);
+    return true;
+}
 
 typedef struct {
     FILE *fp;
@@ -447,6 +471,12 @@ static void vmfw_strip_trailing_slash(char *path) {
         return vmfw_fail(report, VM_FW_ERR_OUTPUT_REFUSED,
                          "The firmware directory's path is too long to use.");
 
+    NSString *gsDir = [[VMSettings sharedSettings] iPhone3GSFirmwareDirectory];
+    if (gsDir.length &&
+        ![gsDir getFileSystemRepresentation:files_ctx.iphone3gs_dir
+                                  maxLength:sizeof files_ctx.iphone3gs_dir])
+        files_ctx.iphone3gs_dir[0] = '\0';
+
     NSString *scratchDir = NSTemporaryDirectory();
     if (scratchDir.length == 0 ||
         ![scratchDir getFileSystemRepresentation:files_ctx.scratch_dir
@@ -457,6 +487,7 @@ static void vmfw_strip_trailing_slash(char *path) {
     /* NSTemporaryDirectory() ends in a slash; the paths below join with one. */
     vmfw_strip_trailing_slash(files_ctx.out_dir);
     vmfw_strip_trailing_slash(files_ctx.scratch_dir);
+    vmfw_strip_trailing_slash(files_ctx.iphone3gs_dir);
 
     char ipswPath[VMFW_PATH_CAP];
     NSString *path = url.path;
@@ -507,6 +538,9 @@ static void vmfw_strip_trailing_slash(char *path) {
     cfg.progress_ctx = (__bridge void *)self;
     cfg.cancel       = vmfw_cancel_cb;
     cfg.cancel_ctx   = _state;
+    cfg.accept_iphone_3gs = true;
+    cfg.identified   = vmfw_identified_cb;
+    cfg.identified_ctx = &files_ctx;
 
     const vm_fw_status_t status = vm_fw_import_run(&cfg, report);
 
