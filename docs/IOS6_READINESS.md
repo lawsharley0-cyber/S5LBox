@@ -331,6 +331,42 @@ first step below.
    on this host (about 23 M instructions/s); that is the harness's speed,
    not the product's.
 
+   A third requirement surfaced next: `/chosen/nvram-proxy-data`, the
+   NVRAM image iBoot passes, is 8 KB of zeros in the template, and
+   IODTNVRAM's partition walk (0x80267298) advances by each header's length
+   (a little-endian u16 at +2, in 16-byte blocks), so a zero header never
+   advances and the walk never ends. The harness now writes the smallest
+   image that parses: an empty "common" partition (0x70) and the rest as
+   the free-space partition (0x7f, "wwwwwwwwwwww"), with CHRP header
+   checksums. With it the kernel goes straight on into IOKit matching and
+   starts, printing as it goes, the S5L8920X I/O and GPIO controllers, the
+   PL192 VICs, the performance controller (one domain, three voltage and
+   four performance states), baseband, SDIO, the camera, H.264 encoder and
+   video decoder, both Samsung serial ports, I2C, PWM, MIPI-DSI, SWI and
+   the audio complex with its three I2S controllers, until
+   `com.apple.driver.AppleARM7M` panics "ARM7M not stopped for some
+   reason". ARM7M is the IOP, an ARM7 I/O coprocessor at `0x86300000` and
+   `0xbf300000` that the kernel loads with firmware ("EmbeddedIOP firmware
+   s5l8920x-RELEASE iBoot-1537.9.55") and must first see stopped. Emulating
+   it means a second CPU running Apple's IOP firmware, so for now the
+   harness takes `-u arm-io/iop`, the same un-matching the iPhone OS 3
+   bring-up uses, to find out what depends on it.
+
+   **Waiting for the root device (2026-09-25).** Without the IOP the kernel
+   finishes IOKit matching (the CS42L61 codec, AppleMobileFileIntegrity,
+   the zlib decompressor, IOSurface, the M2 scaler, TV-out, CLCD, the
+   camera, H.264 and JPEG blocks) and reaches the root mount:
+   `Waiting on <dict>…IOMedia…Apple_HFS</dict>`, then "Still waiting for
+   root device" every minute of guest time. It is idle there, in WFI
+   between timer interrupts; the harness jumps time to each deadline, so a
+   10-billion-instruction run covers hours of guest time. The only client
+   of the IOP seen so far is AppleIOPSDIOEndpoint ("Failed to get IOP after
+   10 sec", every 120 s). This is the stage at which iPhone OS 3 needed the
+   memory-disk bridge, and the iOS 6 kernel still carries the same md
+   driver (`mdevadd`, `mdevstrategy`, `rd=`, a `RAMDisk` memory-map entry),
+   so the same approach applies: find its copy sites in this kernel and
+   serve the root filesystem from the host.
+
    Not yet: the kernel also copies a vector-like block to physical address
    0, which this machine has no memory at (probably the reset trampoline
    for waking the core; only sleep would use it); nothing is in the SoC

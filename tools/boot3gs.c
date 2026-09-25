@@ -34,9 +34,10 @@
  *
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
- *           [-c "boot-args"] [-v] [-m dram.bin]
+ *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]...
  * -v logs every device access instead of the first 400; -m saves all of DRAM
- * at the end (the kernel's message buffer is in there).
+ * at the end (the kernel's message buffer is in there); -u un-matches a
+ * device-tree node (e.g. "arm-io/iop") so no driver claims it.
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -242,6 +243,39 @@ static void dt_memmap(uint8_t *b, size_t len, const char *key, uint32_t pa,
     die("device tree: no free memory-map placeholder for %s", key);
 }
 
+/*
+ * /chosen/nvram-proxy-data: the NVRAM image iBoot hands the kernel. The
+ * template's is 8 KB of zeros, and IODTNVRAM's partition walk (0x80267298)
+ * adds each header's length (a u16 at +2, in 16-byte blocks, read
+ * little-endian with ldrh) to its offset, so a zero header never advances
+ * and the walk never ends. This writes the smallest image that parses: a
+ * "common" partition (signature 0x70) holding no variables, and the rest of
+ * the 8 KB as the free-space partition (0x7f, "wwwwwwwwwwww"), each header
+ * with the CHRP checksum over its signature, length and name.
+ */
+static void nvram_partition(uint8_t *h, uint8_t sig, uint16_t blocks,
+                            const char *name) {
+    memset(h, 0, 16);
+    h[0] = sig;
+    h[2] = (uint8_t)blocks;
+    h[3] = (uint8_t)(blocks >> 8);
+    memcpy(h + 4, name, strlen(name) < 12 ? strlen(name) : 12);
+    unsigned sum = h[0];
+    for (int i = 2; i < 16; i++) {
+        sum += h[i];
+        if (sum > 0xffu) sum = (sum & 0xffu) + 1u;
+    }
+    h[1] = (uint8_t)sum;
+}
+
+static void nvram_image(uint8_t *img, uint32_t len) {
+    const uint32_t common = 0x800u;
+    memset(img, 0, len);
+    nvram_partition(img, 0x70, (uint16_t)(common / 16u), "common");
+    nvram_partition(img + common, 0x7f, (uint16_t)((len - common) / 16u),
+                    "wwwwwwwwwwww");
+}
+
 /* ------------------------------------------------------------- the bus */
 
 typedef struct { uint32_t pa; unsigned size; bool write; uint32_t count;
@@ -295,8 +329,13 @@ static s5l_vic_t g_vic[VIC_COUNT];
 static struct { uint64_t start; uint32_t interval; bool armed, pending;
                 uint32_t ctrl; uint64_t fired; } g_timer;
 
+/* Cycles per timer tick, exactly: the count must never wrap or step back,
+ * and cycles * TB_HZ overflows 64 bits once idle skipping has pushed the
+ * cycle count past ~7.7e11 (it did, 1,281 guest seconds into a run). */
+#define CYCLES_PER_TICK (CPU_HZ / TB_HZ)
+_Static_assert(CPU_HZ % TB_HZ == 0, "the timebase must divide the CPU clock");
 static uint64_t timer_count(void) {
-    return g_cpu.cycles * (uint64_t)TB_HZ / CPU_HZ;
+    return g_cpu.cycles / CYCLES_PER_TICK;
 }
 
 static void irq_update(void) {
@@ -395,7 +434,7 @@ static bool b_wfi(void *c) {
     g_wfi++;
     if (g_timer.armed && (g_timer.ctrl & 1u)) {
         const uint64_t due = g_timer.start + g_timer.interval;
-        const uint64_t due_cycles = (due * CPU_HZ + TB_HZ - 1u) / TB_HZ;
+        const uint64_t due_cycles = due * CYCLES_PER_TICK;
         if (due_cycles > g_cpu.cycles) g_cpu.cycles = due_cycles;
     }
     timer_update();
@@ -477,17 +516,21 @@ static void dump_state(void) {
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: boot3gs kernelcache.macho devicetree.bin "
-                        "[-n insns] [-c boot-args] [-v] [-m dram.bin]\n");
+                        "[-n insns] [-c boot-args] [-v] [-m dram.bin] [-u node]...\n");
         return 2;
     }
     uint64_t budget = 200000000u;
     const char *cmdline = "debug=0x8 serial=3 -v";
     const char *ram_out = NULL;
+    const char *unmatch[16];
+    unsigned nunmatch = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-n") && i + 1 < argc) budget = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cmdline = argv[++i];
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) ram_out = argv[++i];
+        else if (!strcmp(argv[i], "-u") && i + 1 < argc && nunmatch < 16u)
+            unmatch[nunmatch++] = argv[++i];
         else die("unknown option %s", argv[i]);
     }
     size_t klen, dlen;
@@ -545,6 +588,25 @@ int main(int argc, char **argv) {
     };
     for (size_t i = 0; i < sizeof clocks / sizeof clocks[0]; i++)
         dt_set(dt, dlen, clocks[i].path, clocks[i].prop, &clocks[i].v, 1);
+    {
+        size_t chosen = dt_find(dt, dlen, "chosen");
+        uint32_t nl = 0;
+        uint8_t *nv = chosen == (size_t)-1 ? NULL
+                    : dt_prop(dt, dlen, chosen, "nvram-proxy-data", &nl);
+        if (!nv || nl < 0x1000u) die("device tree: no /chosen:nvram-proxy-data");
+        nvram_image(nv, nl);
+    }
+    /* -u: un-match a node, the way core/src/boot/bringup.c does: an 'x'
+     * over the first byte of its compatible, so no driver claims it. */
+    for (unsigned i = 0; i < nunmatch; i++) {
+        size_t node = dt_find(dt, dlen, unmatch[i]);
+        uint32_t cl = 0;
+        uint8_t *compat = node == (size_t)-1 ? NULL
+                        : dt_prop(dt, dlen, node, "compatible", &cl);
+        if (!compat || !cl) die("cannot un-match /%s", unmatch[i]);
+        compat[0] = 'x';
+        printf("un-matched /%s\n", unmatch[i]);
+    }
     dt_memmap(dt, dlen, "DeviceTree", tree_pa, (uint32_t)dlen);
     dt_memmap(dt, dlen, "BootArgs", args_pa, 0x1000u);
 
@@ -583,7 +645,7 @@ int main(int argc, char **argv) {
     /* Run. */
     uint32_t ring[64] = {0};
     unsigned ring_i = 0, same = 0;
-    uint64_t n = 0, exceptions = 0, interrupts = 0;
+    uint64_t n = 0, exceptions = 0, interrupts = 0, undefs = 0;
     arm_status_t st = ARM_OK;
     const char *why = "instruction budget";
     const uint32_t panic_va = g_have_syms ? ksyms_value(&g_syms, "_panic") & ~1u : 0u;
@@ -597,8 +659,12 @@ int main(int argc, char **argv) {
         const uint32_t npc = g_cpu.r[15], nmode = g_cpu.cpsr & 0x1fu;
         const uint32_t vbase = (g_cpu.cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u;
         if (nmode != mode && npc >= vbase && npc < vbase + 0x20u) {
-            /* Interrupts are the machine working, not news; count them. */
+            /* Interrupts are the machine working, not news; count them. So
+             * are undefined-instruction traps: the kernel enables VFP per
+             * thread lazily, so each thread's first VFP or NEON instruction
+             * traps once and is re-run (e.g. vmov.i32 d16, #0 at 0x8024dff8). */
             if (npc - vbase == 0x18u || npc - vbase == 0x1cu) { interrupts++; continue; }
+            if (npc - vbase == 0x04u) { undefs++; continue; }
             exceptions++;
             printf("  exception vector %02x from pc %08x %s  dfsr %08x dfar %08x "
                    "ifsr %08x ifar %08x\n", npc - vbase, pc, sym(pc), g_cpu.cp15.dfsr,
@@ -622,7 +688,8 @@ int main(int argc, char **argv) {
         printf(" (status %d, insn %08x)", (int)st, insn);
     }
     printf("\n%" PRIu64 " device accesses, %" PRIu64 " WFI, %" PRIu64 " interrupts taken, "
-           "%" PRIu64 " timer expiries, guest time %.3f s\n", g_mmio_total, g_wfi, interrupts,
+           "%" PRIu64 " undefined-instruction traps, %" PRIu64 " timer expiries, "
+           "guest time %.3f s\n", g_mmio_total, g_wfi, interrupts, undefs,
            g_timer.fired, (double)timer_count() / TB_HZ);
     dump_state();
     printf("\nlast pcs:\n");
