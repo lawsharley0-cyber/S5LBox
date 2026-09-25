@@ -37,8 +37,8 @@ first step below.
 | ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.U/XP read as one, SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **No** VMSAv7 or v7 CP15 identification | Barriers are no-ops single-core but ISB/`MCR` cache maintenance must keep ending blocks (they already STOP). ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
 | Unaligned access always permitted (SCTLR.U fixed) | Handled by the reference through SCTLR | Engine fast paths already fall back on any misalignment. |
 | SMP (A6 only) | **No** | Per-core CPU state and engine instance; the code bitmap and region generations must be shared so a store on one core invalidates blocks the other runs; exclusive monitor becomes global; deterministic interleaving quanta. XNU can boot single-core by boot-arg, which defers it. |
-| SoC: memory map, interrupt controller, timers, clocks, NAND/eMMC, I²C/SPI devices, display | S5L8900 models only | None. New device models, from scratch. |
-| GPU: SGX535 / SGX543MP3 | **No** (MBX partial) | None. iOS 6 SpringBoard is GPU-composited through CoreAnimation → IOMobileFramebuffer with no software fallback. `ROADMAP.md` P2 names this the decisive risk: emulate an undocumented GPU, or shim IOSurface/IOMobileFramebuffer higher up. **Answer before building anything else.** |
+| SoC: memory map, interrupt controller, timers, clocks, NAND/eMMC, I²C/SPI devices, display | S5L8900 models only. The 3GS inventory is read from its device tree (step 4) | None. New device models, some adapted from the S5L8900 ones. |
+| GPU: SGX535 / SGX543MP3 | **No** (MBX partial) | None. **Answered for the 3GS (2026-09-25):** iOS 6.1.6's window server falls back to QuartzCore's software renderer when OpenGL is off, selected by `CA_ENABLE_OGL=0` in `backboardd`'s environment (`IOS6_GRAPHICS.md` §6). So the home screen and UIKit apps need no GPU model; games that draw with OpenGL ES still do. |
 | Boot chain: iBoot/LLB, IMG3 keys, device tree | IMG3 parsing reusable (A4–A6 use IMG3) | None. |
 
 ## 3. Order of work (smallest risk first)
@@ -191,6 +191,26 @@ first step below.
    specialised records with explicit conditions.
 4. **SoC model** for the chosen device, then boot to the kernel's first
    console output, then userspace.
+
+   **The 3GS inventory (2026-09-25),** from the user's 10B500 device tree
+   (`DeviceTree.n88ap.img3`, 89 nodes; decrypted with the user's key, kept
+   out of the repository). One Cortex-A8 (`cpu0`, `ARM,v7`). Everything
+   else hangs off `/arm-io` (`s5l8920x`). What the compatible strings
+   suggest, before any register is read:
+
+   | Likely adaptable from the S5L8900 models | New to this machine |
+   |---|---|
+   | `vic` (`pl192`, `0x3f200000`) | `pmgr` (power, clocks; `0x3f100000`, `0x3fc00000`) |
+   | `uart0-4` (`uart-1,samsung`) | `cdma` DMA (replaces the PL080) |
+   | `spi0-2` (`spi-1,samsung`; NOR, multi-touch, baseband) | `dart0/1` IOMMUs |
+   | `i2c0/2`, `gpio`, `pwm` (Samsung-style, to be checked) | `flash-controller0` (`fmi,s5l8920x`) NAND |
+   | `usb-complex` (lists `s5l8900x` as compatible) | PMU `d1755` (Dialog), codec `cs42l61`/`cs42l58` |
+   | `clcd`, `tv-out` (list `s5l8720x` as compatible) | `mipi-dsim` display link, `sgx`, `vxd`, `venc`, `isp`, `jpeg`, `scaler` |
+
+   The nearest milestone, the kernel's first console line, needs the CPU
+   pieces above plus the VIC, a timer source, a UART and `pmgr`; the rest
+   waits for the boot to ask for it, as it did on the current machine.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 

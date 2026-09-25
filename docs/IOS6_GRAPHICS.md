@@ -5,6 +5,11 @@ Nothing below is measured on iOS 6 yet. Every claim is marked **Known**
 (established in this project), **Expected** (from general knowledge of the
 platform, to be confirmed from the firmware), or **Unknown**.
 
+**Update 2026-09-25: Q1 is answered, yes.** iOS 6.1.6's QuartzCore still
+composites the display in software when OpenGL is switched off, and the
+switch is `CA_ENABLE_OGL=0` in `backboardd`'s environment. Section 6 has the
+evidence; by the decision rule in section 4, route A comes first.
+
 The target is the one recommended in `IOS6_READINESS.md`: iPhone 3GS
 (S5L8920, Cortex-A8, PowerVR SGX535, 320×480), iOS 6.1.6.
 
@@ -72,3 +77,60 @@ supplies, with tools already in `tools/`: `ipsw_explore.py` (members),
 - The method used for MBX (`core/src/soc/mbx.c`): read the driver, model
   what it waits on, and count every rejected command. The MBX model itself
   does not carry over: the SGX is a different GPU.
+
+## 6. Answers from the firmware (2026-09-25)
+
+Read statically from the user's `iPhone2,1_6.1.6_10B500_Restore.ipsw`
+(MD5 `1b6a0a0c9701d3762be7c4e90799c0b5`, equal to Apple's download ETag), with
+the user's own keys, kept out of the repository like the firmware itself.
+The root filesystem was decrypted with `tools/vfdecrypt.py`, unpacked with
+`tools/udif.py`, and `dyld_shared_cache_armv7` extracted with
+`tools/hfsx_extract.py`. The cache was read with `tools/dsc6.py`, new for
+this: the iOS 3 tools do not read iOS 6's separate local-symbol region or
+Thumb-2 address building. Addresses below are cache virtual addresses in
+that build; nothing here has run yet.
+
+**Q1, the CPU renderer: Known, present and wired to the display.**
+
+1. QuartzCore contains the software renderer the current machine uses,
+   `CA::OGL::SWContext` (vtable `0x396c2110`), with its samplers and blend
+   routines (`CA::OGL::SW::*`).
+2. `CA::WindowServer::Server::sw_renderer()` (`0x32daf078`) builds an
+   `SWContext` and a renderer over it on first use. Its callers are
+   `Server::render_update` (`0x32daf124`), which renders every update with
+   it unconditionally, and `Server::render_surface`.
+3. iOS 6 has one concrete window server, `EAGLServer`; `Server` and
+   `IOMFBServer` are its bases. `EAGLServer::render_update` (`0x32da6a78`)
+   asks `EAGLServer::renderer()` (`0x32da6964`) for the OpenGL renderer and,
+   **when that returns none, tail-calls `Server::render_update`**: the
+   software path.
+4. `EAGLServer::renderer()` returns none when a flag is clear, or when the
+   OpenGL context cannot be created. The flag is read once, in the
+   `EAGLServer` constructor (`0x32da67ec`): `getenv("CA_ENABLE_OGL")`,
+   default 1, `atoi` of the value when set. So `CA_ENABLE_OGL=0` selects
+   software compositing.
+5. The window server runs in `backboardd`, not SpringBoard as on iPhone
+   OS 3: `/System/Library/LaunchDaemons/com.apple.backboardd.plist` owns
+   the `com.apple.CARenderServer` Mach service, and `backboardd` drives
+   `CAWindowServer`. The switch therefore belongs in that plist's
+   `EnvironmentVariables`, the iOS 6 counterpart of the `CA_ENABLE_MBX2D=0`
+   the work image puts into SpringBoard's today.
+6. Not the switch: `CA_NO_ACCEL` is read only by `CA::CG::IOSurfaceQueue`,
+   Core Graphics drawing into IOSurfaces.
+
+What this does not settle (**Unknown** until it runs): whether anything
+else in `backboardd` or UIKit insists on OpenGL ES before the first frame;
+how fast `SWContext` is at 320×480 on this emulator; and what
+`IOMFBDisplay` needs from the display driver (Q4). The display path is
+`IOMobileFramebuffer`, as on the current machine; on the 3GS it sits on the
+`clcd` controller and a MIPI DSI link (`mipi-dsim`) in the device tree.
+Games that draw with OpenGL ES themselves still need route B or C.
+
+**Q2 and Q3 (the SGX driver and shader path): not yet read.** The device
+tree has the GPU at `/arm-io/sgx` (`sgx,s5l8920x`, registers
+`0x05300000`, interrupt 41). Route A no longer waits on them.
+
+**Q4, what QuartzCore needs at minimum:** partly known. The display class
+is `CA::WindowServer::IOMFBDisplay` over `IOMobileFramebuffer`, with
+`IOSurface`-backed pages (`CA::WindowServer::IOSurface`). The exact calls
+are next to read, from the same cache, before the display model is built.
