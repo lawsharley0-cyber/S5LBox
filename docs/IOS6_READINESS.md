@@ -399,6 +399,24 @@ first step below.
    byte-identical to the ones the harness boots. The guest clock is paced to
    the wall clock, so the kernel's once-a-minute messages arrive once a minute.
 
+   **The root device, first slice (2026-09-25).** iOS 6 creates the memory
+   disk differently from iPhone OS 3: `IOFindBSDRoot` (0x80270684) passes the
+   RAMDisk entry through `ml_static_ptovirt` and calls
+   `mdevadd(-1, va >> 12, size >> 12, phys = 0)`, a virtual disk that
+   `mdevstrategy` (0x8009765c) reads with plain `bcopy`. The strategy routine
+   also has the physical path the bridge already services,
+   `bcopy_phys(src64, dst64, len)` one page at a time, so four patches, gated
+   on the kernel's LC_UUID and each site's bytes
+   (`tools/ios6_kernel_patch.c`), make md0 a physical disk at the token
+   address and trap its two copies. `n88` publishes the RAMDisk entry at
+   `N88_MD_TOKEN_PA` and installs the bridge; `boot3gs -r` serves an image.
+   Result on 10B500: the kernel prints `BSD root: md0, major 3, minor 0` and
+   the bridge serves 18 reads with no failures (the HFSX volume header,
+   journal info block and header, and B-tree headers), then the system goes
+   idle with `rootvnode` still 0 -- the root mount has not completed. Why is
+   the next question; the raw-device path (`mdevrw` calling `uiomove64`,
+   which iPhone OS 3 needed a second bridge for) is not yet patched.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 

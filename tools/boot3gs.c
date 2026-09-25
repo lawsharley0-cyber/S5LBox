@@ -24,12 +24,15 @@
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
+ *           [-r root.img]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default, "arm-io/iop"); -e runs on the
  * cached interpreter in large slices, the way the app does, reporting only
  * the backtraces, the console and the end state -- the speed of that mode is
- * the app's.
+ * the app's. -r serves a root filesystem image as /dev/md0 (the kernel must
+ * be the 10B500 one tools/ios6_kernel_patch.c knows); the image is written
+ * to, so pass a working copy, never the only one.
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -37,6 +40,8 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
+#include "file_block.h"
+#include "ios6_kernel_patch.h"
 #include "ksyms.h"
 #include "n88.h"
 
@@ -116,6 +121,34 @@ log:
     }
 }
 
+/* ------------------------------------------------------- root disk log */
+/* The root disk as the kernel uses it: every request the bridge makes,
+ * forwarded to the file and logged (the first 200 in order, with the guest
+ * pc and instruction count, then only counted). */
+static const vm_block_t *g_root_inner;
+static unsigned g_root_logged;
+
+static vm_block_io_status_t logged_read(void *ctx, uint64_t off, void *dst,
+                                        size_t n, size_t *actual) {
+    (void)ctx;
+    if (g_root_logged++ < 200u)
+        printf("  disk R %10llx +%-6zu  pc %08x  guest %.3f s\n",
+               (unsigned long long)off, n, g_m.cpu.r[15], n88_guest_seconds(&g_m));
+    return g_root_inner->read_at(g_root_inner->context, off, dst, n, actual);
+}
+static vm_block_io_status_t logged_write(void *ctx, uint64_t off, const void *src,
+                                         size_t n, size_t *actual) {
+    (void)ctx;
+    if (g_root_logged++ < 200u)
+        printf("  disk W %10llx +%-6zu  pc %08x  guest %.3f s\n",
+               (unsigned long long)off, n, g_m.cpu.r[15], n88_guest_seconds(&g_m));
+    return g_root_inner->write_at(g_root_inner->context, off, src, n, actual);
+}
+static vm_block_io_status_t logged_flush(void *ctx) {
+    (void)ctx;
+    return g_root_inner->flush ? g_root_inner->flush(g_root_inner->context) : VM_BLOCK_IO_OK;
+}
+
 /* ------------------------------------------------------ guest reading */
 
 /* A guest C string at a kernel virtual address, through the guest's own
@@ -172,11 +205,18 @@ static void report_panic(void) {
     printf(")  from %s\n", sym(c->r[14]));
 }
 
+/* The console, each line stamped with the guest time it was drained at. */
 static void drain_console(void) {
+    static bool at_line_start = true;
     char buf[4096];
     size_t n;
-    while ((n = n88_console_take(&g_m, buf, sizeof buf)) > 0)
-        fwrite(buf, 1, n, stderr);
+    while ((n = n88_console_take(&g_m, buf, sizeof buf)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (at_line_start) fprintf(stderr, "[%9.3f] ", n88_guest_seconds(&g_m));
+            fputc(buf[i], stderr);
+            at_line_start = buf[i] == '\n';
+        }
+    }
 }
 
 static void dump_state(void) {
@@ -199,12 +239,14 @@ static void dump_state(void) {
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: boot3gs kernelcache.macho devicetree.bin [-n insns] "
-                        "[-c boot-args] [-v] [-m dram.bin] [-u node]... [-e]\n");
+                        "[-c boot-args] [-v] [-m dram.bin] [-u node]... [-e] "
+                        "[-r root.img]\n");
         return 2;
     }
     uint64_t budget = 200000000u;
     const char *cmdline = NULL;
     const char *ram_out = NULL;
+    const char *root_path = NULL;
     const char *unmatch[16];
     unsigned nunmatch = 0;
     bool engine = false;
@@ -214,6 +256,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else if (!strcmp(argv[i], "-e")) engine = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) ram_out = argv[++i];
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-u") && i + 1 < argc && nunmatch < 16u)
             unmatch[nunmatch++] = argv[++i];
         else die("unknown option %s", argv[i]);
@@ -229,6 +272,31 @@ int main(int argc, char **argv) {
     if (!n88_devicetree_is_3gs(tree, dlen))
         printf("warning: the device tree's root is not compatible \"N88AP\"\n");
 
+    file_block_t *root_file = NULL;
+    const vm_block_t *root = NULL;
+    if (root_path) {
+        if (!ios6_kernel_patch_identify(kernel, klen))
+            die("-r needs the iOS 6.1.6 10B500 iPhone2,1 kernel (its UUID differs)");
+        root_file = file_block_create();
+        FILE *f = fopen(root_path, "rb");
+        if (!f || fseek(f, 0, SEEK_END) != 0) die("cannot open %s", root_path);
+        const long size = ftell(f);
+        fclose(f);
+        file_block_status_t fs;
+        if (!root_file || size <= 0 ||
+            (fs = file_block_open(root_file, root_path, (uint64_t)size)) != FILE_BLOCK_STATUS_OK)
+            die("cannot open %s as a block device", root_path);
+        g_root_inner = file_block_get(root_file);
+        static vm_block_t logged;
+        logged = *g_root_inner;
+        logged.context = NULL;
+        logged.read_at = logged_read;
+        logged.write_at = logged_write;
+        logged.flush = logged_flush;
+        root = &logged;
+        printf("root filesystem: %s, %ld bytes, as /dev/md0\n", root_path, size);
+    }
+
     if (!n88_init(&g_m, engine)) die("cannot allocate the machine");
     g_m.trace = on_unmodelled;
     char detail[256];
@@ -236,9 +304,21 @@ int main(int argc, char **argv) {
         .kernel = kernel, .kernel_size = klen, .devicetree = tree, .devicetree_size = dlen,
         .cmdline = cmdline,
         .unmatch = nunmatch ? unmatch : NULL, .unmatch_count = nunmatch,
+        .root = root,
+        .md_read_site_pc = root ? IOS6_KERNEL_PATCH_MD_READ_VA : 0u,
+        .md_write_site_pc = root ? IOS6_KERNEL_PATCH_MD_WRITE_VA : 0u,
     };
     const n88_status_t bs = n88_boot(&g_m, &req, detail, sizeof detail);
     if (bs != N88_OK) die("%s: %s", n88_strerror(bs), detail);
+    if (root) {
+        guest_patch_report_t pr;
+        const guest_patch_status_t ps = ios6_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr);
+        if (ps != GUEST_PATCH_STATUS_OK)
+            die("the kernel patch was refused: %s (entry %u, va %08llx)",
+                guest_patch_status_string(ps), pr.entry_index,
+                (unsigned long long)pr.virtual_address);
+        printf("kernel patched for the memory-disk bridge (4 sites)\n");
+    }
     printf("device tree pa %08x (%u bytes), boot_args pa %08x, topOfKernelData pa %08x\n",
            g_m.devicetree_pa, g_m.devicetree_size, g_m.boot_args_pa, g_m.tokd_pa);
     printf("boot-args \"%s\"\n", (const char *)g_m.ram + (g_m.boot_args_pa - N88_DRAM_BASE) + 0x38);
@@ -292,6 +372,14 @@ int main(int argc, char **argv) {
                 printf("  exception vector %02x from pc %08x %s  dfsr %08x dfar %08x "
                        "ifsr %08x ifar %08x\n", npc - vbase, pc, sym(pc), g_m.cpu.cp15.dfsr,
                        g_m.cpu.cp15.dfar, g_m.cpu.cp15.ifsr, g_m.cpu.cp15.ifar);
+                if (exceptions <= 5u) {
+                    /* r7 is not banked, so the chain is still the faulting
+                     * code's; start it from the faulting pc. */
+                    const uint32_t vpc = g_m.cpu.r[15];
+                    g_m.cpu.r[15] = pc;
+                    backtrace("      ");
+                    g_m.cpu.r[15] = vpc;
+                }
                 if (exceptions > 20u) { why = "more than 20 exceptions"; n++; break; }
             }
             if ((n + 1u) % every == 0u) {
@@ -323,6 +411,16 @@ int main(int argc, char **argv) {
            n88_guest_seconds(&g_m));
     printf("console: %" PRIu64 " bytes (%" PRIu64 " dropped from the ring)\n",
            g_m.console_total, g_m.console_dropped);
+    if (g_m.has_root) {
+        const md_bridge_stats_t *ms = &g_m.md.stats;
+        printf("root disk: %" PRIu64 " reads (%" PRIu64 " bytes), %" PRIu64 " writes (%"
+               PRIu64 " bytes), %" PRIu64 " failures", ms->successful_reads, ms->bytes_read,
+               ms->successful_writes, ms->bytes_written, ms->failures);
+        if (ms->failures)
+            printf("; last: %s at pc %08x", md_bridge_error_string(g_m.md.last_error.code),
+                   g_m.md.last_error.pc);
+        printf("\n");
+    }
     dump_state();
     if (!engine) {
         printf("\nlast pcs:\n");
@@ -344,5 +442,9 @@ int main(int argc, char **argv) {
         printf("DRAM written to %s\n", ram_out);
     }
     n88_free(&g_m);
+    if (root_file) {
+        file_block_close(root_file);
+        file_block_destroy(&root_file);
+    }
     return 0;
 }

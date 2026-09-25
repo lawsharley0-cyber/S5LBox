@@ -1156,6 +1156,28 @@ else()
         -Wall -Wextra -Werror -pedantic)
 endif()
 
+# The iOS 6.1.6 (10B500) kernel gate for the iPhone 3GS machine: the same
+# fail-closed shape as the iPhone OS 3 one above, for the four patches that let
+# the memory-disk bridge serve its root filesystem (tools/ios6_kernel_patch.h).
+add_library(host_ios6_kernel_patch STATIC ../tools/ios6_kernel_patch.c)
+target_include_directories(host_ios6_kernel_patch PUBLIC ../tools include)
+target_link_libraries(host_ios6_kernel_patch
+    PUBLIC host_guest_patch
+    PRIVATE emucore)
+set_target_properties(host_ios6_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_ios6_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_ios6_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_ios6_kernel_patch tests/test_ios6_kernel_patch.c)
+target_link_libraries(test_ios6_kernel_patch PRIVATE host_ios6_kernel_patch emucore)
+add_test(NAME ios6_kernel_patch COMMAND test_ios6_kernel_patch)
+
 # The gate as a bring-up hook: one adapter, shared by the desktop test below
 # and by the iOS app, so a kernel is authorized by the same code in both.
 add_library(host_ios3_bringup_gate STATIC ../tools/ios3_bringup_gate.c)
@@ -1514,4 +1536,4 @@ target_link_libraries(arm_diff_probe PRIVATE emucore)
 # iPhone 3GS / iOS 6 bring-up research harness: runs the user's kernelcache on
 # a bare Cortex-A8 machine and logs every device access (tools/boot3gs.c).
 add_executable(boot3gs ../tools/boot3gs.c)
-target_link_libraries(boot3gs PRIVATE emucore)
+target_link_libraries(boot3gs PRIVATE emucore host_ios6_kernel_patch host_file_block)

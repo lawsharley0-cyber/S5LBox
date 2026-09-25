@@ -370,10 +370,11 @@ static void build_tree(buf_t *t, tree_opts_t o) {
         b_prop(t, "peripheral-frequency", zero4, 4);
         b_prop(t, "fixed-frequency", zero4, 4);
       b_node(t, 2, 1); b_str(t, "name", "chosen"); b_prop(t, "nvram-proxy-data", NULL, 0x2000);
-        b_node(t, 4, 0); b_str(t, "name", "memory-map");
+        b_node(t, 5, 0); b_str(t, "name", "memory-map");
         b_prop(t, "MemoryMapReserved-0", zero8, 8);
-        b_prop(t, "RAMDisk", "\x01\x00\x00\x40\x00\x10\x00\x00", 8);   /* in use */
+        b_prop(t, "InUse", "\x01\x00\x00\x40\x00\x10\x00\x00", 8);     /* taken */
         b_prop(t, "MemoryMapReserved-1", zero8, 8);
+        b_prop(t, "MemoryMapReserved-2", zero8, 8);
       b_node(t, 1, 1); b_str(t, "name", "arm-io");
         b_node(t, 2, 0); b_str(t, "name", "iop"); b_str(t, "compatible", "iop-s5l8920x");
 }
@@ -470,7 +471,8 @@ static void test_boot_layout_and_tree(void) {
         CHECK(m && n88_init(m, engine), "init");
         if (!m || !m->ram) { free(m); return; }
         char detail[160];
-        const n88_boot_t req = { kernel, klen, tree.b, tree.n, NULL, NULL, 0 };
+        const n88_boot_t req = { .kernel = kernel, .kernel_size = klen,
+                                 .devicetree = tree.b, .devicetree_size = tree.n };
         const n88_status_t st = n88_boot(m, &req, detail, sizeof detail);
         CHECK(st == N88_OK, "boot: %s (%s)", n88_strerror(st), detail);
         if (st != N88_OK) { n88_free(m); free(m); return; }
@@ -528,8 +530,11 @@ static void test_boot_layout_and_tree(void) {
         p = tree_prop(dt, tree.n, "chosen/memory-map", "BootArgs", &l);
         CHECK(p && get32(p) == args_pa && get32(p + 4) == 0x1000u,
               "memory-map BootArgs took the next free one");
-        p = tree_prop(dt, tree.n, "chosen/memory-map", "RAMDisk", &l);
+        p = tree_prop(dt, tree.n, "chosen/memory-map", "InUse", &l);
         CHECK(p && get32(p) == 0x40000001u, "an entry in use is left alone");
+        CHECK(!tree_prop(dt, tree.n, "chosen/memory-map", "RAMDisk", &l),
+              "no RAMDisk entry without a root filesystem");
+        CHECK(!m->has_root && !m->bus.privileged_svc_handler, "and no bridge");
 
         /* And it runs. */
         arm_status_t rs = ARM_HALT;
@@ -540,7 +545,11 @@ static void test_boot_layout_and_tree(void) {
 
         /* A second boot starts from clean DRAM. */
         put32(ram_at(m, 0x48000000u), 0x5a5a5a5au);
-        const n88_boot_t req2 = { kernel, klen, tree.b, tree.n, "-v", (const char *const[]){ "" }, 0 };
+        const n88_boot_t req2 = { .kernel = kernel, .kernel_size = klen,
+                                  .devicetree = tree.b, .devicetree_size = tree.n,
+                                  .cmdline = "-v",
+                                  .unmatch = (const char *const[]){ "" },
+                                  .unmatch_count = 0 };
         CHECK(n88_boot(m, &req2, NULL, 0) == N88_OK, "second boot");
         CHECK(get32(ram_at(m, 0x48000000u)) == 0u, "DRAM cleared for a second boot");
         CHECK(strcmp((const char *)ram_at(m, m->boot_args_pa) + 0x38, "-v") == 0, "given boot-args");
@@ -564,7 +573,8 @@ static void test_boot_refusals(void) {
     CHECK(m && n88_init(m, false), "init");
     if (!m || !m->ram) { free(m); return; }
     char d[160];
-    n88_boot_t r = { kernel, klen, tree.b, tree.n, NULL, NULL, 0 };
+    n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                     .devicetree = tree.b, .devicetree_size = tree.n };
 
     r.kernel = NULL;
     CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ARGUMENT, "no kernel");
@@ -605,6 +615,120 @@ static void test_boot_refusals(void) {
     CHECK(strcmp(n88_strerror(N88_ERR_LAYOUT), "unknown error") != 0, "strerror");
     n88_free(m);
     free(m);
+}
+
+/* -------------------------------------------------------- root disk */
+
+typedef struct { uint8_t data[16384]; } memdisk_t;
+static vm_block_io_status_t md_read(void *ctx, uint64_t off, void *dst, size_t n, size_t *got) {
+    memdisk_t *d = ctx;
+    memcpy(dst, d->data + off, n);
+    *got = n;
+    return VM_BLOCK_IO_OK;
+}
+static vm_block_io_status_t md_write(void *ctx, uint64_t off, const void *src, size_t n,
+                                     size_t *got) {
+    memdisk_t *d = ctx;
+    memcpy(d->data + off, src, n);
+    *got = n;
+    return VM_BLOCK_IO_OK;
+}
+
+/* Thumb-2 MOVW/MOVT as two halfwords. */
+static void t_mov16(uint16_t *h, unsigned *n, bool top, unsigned rd, uint32_t imm) {
+    h[(*n)++] = (uint16_t)((top ? 0xf2c0u : 0xf240u) | ((imm >> 1) & 0x0400u) | (imm >> 12));
+    h[(*n)++] = (uint16_t)(((imm << 4) & 0x7000u) | (rd << 8) | (imm & 0xffu));
+}
+static void t_const(uint16_t *h, unsigned *n, unsigned rd, uint32_t v) {
+    t_mov16(h, n, false, rd, v & 0xffffu);
+    t_mov16(h, n, true, rd, v >> 16);
+}
+
+/*
+ * A Thumb "kernel" that does what the patched strategy routine does: the
+ * length on the stack, 64-bit source and destination in r1:r0 and r3:r2,
+ * then the bridge's SVC in place of bcopy_phys. It reads disk offset 0x1000
+ * into RAM, then writes that RAM back to disk offset 0x2000.
+ */
+static void test_boot_with_root(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    static memdisk_t disk;
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true });
+    for (size_t i = 0; i < sizeof disk.data; i++) disk.data[i] = (uint8_t)(i * 7u + 3u);
+    const vm_block_t block = { &disk, sizeof disk.data, 0, 0, md_read, md_write, NULL };
+
+    uint16_t h[64];
+    unsigned n = 0, read_site, write_site;
+    t_const(h, &n, 0, 0x40200000u);
+    h[n++] = 0x4685;                            /* mov sp, r0 */
+    t_mov16(h, &n, false, 4, 256);
+    h[n++] = 0x9400;                            /* str r4, [sp] */
+    t_const(h, &n, 0, N88_MD_TOKEN_PA + 0x1000u);
+    h[n++] = 0x2100;                            /* movs r1, #0 */
+    t_const(h, &n, 2, 0x40100000u);
+    h[n++] = 0x2300;                            /* movs r3, #0 */
+    read_site = n;
+    h[n++] = (uint16_t)N88_SVC_MD_READ;
+    h[n++] = 0xbf00;
+    t_const(h, &n, 0, 0x40100000u);
+    h[n++] = 0x2100;
+    t_const(h, &n, 2, N88_MD_TOKEN_PA + 0x2000u);
+    h[n++] = 0x2300;
+    write_site = n;
+    h[n++] = (uint16_t)N88_SVC_MD_WRITE;
+    h[n++] = 0xbf00;
+    h[n++] = 0xe7fe;                            /* b . */
+    if (n & 1u) h[n++] = 0xbf00;
+    uint32_t words[32];
+    for (unsigned i = 0; i < n / 2u; i++)
+        words[i] = (uint32_t)h[2u * i] | (uint32_t)h[2u * i + 1u] << 16;
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, words, n / 2u);
+    put32(kernel + 28 + 56 + 16 + 15 * 4, KVA_TEXT | 1u);   /* a Thumb entry */
+
+    /* MMU off, so the sites are the physical pcs the SVCs execute at. */
+    const uint32_t code_pa = KVA_TEXT - N88_VIRT_BASE + N88_DRAM_BASE;
+    for (int engine = 0; engine < 2; engine++) {
+        n88_t *m = malloc(sizeof *m);
+        CHECK(m && n88_init(m, engine), "init");
+        if (!m || !m->ram) { free(m); return; }
+        char d[160];
+        n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                         .devicetree = tree.b, .devicetree_size = tree.n,
+                         .root = &block };
+        CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ROOT, "a root without its sites: %s", d);
+        r.md_read_site_pc = code_pa + 2u * read_site;
+        r.md_write_site_pc = code_pa + 2u * write_site;
+        vm_block_t odd = block;
+        odd.size = 10000u;
+        r.root = &odd;
+        CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ROOT, "part of a page: %s", d);
+        r.root = &block;
+        const n88_status_t st = n88_boot(m, &r, d, sizeof d);
+        CHECK(st == N88_OK, "boot with a root: %s (%s)", n88_strerror(st), d);
+        if (st != N88_OK) { n88_free(m); free(m); return; }
+        CHECK(m->has_root && m->root_size == sizeof disk.data, "attached");
+        CHECK(strcmp((const char *)ram_at(m, m->boot_args_pa) + 0x38, N88_ROOT_CMDLINE) == 0,
+              "rd=md0 by default");
+        uint32_t l = 0;
+        const uint8_t *p = tree_prop(ram_at(m, m->devicetree_pa), tree.n,
+                                     "chosen/memory-map", "RAMDisk", &l);
+        CHECK(p && l == 8 && get32(p) == N88_MD_TOKEN_PA && get32(p + 4) == sizeof disk.data,
+              "the RAMDisk entry names the token and the size");
+
+        arm_status_t rs = ARM_HALT;
+        n88_run(m, 200, &rs);
+        CHECK(rs == ARM_OK, "engine %d: ran (status %d, pc %08x)", engine, (int)rs, m->cpu.r[15]);
+        CHECK(memcmp(ram_at(m, 0x40100000u), disk.data + 0x1000, 256) == 0,
+              "engine %d: the read landed in RAM", engine);
+        CHECK(memcmp(disk.data + 0x2000, disk.data + 0x1000, 256) == 0,
+              "engine %d: the write reached the disk", engine);
+        CHECK(m->md.stats.successful_reads == 1 && m->md.stats.successful_writes == 1 &&
+              m->md.stats.failures == 0, "engine %d: one of each, no failures", engine);
+        for (size_t i = 0x2000; i < 0x2100; i++) disk.data[i] = (uint8_t)(i * 7u + 3u);
+        n88_free(m);
+        free(m);
+    }
 }
 
 /* ------------------------------------------------------------ console */
@@ -659,6 +783,7 @@ int main(void) {
     test_nvram_image();
     test_boot_layout_and_tree();
     test_boot_refusals();
+    test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();
     printf("n88: %d passed, %d failed\n", g_pass, g_fail);

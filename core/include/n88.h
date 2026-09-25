@@ -23,9 +23,15 @@
  *     in (memory, clocks, /pram, the NVRAM image, the memory map), boot_args,
  *     and the IOP un-matched, because nothing emulates that coprocessor.
  *
- * What is not: storage (the kernel waits for its root device), the display,
- * touch, buttons, audio, the IOP, sleep. It boots the kernel as far as that
- * allows, and prints what the kernel prints.
+ *   - Optionally a root filesystem: a block device the kernel sees as the
+ *     memory disk /dev/md0, published as the RAMDisk memory-map entry at a
+ *     synthetic physical address (N88_MD_TOKEN_PA) and served by the
+ *     memory-disk bridge (md_bridge.h). The kernel's strategy routine must
+ *     have been patched to trap into the bridge; which bytes that takes is
+ *     per kernel build and lives outside the core (tools/ios6_kernel_patch.c).
+ *
+ * What is not: the display, touch, buttons, audio, the IOP, sleep. It boots
+ * the kernel as far as that allows, and prints what the kernel prints.
  *
  * Time: the count advances at N88_TB_HZ against one retired instruction per
  * cycle at N88_CPU_HZ. When the guest waits for an interrupt, time jumps to
@@ -39,7 +45,9 @@
 
 #include "arm.h"
 #include "arm_ci.h"
+#include "md_bridge.h"
 #include "soc.h"
+#include "vm_block.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -80,6 +88,16 @@
 
 #define N88_CONSOLE_CAPACITY 65536u
 #define N88_DEFAULT_CMDLINE  "debug=0x8 serial=3 -v"
+#define N88_ROOT_CMDLINE     "rd=md0 debug=0x8 serial=3 -v"
+
+/*
+ * Where the kernel believes the memory disk is: a physical address nothing
+ * answers, because the bridge serves every copy from or to it. Just past
+ * DRAM, so any disk up to 2.75 GB stays inside 32 bits.
+ */
+#define N88_MD_TOKEN_PA   UINT32_C(0x50000000)
+#define N88_SVC_MD_READ   0xdfe1u       /* SVC #0xe1: copy from the disk */
+#define N88_SVC_MD_WRITE  0xdfe2u       /* SVC #0xe2: copy to the disk   */
 
 /* Optional: every access to an address that is neither DRAM nor a modelled
  * register, as the harness logs them. `pc` is the instruction's. */
@@ -112,6 +130,11 @@ typedef struct n88 {
     n88_trace_fn trace;
     void        *trace_ctx;
 
+    /* The root filesystem, when one was attached. */
+    bool        has_root;
+    uint64_t    root_size;
+    md_bridge_t md;
+
     /* What bring-up did, for the caller to report. */
     bool     booted;
     uint32_t entry_pa, boot_args_pa, devicetree_pa, devicetree_size, tokd_pa;
@@ -124,7 +147,8 @@ typedef enum {
     N88_ERR_KERNEL,             /* not an ARM Mach-O executable we can map  */
     N88_ERR_DEVICETREE,         /* not a complete Apple flat tree, or a
                                    property bring-up needs is missing       */
-    N88_ERR_LAYOUT              /* the pieces do not fit in DRAM            */
+    N88_ERR_LAYOUT,             /* the pieces do not fit in DRAM            */
+    N88_ERR_ROOT                /* the root filesystem cannot be attached   */
 } n88_status_t;
 
 typedef struct {
@@ -138,6 +162,13 @@ typedef struct {
      * unmatch_count to 0 with a non-NULL list to un-match nothing. */
     const char *const *unmatch;
     unsigned           unmatch_count;
+    /* Optional root filesystem, whole 4 KiB pages. With it the default
+     * boot-args are N88_ROOT_CMDLINE, and the two sites are the kernel
+     * virtual addresses where the caller's patch put N88_SVC_MD_READ and
+     * N88_SVC_MD_WRITE in place of the strategy routine's physical copies. */
+    const vm_block_t  *root;
+    uint32_t           md_read_site_pc;
+    uint32_t           md_write_site_pc;
 } n88_boot_t;
 
 /* Allocate DRAM, wire the bus, reset the CPU. `cached_engine` puts the CPU on

@@ -349,6 +349,7 @@ const char *n88_strerror(n88_status_t st) {
     case N88_ERR_KERNEL:     return "the kernelcache is not an ARM Mach-O this machine can map";
     case N88_ERR_DEVICETREE: return "the device tree is not one bring-up can complete";
     case N88_ERR_LAYOUT:     return "the kernel, device tree and boot_args do not fit in DRAM";
+    case N88_ERR_ROOT:       return "the root filesystem cannot be attached";
     }
     return "unknown error";
 }
@@ -462,11 +463,34 @@ bool n88_devicetree_is_3gs(const uint8_t *blob, size_t len) {
     return false;
 }
 
+/* The bridge writes guest RAM directly; code the cached interpreter holds
+ * there must be re-read. */
+static void n88_ram_written(void *ctx, uint64_t pa, uint64_t len) {
+    n88_t *m = ctx;
+    if (m && m->ci && pa <= UINT32_MAX)
+        arm_ci_note_ram_write(m->ci, (uint32_t)pa,
+                              len > UINT32_MAX ? UINT32_MAX : (uint32_t)len);
+}
+
 n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap) {
     if (detail && cap) detail[0] = 0;
     if (!m || !m->ram || !req || !req->kernel || !req->devicetree)
         return fail(N88_ERR_ARGUMENT, detail, cap, "missing kernel or device tree");
-    const char *cmdline = req->cmdline ? req->cmdline : N88_DEFAULT_CMDLINE;
+    const char *cmdline = req->cmdline ? req->cmdline
+                        : req->root ? N88_ROOT_CMDLINE : N88_DEFAULT_CMDLINE;
+    vm_block_info_t root_info = {0};
+    if (req->root) {
+        if (vm_block_get_info(req->root, &root_info) != VM_BLOCK_STATUS_OK ||
+            root_info.size == 0 || (root_info.size & 0xfffu) != 0 ||
+            root_info.size > (uint64_t)UINT32_MAX + 1u - N88_MD_TOKEN_PA)
+            return fail(N88_ERR_ROOT, detail, cap,
+                        "the root filesystem must be whole 4 KiB pages and at "
+                        "most %llu bytes",
+                        (unsigned long long)((uint64_t)UINT32_MAX + 1u - N88_MD_TOKEN_PA));
+        if (!req->md_read_site_pc || !req->md_write_site_pc)
+            return fail(N88_ERR_ROOT, detail, cap,
+                        "a root filesystem needs the kernel's two patched copy sites");
+    }
     if (strlen(cmdline) > 255u)
         return fail(N88_ERR_ARGUMENT, detail, cap, "boot-args longer than 255 bytes");
 
@@ -564,6 +588,40 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         !dt_memmap(tree, &dt, &root, "BootArgs", (uint32_t)args_pa, 0x1000u))
         return fail(N88_ERR_DEVICETREE, detail, cap,
                     "device tree: no free /chosen/memory-map placeholder");
+
+    /* The root filesystem: the RAMDisk entry IOFindBSDRoot turns into md0,
+     * and the bridge that answers the copies from its token address. */
+    arm_bus_set_privileged_svc_handler(&m->bus, NULL, NULL);
+    m->has_root = false;
+    m->root_size = 0;
+    if (req->root) {
+        if (!dt_memmap(tree, &dt, &root, "RAMDisk", N88_MD_TOKEN_PA,
+                       (uint32_t)root_info.size))
+            return fail(N88_ERR_DEVICETREE, detail, cap,
+                        "device tree: no free /chosen/memory-map placeholder "
+                        "for the RAMDisk entry");
+        md_bridge_config_t mc;
+        memset(&mc, 0, sizeof mc);
+        mc.read_site.pc = req->md_read_site_pc;
+        mc.read_site.encoding = N88_SVC_MD_READ;
+        mc.write_site.pc = req->md_write_site_pc;
+        mc.write_site.encoding = N88_SVC_MD_WRITE;
+        mc.token_base = N88_MD_TOKEN_PA;
+        mc.media_size = root_info.size;
+        mc.ram_base = N88_DRAM_BASE;
+        mc.ram_size = N88_DRAM_SIZE;
+        mc.ram = m->ram;
+        mc.block = req->root;
+        mc.ram_written = n88_ram_written;
+        mc.ram_written_context = m;
+        if (!md_bridge_config_valid(&mc))
+            return fail(N88_ERR_ROOT, detail, cap,
+                        "the memory-disk bridge refused the geometry");
+        md_bridge_init(&m->md, &mc);
+        arm_bus_set_privileged_svc_handler(&m->bus, md_bridge_handle_svc, &m->md);
+        m->has_root = true;
+        m->root_size = root_info.size;
+    }
 
     /* boot_args (the layout core/src/boot/bringup.c documents). */
     uint8_t *ba = m->ram + ((uint32_t)args_pa - N88_DRAM_BASE);
