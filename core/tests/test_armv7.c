@@ -736,6 +736,95 @@ static void test_vfpv3_on_the_cortex_a8(void) {
           "VDUP must stay refused on the ARM1176");
 }
 
+/*
+ * Advanced SIMD on the Cortex-A8 profile. tools/unicorn_neon_diff.py compares
+ * every group against Unicorn at random; these pin one answer each for the
+ * paths that matter most, and the ones the differential cannot show:
+ * alignment faults (QEMU 5 does not raise them), the lazy-enable trap, the
+ * ARM1176 refusing, and the cached engine agreeing on a VLD with Vd = 15,
+ * which has the shape of an ARMv6 PLD and was once decoded as one.
+ */
+static void test_neon_on_the_cortex_a8(void) {
+    arm_cpu_t c;
+    arm_ci_stop_t stop;
+    arm_ci_stats_t s;
+
+    /* vadd.i32 q0, q1, q2 (0xf2220844). */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    set_dreg(&c, 2, 0x0000000200000001ull); set_dreg(&c, 3, 0xffffffff00000003ull);
+    set_dreg(&c, 4, 0x0000001000000010ull); set_dreg(&c, 5, 0x0000000100000010ull);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf2220844u, true) == ARM_OK &&
+          dreg(&c, 0) == 0x0000001200000011ull && dreg(&c, 1) == 0x0000000000000013ull &&
+          c.r[15] == 0x104u,
+          "vadd.i32 q0: %016llx %016llx pc=%08x", (unsigned long long)dreg(&c, 0),
+          (unsigned long long)dreg(&c, 1), c.r[15]);
+
+    /* vqadd.s8 d0, d1, d2 (0xf2010012): 0x7f + 1 saturates and sets QC. */
+    set_dreg(&c, 1, 0x000000000000017full); set_dreg(&c, 2, 0x0000000000000101ull);
+    c.vfp_fpscr = 0;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf2010012u, true) == ARM_OK &&
+          dreg(&c, 0) == 0x000000000000027full && (c.vfp_fpscr & ARM_FPSCR_QC),
+          "vqadd.s8: %016llx fpscr %08x", (unsigned long long)dreg(&c, 0), c.vfp_fpscr);
+
+    /* vld1.32 {d16, d17}, [r0]! (0xf4600a8d): writeback by the transfer size. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    c.r[0] = 0x2000;
+    for (unsigned i = 0; i < 4u; i++) m_w32(NULL, 0x2000 + 4u * i, 0x11111111u * (i + 1u));
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf4600a8du, true) == ARM_OK &&
+          dreg(&c, 16) == 0x2222222211111111ull && dreg(&c, 17) == 0x4444444433333333ull &&
+          c.r[0] == 0x2010u,
+          "vld1.32 {d16,d17}: %016llx %016llx r0=%08x", (unsigned long long)dreg(&c, 16),
+          (unsigned long long)dreg(&c, 17), c.r[0]);
+
+    /* vst1.64 {d0, d1}, [r0:128] (0xf4000aef) from an address that is only
+     * 8-aligned: an alignment fault, with nothing stored, whatever SCTLR.A. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    c.r[0] = 0x2008;
+    set_dreg(&c, 0, 0x0123456789abcdefull);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf4000aefu, true) == ARM_OK &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_ABT &&
+          (c.cp15.dfsr & 0x40fu) == ARM_FSR_ALIGNMENT && c.cp15.dfar == 0x2008u &&
+          m_r32(NULL, 0x2008) == 0u,
+          "vst1 [r0:128] misaligned: mode %02x dfsr %08x dfar %08x",
+          c.cpsr & ARM_CPSR_MODE_MASK, c.cp15.dfsr, c.cp15.dfar);
+
+    /* The same vadd in Thumb (0xef22 0x0844). */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, true);
+    enable_vfp(&c);
+    put16(0x100, 0xef22); put16(0x102, 0x0844);
+    set_dreg(&c, 2, 5u); set_dreg(&c, 4, 7u);
+    CHECK(arm_step(&c) == ARM_OK && dreg(&c, 0) == 12u && c.r[15] == 0x104u,
+          "Thumb vadd.i32: %016llx pc=%08x", (unsigned long long)dreg(&c, 0), c.r[15]);
+
+    /* With FPEXC.EN clear it is the lazy-enable trap, from ARM state too. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    c.cp15.cpacr |= 0xfu << ARM_CPACR_CP10_SHIFT;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf2220844u, true) == ARM_OK &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_UND && c.r[15] == ARM_VEC_UNDEFINED,
+          "NEON with VFP off: mode %02x pc %08x", c.cpsr & ARM_CPSR_MODE_MASK, c.r[15]);
+
+    /* And the ARM1176 has no NEON at all: the machine stops. */
+    CHECK(arm_one(&c, ARM_ARCH_V6_ARM1176, 0xf2220844u, false) == ARM_UNDEFINED,
+          "NEON must stay refused on the ARM1176");
+
+    /* vld1.32 {d15}, [r0] (0xf420f78f) through the engine: bits 27:26 = 01
+     * and Vd = 15 is the ARMv6 PLD shape. Both engines must load d15. */
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    m_w32(NULL, 0x100, 0xf420f78fu);
+    m_w32(NULL, 0x104, 0xe3a05009u);                          /* mov r5, #9 */
+    m_w32(NULL, 0x2000, 0xdeadbeefu); m_w32(NULL, 0x2004, 0x01234567u);
+    c.r[0] = 0x2000;
+    unsigned ran = ci_run_once(&c, 2u, &stop, &s);
+    CHECK(ran == 2u && dreg(&c, 15) == 0x01234567deadbeefull && c.r[5] == 9u &&
+          s.ref_retired == 1u,
+          "engine vld1 {d15}: ran %u d15=%016llx r5=%u via reference %llu", ran,
+          (unsigned long long)dreg(&c, 15), c.r[5], (unsigned long long)s.ref_retired);
+}
+
 int main(void) {
     printf("S5LBox ARMv7 profile tests\n");
     test_profile_predicates();
@@ -757,6 +846,7 @@ int main(void) {
     test_cached_interpreter_runs_armv7();
     test_engine_leaves_a_block_when_itstate_turns_live();
     test_vfpv3_on_the_cortex_a8();
+    test_neon_on_the_cortex_a8();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

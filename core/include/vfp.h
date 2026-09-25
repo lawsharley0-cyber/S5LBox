@@ -1,13 +1,15 @@
 /*
- * S5LBox — VFPv2 (VFP11) coprocessor, public interface.
+ * S5LBox — the VFP coprocessor and Advanced SIMD, public interface.
  *
  * The ARM1176JZF-S carries a VFP11 unit implementing VFPv2: 32 single-precision
  * registers s0-s31 aliased onto 16 double-precision registers d0-d15. There is
- * no d16-d31 and there is no Advanced SIMD/NEON on this part.
+ * no d16-d31 and there is no Advanced SIMD/NEON on that part. The Cortex-A8
+ * profile (ARM_ARCH_V7_A8) has VFPv3-D32, d0-d31, and NEON.
  *
  * Everything about WHY this exists, and every floating-point semantic this
  * implementation does and does not model, is documented at the top of
- * core/src/arm/vfp.c. Read that before using anything here.
+ * core/src/arm/vfp.c (and, for Advanced SIMD, core/src/arm/neon.c). Read
+ * those before using anything here.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -106,6 +108,16 @@ static inline void vfp_set_d(arm_cpu_t *c, unsigned n, uint64_t v) {
 typedef struct vfp_bus {
     uint32_t (*read32 )(arm_cpu_t *c, uint32_t va);
     void     (*write32)(arm_cpu_t *c, uint32_t va, uint32_t v);
+    /*
+     * Advanced SIMD element accesses (neon.c): `bytes` of 1, 2 or 4, at any
+     * alignment the ordinary load/store rules allow (ARM ARM MemU: unaligned
+     * is fine unless SCTLR.A), little-endian, faults latched the same way.
+     * align_fault latches the alignment fault an explicit alignment
+     * qualifier raises. NULL on a bus that serves only the VFP.
+     */
+    uint32_t (*read_el )(arm_cpu_t *c, uint32_t va, unsigned bytes);
+    void     (*write_el)(arm_cpu_t *c, uint32_t va, unsigned bytes, uint32_t v);
+    void     (*align_fault)(arm_cpu_t *c, uint32_t va, bool write);
 } vfp_bus_t;
 
 /*
@@ -131,6 +143,16 @@ bool vfp_enabled(const arm_cpu_t *c);
  */
 arm_status_t vfp_execute(arm_cpu_t *c, uint32_t pc, uint32_t insn,
                          const vfp_bus_t *bus);
+
+/*
+ * Execute one Advanced SIMD (NEON) encoding on an ARMv7 core: data
+ * processing (ARM 0xF2/0xF3) or an element/structure load or store (0xF4),
+ * given in its ARM encoding (the Thumb forms map onto it). The same status
+ * contract as vfp_execute, including the silent ARM_UNDEFINED of the
+ * lazy-enable trap. core/src/arm/neon.c.
+ */
+arm_status_t neon_execute(arm_cpu_t *c, uint32_t pc, uint32_t insn,
+                          const vfp_bus_t *bus);
 
 /* ------------------------------------------- the cached interpreter's path --
  *

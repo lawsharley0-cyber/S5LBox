@@ -76,7 +76,7 @@ typedef enum {
  * arm_ci_stats_t.ref_class. */
 typedef enum {
     ARM_CI_REF_OTHER = 0,
-    ARM_CI_REF_VFP,             /* coprocessor 10/11                            */
+    ARM_CI_REF_VFP,             /* coprocessor 10/11, and Advanced SIMD         */
     ARM_CI_REF_BLOCK,           /* LDM/STM forms without a fast path            */
     ARM_CI_REF_STATUS,          /* MSR, MRS, CPS, SETEND, other misc DP space   */
     ARM_CI_REF_MEM,             /* single/extra/exclusive load-store corner     */

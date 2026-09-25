@@ -27,13 +27,15 @@
  * extended form's tokens are followed, BEFORE any further code words, by
  *   fpscr d0lo d0hi d1lo d1hi ... d31lo d31hi
  * (65 tokens). CPACR grants CP10/CP11 full access and FPEXC.EN is set before
- * the step. The output gains fpscr and the same 64 words after the hash.
+ * the step. The output gains fpscr and the same 64 words after the hash, and
+ * for a refused instruction a final " #reason" (vfp_trap_reason()).
  *
  * A malformed input line prints "ERR" and is skipped.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
+#include "vfp.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -149,6 +151,9 @@ int main(void) {
         if (vfp) {
             printf(" %08x", c.vfp_fpscr);
             for (int i = 0; i < 64; i++) printf(" %08x", c.vfp_s[i]);
+            /* Why a refused instruction was refused, after a '#'. */
+            if (status != ARM_OK && vfp_trap_reason())
+                printf(" #%s", vfp_trap_reason());
         }
         printf("\n");
         fflush(stdout);

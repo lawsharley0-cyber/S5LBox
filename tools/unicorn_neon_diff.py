@@ -8,10 +8,18 @@ Cortex-A8 model, from the same core registers, FPSCR, d0-d31, code and RAM,
 and compares r0-r15, CPSR, a hash of RAM, FPSCR and d0-d31.
 
 Each case is one instruction drawn from an encoding group, run in ARM state
-or in Thumb state (the same instruction in its Thumb-2 encoding). Register
+or in Thumb state (the same instruction in its Thumb-2 encoding). The groups
+cover VFPv3 (data processing, conversions, loads and stores, core-register
+transfers) and all of ARMv7 Advanced SIMD (the "neon ..." groups, whose
+generators favour defined encodings so every mnemonic is reached). Register
 values lean towards the interesting floating-point classes (zeros,
 denormals, infinities, NaNs, the smallest normal, integers) and towards
-addresses inside RAM for the base registers of loads and stores.
+addresses inside RAM for the base registers of loads and stores; NEON load
+and store bases are 32-byte aligned 70% of the time (NEON_ALIGNED in the
+environment changes that fraction), so the alignment qualifiers mostly pass.
+
+For every case S5LBox refused, the probe reports vfp_trap_reason(), and the
+summary counts the reasons; --coverage counts agreeing cases per mnemonic.
 
 Buckets, as in unicorn_thumb2_diff.py:
   agree        everything matches
@@ -35,6 +43,7 @@ Usage:
   cmake --build build --target arm_diff_probe
   python tools/unicorn_neon_diff.py [--count N] [--seed S] [--show N]
                                     [--groups a,b] [--state arm|thumb|both]
+                                    [--coverage] [--verbose]
 """
 import argparse
 import collections
@@ -151,11 +160,13 @@ def rand_dreg(rng):
     return rng.choice([0, (1 << 64) - 1, 0x8000000080000000, 0x7fffffff7fffffff])
 
 
-def rand_fpscr(rng):
+def rand_fpscr(rng, vectors=True):
     v = rng.getrandbits(32) & 0xff00009f          # flags, QC, AHP, DN, FZ, RMode, cumulative
     if rng.random() < 0.6:
         v &= ~(3 << 22)                           # round to nearest, mostly
-    if rng.random() < 0.1:                        # a short vector, stride 1
+    # Advanced SIMD with Len or Stride set is refused on purpose (neon.c),
+    # so the NEON groups spend their cases elsewhere.
+    if vectors and rng.random() < 0.1:            # a short vector, stride 1
         # Stride 0b11 (two) is legal too, but Unicorn 2.1.4 is QEMU 5.0,
         # whose translator steps FPSCR.Stride + 1 registers, so 0b11 walks
         # four and every such case would compare against a QEMU bug.
@@ -260,6 +271,154 @@ def g_simd_scalar(rng):
         | (r(4) << 16) | (rt << 12) | (r(3) << 5) | low
 
 
+def regs3(rng, q, fields=("d", "n", "m")):
+    """D-register numbers for the named operands; with Q set, mostly even
+    (an odd one is UNDEFINED, which is worth a few cases, not most)."""
+    out = {}
+    for f in fields:
+        v = rng.getrandbits(5)
+        if q and rng.random() < 0.9:
+            v &= ~1
+        out[f] = v
+    return out
+
+
+def place(w, d=None, n=None, m=None):
+    if d is not None:
+        w |= ((d >> 4) << 22) | ((d & 15) << 12)
+    if n is not None:
+        w |= ((n >> 4) << 7) | ((n & 15) << 16)
+    if m is not None:
+        w |= ((m >> 4) << 5) | (m & 15)
+    return w
+
+
+def g_n3same(rng):
+    r = rng.getrandbits
+    q = r(1)
+    op = r(4) if rng.random() < 0.85 else 1       # 1 with B set: the bitwise ops
+    b = r(1) if op != 1 or rng.random() < 0.3 else 1
+    w = 0xf2000000 | (r(1) << 24) | (r(2) << 20) | (op << 8) | (q << 6) | (b << 4)
+    return place(w, **regs3(rng, q))
+
+
+def g_n3same_float(rng):
+    r = rng.getrandbits
+    q = r(1)
+    size = r(1) << 1 if rng.random() < 0.95 else r(2)
+    w = 0xf2000000 | (r(1) << 24) | (size << 20) | (rng.choice([13, 14, 15, 12]) << 8) \
+        | (q << 6) | (r(1) << 4)
+    return place(w, **regs3(rng, q))
+
+
+def g_n1imm(rng):
+    r = rng.getrandbits
+    q = r(1)
+    w = 0xf2800010 | (r(1) << 24) | (r(3) << 16) | (r(4) << 8) | (q << 6) | (r(1) << 5) | r(4)
+    return place(w, **regs3(rng, q, ("d",)))
+
+
+def g_nshift(rng):
+    r = rng.getrandbits
+    q = r(1)
+    L = r(1)
+    imm6 = r(6)
+    if not L and imm6 < 8:
+        imm6 |= 8 << r(2) if rng.random() < 0.95 else 0
+        imm6 &= 63
+    w = 0xf2800010 | (r(1) << 24) | (imm6 << 16) | (r(4) << 8) | (L << 7) | (q << 6)
+    return place(w, **regs3(rng, q, ("d", "m")))
+
+
+def g_n3diff(rng):
+    r = rng.getrandbits
+    w = 0xf2800000 | (r(1) << 24) | (rng.randrange(3) << 20) | (r(4) << 8)
+    regs = regs3(rng, True)
+    return place(w, **regs)
+
+
+def g_nscalar(rng):
+    r = rng.getrandbits
+    w = 0xf2800040 | (r(1) << 24) | (rng.choice([1, 2, 2, 0]) << 20) | (r(4) << 8)
+    regs = regs3(rng, True, ("d", "n"))
+    return place(w, **regs) | ((r(1)) << 5) | r(4)
+
+
+# (A, bits 10:7, sizes) for every defined two-register miscellaneous form.
+MISC_VALID = (
+    [(0, op, (0, 1, 2)) for op in (0, 1, 2, 4, 5, 8, 9, 12, 13, 14, 15)]
+    + [(0, 10, (0,)), (0, 11, (0,))]
+    + [(1, op, (0, 1, 2)) for op in (0, 1, 2, 3, 4, 6, 7)]
+    + [(1, 8 | op, (2,)) for op in (0, 1, 2, 3, 4, 6, 7)]
+    + [(2, 0, (0,))] + [(2, op, (0, 1, 2)) for op in (1, 2, 3, 4, 5)]
+    + [(2, 6, (0, 1, 2))]                       # 01100: VSHLL (Q bit clear)
+    + [(3, op, (2,)) for op in (8, 9, 10, 11, 12, 13, 14, 15)]
+)
+
+
+def g_nmisc(rng):
+    r = rng.getrandbits
+    q = r(1)
+    if rng.random() < 0.85:
+        a, op, sizes = rng.choice(MISC_VALID)
+        size = rng.choice(sizes)
+        if a == 2 and op in (4, 5, 6):
+            q = r(1) if op != 6 else 0           # narrowing: bit 6 is an op bit
+        w = 0xf3b00000 | (size << 18) | (a << 16) | (op << 7) | (q << 6)
+    else:
+        w = 0xf3b00000 | (r(2) << 18) | (r(2) << 16) | (r(4) << 7) | (q << 6)
+    return place(w, **regs3(rng, q or (w >> 16) & 3 == 2, ("d", "m")))
+
+
+def g_nperm(rng):
+    """VEXT, VTBL/VTBX, VDUP (scalar)."""
+    r = rng.getrandbits
+    kind = rng.randrange(3)
+    q = r(1)
+    if kind == 0:
+        imm4 = r(4) if q else r(3)
+        return place(0xf2b00000 | (imm4 << 8) | (q << 6), **regs3(rng, q))
+    if kind == 1:
+        return place(0xf3b00800 | (r(2) << 8) | (r(1) << 6), **regs3(rng, False))
+    imm4 = rng.choice([1, 3, 5, 7, 9, 11, 13, 15, 2, 6, 10, 14, 4, 12, 0])
+    return place(0xf3b00c00 | (imm4 << 16) | (q << 6), **regs3(rng, q, ("d", "m")))
+
+
+def ldst_rm(rng):
+    return rng.choice([15, 15, 13, 13, rng.randrange(13)])
+
+
+def g_nld_multi(rng):
+    r = rng.getrandbits
+    btype = rng.choice([7, 10, 6, 2, 8, 9, 3, 4, 5, 0, 1]) if rng.random() < 0.95 else r(4)
+    return 0xf4000000 | (r(1) << 22) | (r(1) << 21) | (rng.randrange(13) << 16) \
+        | (r(4) << 12) | (btype << 8) | (r(2) << 6) | (r(2) << 4) | ldst_rm(rng)
+
+
+def g_nld_lane(rng):
+    r = rng.getrandbits
+    size = rng.randrange(3)
+    return 0xf4800000 | (r(1) << 22) | (r(1) << 21) | (rng.randrange(13) << 16) \
+        | (r(4) << 12) | (size << 10) | (r(2) << 8) | (r(4) << 4) | ldst_rm(rng)
+
+
+def g_nld_all(rng):
+    r = rng.getrandbits
+    return 0xf4a00c00 | (r(1) << 22) | (rng.randrange(13) << 16) | (r(4) << 12) \
+        | (r(2) << 8) | (r(2) << 6) | (r(1) << 5) | (r(1) << 4) | ldst_rm(rng)
+
+
+def ldst_fixup(w, regs, rng):
+    """A NEON load/store's base: inside RAM, usually aligned to 32 so the
+    alignment qualifiers pass; the index register, a small step."""
+    rn, rm = (w >> 16) & 15, w & 15
+    base = rng.randrange(0x2000, 0xd000)
+    k = rng.random()
+    regs[rn] = base & ~31 if k < float(os.environ.get("NEON_ALIGNED", "0.7")) else base & ~7 if k < 0.9 else base
+    if rm not in (13, 15) and rm != rn:
+        regs[rm] = rng.choice([0, 8, 16, 24, 32, rng.randrange(-64, 64) & 0xffffffff])
+
+
 GROUPS = {
     "vfp dp": g_vfp_dp,
     "vfp convert": g_vfp_other,
@@ -269,6 +428,17 @@ GROUPS = {
     "vfp xfer32": g_vfp_xfer32,
     "vfp xfer64": g_vfp_xfer64,
     "simd scalar": g_simd_scalar,
+    "neon 3same": g_n3same,
+    "neon 3same f": g_n3same_float,
+    "neon 1reg imm": g_n1imm,
+    "neon shift": g_nshift,
+    "neon 3diff": g_n3diff,
+    "neon scalar": g_nscalar,
+    "neon misc": g_nmisc,
+    "neon ext/tbl/dup": g_nperm,
+    "neon ld/st multi": g_nld_multi,
+    "neon ld/st lane": g_nld_lane,
+    "neon ld all lanes": g_nld_all,
 }
 
 
@@ -334,10 +504,11 @@ def run_probe(proc, regs, cpsr, fpscr, dregs, pc, code):
     line += "".join(" %x" % w for w in words[1:]) + "\n"
     proc.stdin.write(line)
     proc.stdin.flush()
-    reply = proc.stdout.readline().split()
+    body, _, reason = proc.stdout.readline().rstrip("\n").partition(" #")
+    reply = body.split()
     if not reply or reply[0] == "ERR":
         raise RuntimeError("probe returned %r for %r" % (reply, line))
-    return [int(x, 16) for x in reply[1:]], int(reply[0])
+    return [int(x, 16) for x in reply[1:]], int(reply[0]), reason
 
 
 def known_qemu_bug(w, thumb, fpscr):
@@ -396,6 +567,8 @@ def main():
     ap.add_argument("--show", type=int, default=4)
     ap.add_argument("--groups", default=",".join(GROUPS))
     ap.add_argument("--state", choices=["arm", "thumb", "both"], default="both")
+    ap.add_argument("--coverage", action="store_true",
+                    help="count agreeing cases per mnemonic (needs capstone)")
     ap.add_argument("--verbose", action="store_true",
                     help="print every input D register of a DIFF")
     args = ap.parse_args()
@@ -412,6 +585,8 @@ def main():
     rng = random.Random(args.seed)
     tally = collections.defaultdict(collections.Counter)
     shown = collections.Counter()
+    refusals = collections.Counter()
+    covered = collections.Counter()
     states = {"arm": [False], "thumb": [True], "both": [False, True]}[args.state]
     groups = [g for g in args.groups.split(",") if g]
 
@@ -433,15 +608,17 @@ def main():
                     code = struct.pack("<I", w)
                 done += 1
                 regs = rand_core_regs(rng)
+                if group.startswith("neon ld"):
+                    ldst_fixup(w if not thumb else (0xf4000000 | (w & 0x00ffffff)), regs, rng)
                 mode = 0x1f if rng.random() < 0.85 else 0x10
                 cpsr = (rng.getrandbits(5) << 27) | (rng.getrandbits(4) << 16) \
                     | 0xc0 | mode | (0x20 if thumb else 0)
-                fpscr = rand_fpscr(rng)
+                fpscr = rand_fpscr(rng, not group.startswith("neon"))
                 dregs = [rand_dreg(rng) for _ in range(32)]
                 pc = CODE + 4 * rng.randrange(0, 0x100)
 
                 u_out, u_err = run_unicorn(thumb, regs, cpsr, fpscr, dregs, pc, code)
-                p_out, p_status = run_probe(proc, regs, cpsr, fpscr, dregs, pc, code)
+                p_out, p_status, reason = run_probe(proc, regs, cpsr, fpscr, dregs, pc, code)
                 p_ok = p_status == 0 and not took_exception(p_out, cpsr)
 
                 unmapped = u_err is not None and u_err.errno in (
@@ -465,6 +642,11 @@ def main():
                 else:
                     bucket = "DIFF"
                 tally[row][bucket] += 1
+                if bucket == "we-refuse":
+                    refusals[reason or "(no reason)"] += 1
+                if bucket == "agree" and args.coverage and _CS is not None:
+                    ins = list(_CS[thumb].disasm(code, CODE))
+                    covered[ins[0].mnemonic.split(".")[0] if ins else "?"] += 1
                 if bucket in ("agree", "both-undef", "unmapped", "qemu-bug"):
                     continue
                 key = (row, bucket)
@@ -475,7 +657,7 @@ def main():
                 if bucket == "we-accept":
                     print("           unicorn: %s" % u_err)
                 if bucket == "we-refuse":
-                    print("           s5lbox status %d" % p_status)
+                    print("           s5lbox: %s" % (reason or "status %d" % p_status))
                 if bucket in ("DIFF", "nan-payload"):
                     print("           cpsr_in=%08x fpscr_in=%08x" % (cpsr, fpscr))
                     if args.verbose:
@@ -499,6 +681,15 @@ def main():
         print("%-18s" % row + "".join("%12d" % tally[row][c] for c in cols))
         total.update(tally[row])
     print("%-18s" % "total" + "".join("%12d" % total[c] for c in cols))
+    if covered:
+        print("\nagreeing cases per mnemonic:")
+        items = sorted(covered.items())
+        for i in range(0, len(items), 6):
+            print("  " + "  ".join("%-9s%6d" % kv for kv in items[i:i + 6]))
+    if refusals:
+        print("\nwhy S5LBox refused what Unicorn ran:")
+        for why, count in refusals.most_common():
+            print("%8d  %s" % (count, why))
     sys.exit(1 if total["DIFF"] else 0)
 
 

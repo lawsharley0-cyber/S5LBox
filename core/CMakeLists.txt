@@ -21,6 +21,7 @@ add_library(emucore STATIC
     src/arm/arm_ci.c
     src/arm/arm_ci_decode.c
     src/arm/vfp.c
+    src/arm/neon.c
     src/arm/a64_static_engine.c
     src/mmu.c
     src/snapshot.c
@@ -90,7 +91,7 @@ if(NOT MSVC)
     # each rounding step behind a volatile store, so this flag is a second
     # belt rather than the only one — but a last-bit difference in a float is
     # exactly the silent wrongness this core refuses to ship.
-    set_source_files_properties(src/arm/vfp.c PROPERTIES
+    set_source_files_properties(src/arm/vfp.c src/arm/neon.c PROPERTIES
         COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 

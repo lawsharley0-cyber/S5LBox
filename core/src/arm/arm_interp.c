@@ -419,7 +419,19 @@ static void vfp_mem_w32(arm_cpu_t *c, uint32_t va, uint32_t v) {
 /* The VFP unit reaches memory through the interpreter's own translating
  * accessors, so a VLDM that crosses into an unmapped page latches the fault
  * exactly like an LDM would and arm_step converts it to a data abort. */
-static const vfp_bus_t g_vfp_bus = { vfp_mem_r32, vfp_mem_w32 };
+static uint32_t neon_mem_read(arm_cpu_t *c, uint32_t va, unsigned bytes) {
+    if (bytes == 1u) return mem_r8(c, va);
+    if (bytes == 2u) return mem_r16(c, va);
+    return mem_r32(c, va);
+}
+static void neon_mem_write(arm_cpu_t *c, uint32_t va, unsigned bytes, uint32_t v) {
+    if (bytes == 1u)      mem_w8(c, va, (uint8_t)v);
+    else if (bytes == 2u) mem_w16(c, va, (uint16_t)v);
+    else                  mem_w32(c, va, v);
+}
+static const vfp_bus_t g_vfp_bus = {
+    vfp_mem_r32, vfp_mem_w32, neon_mem_read, neon_mem_write, note_alignment_abort
+};
 
 bool arm_mode_is_valid(uint32_t mode) {
     switch (mode & ARM_CPSR_MODE_MASK) {
@@ -3665,7 +3677,10 @@ static arm_status_t t2_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t hw1,
                                    uint32_t hw2) {
     const uint32_t w = thumb_coproc_as_arm(hw1, hw2);
     const unsigned cp = (hw2 >> 8) & 0xfu;
-    /* Advanced SIMD and the T == 1 space (MCR2, LDC2, ...) are not here. */
+    /* Advanced SIMD, as the ARM encoding it maps to (neon.c). */
+    if ((w & 0xfe000000u) == 0xf2000000u || (w & 0xff100000u) == 0xf4000000u)
+        return neon_execute(c, pc, w, &g_vfp_bus);
+    /* The T == 1 space (MCR2, LDC2, ...) is not here. */
     if (w == 0u || (w >> 28) != 0xeu) return ARM_UNDEFINED;
     if ((w & 0x0f000010u) == 0x0e000010u)              /* MCR / MRC */
         return exec_coprocessor(c, pc - 4u, w);
@@ -3700,7 +3715,7 @@ static arm_status_t thumb32_step(arm_cpu_t *c, uint32_t pc, uint32_t hw1,
         if (hw1 & 0x0400u) return t2_coprocessor(c, pc, hw1, hw2);
         if ((hw1 & 0x0600u) == 0u) {
             if (!(hw1 & 0x10u) && (hw1 & 0x100u))      /* SIMD element ld/st */
-                return ARM_UNDEFINED;
+                return t2_coprocessor(c, pc, hw1, hw2);
             return t2_load_store_single(c, pc, hw1, hw2, next);
         }
         if ((hw1 & 0x0700u) == 0x0200u) return t2_dp_register(c, pc, hw1, hw2);
@@ -3872,6 +3887,23 @@ arm_exec_fetched(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
      * it loaded. ARMv6-optimised code (memcpy loops in libSystem, XNU copy
      * routines) issues PLD constantly. */
     if (cond == 0xfu) {
+        /* Advanced SIMD (neon.c) on the ARMv7 profiles, decoded before the
+         * hints below: the PLD test there is the ARMv6 one, bits 27:26 = 01
+         * with Rd = 1111, and a VLD/VST with Vd = 15 (0xF4, bit 20 clear)
+         * matches it. The Unicorn differential test found that. */
+        if (arm_arch_is_v7(c->arch) &&
+            ((insn & 0xfe000000u) == 0xf2000000u ||
+             (insn & 0xff100000u) == 0xf4000000u)) {
+            const arm_status_t st = neon_execute(c, pc, insn, &g_vfp_bus);
+            if (c->abort_pending) {
+                take_pending_data_abort(c, pc);
+                return ARM_OK;
+            }
+            if (st == ARM_GUEST_UNDEFINED) return take_undefined_instruction(c, pc);
+            if (st == ARM_UNDEFINED) return undefined_instruction(c, pc, insn);
+            if (st == ARM_OK) c->r[15] = next;
+            return st;
+        }
         /* PLD is a hint; a no-op is architecturally correct. Both the immediate
          * and register forms have bits[27:26]==01 and the Rd field SBO (1111). */
         /*
@@ -4038,7 +4070,8 @@ arm_exec_fetched(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         }
         /* The Advanced SIMD spaces (0xF2/0xF3 data processing, 0xF4 element
          * and structure load/store) live here, in the unconditional space, so
-         * the lazy-VFP discrimination has to be applied on this arm too. */
+         * the lazy-VFP discrimination has to be applied on this arm too. The
+         * ARMv7 profiles execute them first thing, above. */
         return undefined_instruction(c, pc, insn);
     }
 

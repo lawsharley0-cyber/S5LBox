@@ -33,7 +33,7 @@ first step below.
 |---|---|---|
 | ARMv7 profile switch | `arm_arch_t` in `core/include/arm.h`: `ARM_ARCH_V6_ARM1176` (default), `ARM_ARCH_V7_SWIFT`, and `ARM_ARCH_V7_A8` (the 3GS). Code asks `arm_arch_is_v7()` / `arm_arch_has_divide()`, never the enum's order: the A8 is ARMv7 without the divider | The engine decodes for the core it runs: ARMv7 ARM state differs in an interworking `MOV pc` and the WFI hint, both handled (step 3). |
 | Thumb-2 (32-bit Thumb) | **Yes, in the reference interpreter** (2026-09-25; see step 2). On the ARM1176 `0xE800..0xFFFF` still decode as the two BL/BLX halves | **Done (step 3, first slice).** ARMv7 Thumb blocks carry a halfword-offset table for their mixed 16/32-bit records; a 32-bit instruction that straddles a 1 KiB block ends the block before it; `IT` and the instructions it covers are REF records, and a block is never entered with ITSTATE live. |
-| NEON / VFPv3-D32 (VFPv4 on A6) | **VFPv3-D32 yes** on the A8 profile, and the NEON scalar transfers and VDUP (2026-09-25; step 2, second slice). NEON data processing and element loads/stores: **not yet** | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
+| NEON / VFPv3-D32 (VFPv4 on A6) | **Yes** on the A8 profile (2026-09-25): VFPv3-D32 (step 2, second slice) and all of ARMv7 Advanced SIMD, data processing and element/structure loads and stores (third slice) | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
 | ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.U/XP read as one, SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **No** VMSAv7 or v7 CP15 identification | Barriers are no-ops single-core but ISB/`MCR` cache maintenance must keep ending blocks (they already STOP). ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
 | Unaligned access always permitted (SCTLR.U fixed) | Handled by the reference through SCTLR | Engine fast paths already fall back on any misalignment. |
 | SMP (A6 only) | **No** | Per-core CPU state and engine instance; the code bitmap and region generations must be shared so a store on one core invalidates blocks the other runs; exclusive monitor becomes global; deterministic interleaving quanta. XNU can boot single-core by boot-arg, which defers it. |
@@ -114,10 +114,40 @@ first step below.
    interpreter +0.56 %, engine +0.84 %, the engine's all in `f32_do`'s test
    for a NaN result.
 
+   **Third slice, Advanced SIMD (2026-09-25).** `core/src/arm/neon.c` runs
+   every ARMv7 NEON instruction on the A8 profile, in ARM (0xF2/0xF3/0xF4)
+   and Thumb (0xEF/0xFF/0xF9) state: the three-register, by-scalar, shift,
+   modified-immediate and miscellaneous groups, VEXT, VTBL/VTBX, VDUP, and
+   VLD1-4/VST1-4 in their multiple, single-lane and all-lanes forms with
+   alignment checks and writeback. Floating point runs under ARM's standard
+   FPSCR (flush-to-zero, default NaN) through the VFP unit's own rounding
+   step; FPSCR.QC records saturation. The ARM1176 still refuses all of it.
+
+   Checked with `tools/unicorn_neon_diff.py` against Unicorn's Cortex-A8 in
+   ARM and Thumb state: data processing, `--count 2500 --seed 3`, 24,849
+   cases where both executed, every NEON mnemonic among them (`--coverage`
+   counts agreeing cases per mnemonic; the thinnest in a targeted run of
+   the 3-same, miscellaneous and shift groups, `--count 5000 --seed 21`,
+   were VMOVL 3, VRECPS 27 and VRSQRTS 29); loads and stores,
+   `--count 2000`, 6,607 cases. All with **0** differences and **0** encodings accepted that
+   Unicorn refused. S5LBox refuses what the ARMv7 ARM calls UNDEFINED even
+   where QEMU 5 runs it (VMUL.F32 with bit 21 set, VQDMULL/VQDMLAL with
+   U=1), and the UNPREDICTABLE forms (a register list past d31, VZIP/VUZP/
+   VTRN of one register with itself, a zero modified immediate). Its extra
+   faults are alignment faults QEMU 5 does not raise: with every base
+   register 32-byte aligned that bucket is empty. Two bugs were found on
+   the way, both fixed: VQDMULH/VQRDMULH treated U as unsigned (it selects
+   the rounding form), and in ARM state the ARMv6 PLD test claimed any
+   0xF4 load or store with Vd = 15; the engine had the same test, and
+   `test_ci_diff`, which now mixes NEON into both ARMv7 passes and compares
+   d16-d31, catches it when it is put back. Cost to the iPhone OS 3 machine
+   (cachegrind, all workloads, `--div 40`, against 80931e1): ARM +0.045 %
+   on the interpreter and +0.043 % on the engine, Thumb under 0.001 %.
+
    Not yet: SRS/RFE in Thumb state, VMSAv7 (TEX remap, access flag, ASIDs),
-   the A8's CP15 identification and cache registers, NEON data processing
-   and element loads/stores, ThumbEE, and saving `arch` in snapshots (no
-   ARMv7 machine exists yet to save).
+   the A8's CP15 identification and cache registers, CPACR.ASEDIS/D32DIS,
+   ThumbEE, and saving `arch` in snapshots (no ARMv7 machine exists yet to
+   save).
 3. **Cached interpreter for v7**: Thumb-2 variable-length records and the
    straddle rule, IT handling, then specialisations in order of a kernel
    census (`tools/kcensus.py`), each kept only with a fuzzer proof and a
@@ -151,9 +181,14 @@ first step below.
    (cachegrind, 7 workloads, `--div 40`): Thumb on the engine +0.40 %, ARM on
    it -0.19 %.
 
-   Next in this step: Thumb VFP as specialised records (it needs the VFPv3
-   and NEON of step 2 before it matters for iOS 6 code), LDRD/STRD and the
-   IT-covered instructions as specialised records with explicit conditions.
+   NEON runs in-block as reference records (2026-09-25), in both states:
+   correct, and no longer a block boundary, but not yet specialised.
+
+   Next in this step: Thumb VFP and the NEON forms libSystem's `memcpy` and
+   string routines use (VLD1/VST1, VMOV, VDUP) as specialised records,
+   chosen by a census of real iOS 6 code and each kept only with a fuzzer
+   proof and a measured gain; LDRD/STRD and the IT-covered instructions as
+   specialised records with explicit conditions.
 4. **SoC model** for the chosen device, then boot to the kernel's first
    console output, then userspace.
 5. SMP only if the chosen device needs it and a single-core boot-arg is not

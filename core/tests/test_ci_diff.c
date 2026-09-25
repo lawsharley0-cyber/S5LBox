@@ -135,8 +135,19 @@ static uint32_t arm_cond(void) {
  * engine's decoded VFP forms meet NaNs, flush-to-zero, short vectors and trap
  * enables thousands of times rather than a few. */
 static bool g_vfp_heavy;
+static bool g_neon;         /* the Cortex-A8 passes: Advanced SIMD in the mix */
+
+/* An Advanced SIMD instruction in its ARM encoding: data processing with
+ * every field random, or an element/structure load or store from a
+ * register the state fill points into data. The Thumb pass maps it. */
+static uint32_t gen_neon_arm(void) {
+    if (chance(70)) return 0xf2000000u | (rnd() & 0x01ffffffu);
+    const unsigned rn = reg_field(), rm = chance(40) ? 15u : chance(50) ? 13u : reg_field();
+    return 0xf4000000u | (rnd() & 0x00e0fff0u) | (rn << 16) | rm;
+}
 
 static uint32_t gen_arm(unsigned idx, unsigned len) {
+    if (g_neon && chance(15)) return gen_neon_arm();
     uint32_t c = arm_cond() << 28;
     unsigned rd = reg_field(), rn = reg_field(), rm = reg_field(), rs = reg_field();
     switch (g_vfp_heavy && chance(60) ? 24u : rnd_n(29u)) {
@@ -355,6 +366,14 @@ static uint16_t t2_reg4(void) { return (uint16_t)reg_field(); }
 
 static unsigned gen_thumb2(unsigned idx, unsigned len, uint16_t *h) {
     const int32_t fwd = (int32_t)rnd_n(len + 4u) - (int32_t)idx - 2;  /* halfwords */
+    if (g_neon && chance(12)) {                         /* Advanced SIMD */
+        const uint32_t a = gen_neon_arm();
+        const uint32_t t = (a >> 24) == 0xf4u ? 0xf9000000u | (a & 0x00ffffffu)
+                         : 0xef000000u | ((a & 0x01000000u) << 4) | (a & 0x00ffffffu);
+        h[0] = (uint16_t)(t >> 16);
+        h[1] = (uint16_t)t;
+        return 2u;
+    }
     switch (rnd_n(24u)) {
     case 0: case 1: case 2: case 3: case 4: case 5: {
         bool pair;
@@ -499,7 +518,7 @@ static unsigned gen_thumb2(unsigned idx, unsigned len, uint16_t *h) {
 
 typedef struct {
     uint32_t r[16], cpsr, spsr[ARM_BANK_COUNT], b13[ARM_BANK_COUNT], b14[ARM_BANK_COUNT];
-    uint32_t fiq[5], usr[5], sctlr_extra, fpscr, fpexc, cpacr, s[32];
+    uint32_t fiq[5], usr[5], sctlr_extra, fpscr, fpexc, cpacr, s[64];
     uint64_t cycles;
     bool excl_valid;
     uint32_t excl_addr;
@@ -534,7 +553,7 @@ static void random_state(state_t *s, bool thumb) {
         0x00000001u, 0x807fffffu, 0x00800000u, 0x80000000u, 0x3f800000u, 0x7f7fffffu,
         0x7ff00000u, 0x7ff40000u, 0x7ff80000u, 0xfff00000u, 0x00080000u, 0x80000000u,
     };
-    for (int i = 0; i < 32; i++)
+    for (int i = 0; i < 64; i++)                     /* s0-s31, then d16-d31 */
         s->s[i] = chance(40) ? rnd() : chance(50) ? interesting()
                 : fp_special[rnd_n((uint32_t)(sizeof fp_special / sizeof fp_special[0]))];
     /* Mostly the default FP environment; sometimes flags, a directed
@@ -581,7 +600,7 @@ static void apply_state(s5l8900_t *m, const state_t *s) {
     c->cp15.cpacr = s->cpacr << ARM_CPACR_CP10_SHIFT;
     c->vfp_fpexc = s->fpexc;
     c->vfp_fpscr = s->fpscr;
-    for (int i = 0; i < 32; i++) c->vfp_s[i] = s->s[i];
+    for (int i = 0; i < 64; i++) c->vfp_s[i] = s->s[i];
     c->cp15.dfsr = c->cp15.dfar = c->cp15.ifsr = c->cp15.ifar = 0;
     c->cycles = s->cycles;
     c->excl_valid = s->excl_valid;
@@ -626,7 +645,7 @@ static int compare(const s5l8900_t *a, const s5l8900_t *b, char *why, size_t n) 
     DIFF(irq_line, "%d"); DIFF(fiq_line, "%d");
     DIFF(abort_pending, "%d");
     DIFF(vfp_fpscr, "%08x"); DIFF(vfp_fpexc, "%08x");
-    for (int i = 0; i < 32; i++) DIFF(vfp_s[i], "%08x");
+    for (int i = 0; i < 64; i++) DIFF(vfp_s[i], "%08x");
 #undef DIFF
     const uint8_t *ma = a->ram + (PHYS(DATA_VA) - RAM_BASE);
     const uint8_t *mb = b->ram + (PHYS(DATA_VA) - RAM_BASE);
@@ -657,6 +676,7 @@ int main(int argc, char **argv) {
         const bool thumb2 = isa == 3, armv7 = isa == 4;
         const bool thumb = isa == 1 || thumb2;
         g_vfp_heavy = isa == 2;
+        g_neon = thumb2 || armv7;
         const unsigned count = (g_vfp_heavy || armv7) ? cases / 2u : cases;
         const arm_arch_t arch = (thumb2 || armv7) ? ARM_ARCH_V7_A8 : ARM_ARCH_V6_ARM1176;
         ref.cpu.arch = arch;

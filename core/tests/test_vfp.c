@@ -1722,7 +1722,9 @@ static void fault_first_w32(arm_cpu_t *c, uint32_t va, uint32_t v) {
     c->abort_fsr = ARM_FSR_PAGE_TRANSLATION | (1u << 11);
     c->abort_far = va;
 }
-static const vfp_bus_t g_fault_first_bus = { fault_first_r32, fault_first_w32 };
+static const vfp_bus_t g_fault_first_bus = {
+    .read32 = fault_first_r32, .write32 = fault_first_w32,
+};
 
 static void test_double_transfers_stop_after_the_first_abort(void) {
     arm_cpu_t c = {0};

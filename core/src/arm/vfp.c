@@ -122,6 +122,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "vfp.h"
+#include "vfp_private.h"
 
 #include <fenv.h>
 #include <math.h>
@@ -256,15 +257,15 @@ static inline bool snan64(uint64_t u) {
 
 /* ============================================ host arithmetic + flags ==== */
 
-typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_SQRT } fop_t;
+typedef vfp_op_t fop_t;
+#define OP_ADD  VFP_OP_ADD
+#define OP_SUB  VFP_OP_SUB
+#define OP_MUL  VFP_OP_MUL
+#define OP_DIV  VFP_OP_DIV
+#define OP_SQRT VFP_OP_SQRT
 
-/*
- * A private marker carried alongside the FPSCR exception bits. It is NOT an
- * FPSCR bit (6 is reserved on VFPv2) and never reaches FPSCR: seeing it means
- * flush-to-zero cannot be decided from the host's rounded result and the
- * instruction must trap. See fz_out32.
- */
-#define VFP_FZ_AMBIGUOUS (1u << 6)
+/* VFP_FZ_AMBIGUOUS, the flush-to-zero refusal marker, is in vfp_private.h
+ * because neon.c raises it too. */
 
 #define F32_MIN_NORMAL 0x00800000u
 #define F64_MIN_NORMAL 0x0010000000000000ull
@@ -1164,10 +1165,7 @@ enum {
     A_VMLA, A_VMLS, A_VNMLS, A_VNMLA, A_VMUL, A_VNMUL, A_VADD, A_VSUB, A_VDIV
 };
 
-#define FZ_AMBIGUOUS_WHY                                                      \
-    "flush-to-zero cannot be decided: the exact result straddles the smallest " \
-    "normal, and the architecture tests it before rounding while the host " \
-    "reports it after"
+#define FZ_AMBIGUOUS_WHY VFP_FZ_AMBIGUOUS_WHY
 
 /* The three-operand arithmetic group: opc1 (bits 23,21,20) selects the family
  * and opc3<0> (bit 6) the variant. Bit 22 is D, not part of the opcode. */
@@ -1804,6 +1802,32 @@ bool vfp_fast_dp(arm_cpu_t *c, unsigned form, bool dbl,
     }
     c->vfp_fpscr = fs | exc;
     return true;
+}
+
+/* ================================================ shared with neon.c ==== *
+ * See vfp_private.h. Thin wrappers, so the Advanced SIMD unit rounds, flushes
+ * and saturates through exactly the code the VFP does. */
+void vfp_begin(void) { g_reason = NULL; }
+arm_status_t vfp_refuse(uint32_t pc, uint32_t insn, const char *why) {
+    return vfp_trap(pc, insn, why);
+}
+uint32_t vfp_std_f32(vfp_op_t op, uint32_t a, uint32_t b, uint32_t *exc) {
+    return f2u(f32_do(op, u2f(a), u2f(b), VFP_STANDARD_FPSCR, exc));
+}
+uint32_t vfp_std_flush32(uint32_t a, uint32_t *exc) {
+    return f2u(fz_in32(u2f(a), exc));
+}
+uint32_t vfp_std_round32(double exact, uint32_t *exc) {
+    volatile double vs = exact;
+    volatile float vr;
+    double x;
+    host_exceptions_clear();
+    x = vs; vr = (float)x;
+    *exc |= host_exceptions();
+    return f2u(vr);
+}
+uint32_t vfp_std_to_fixed32(double v, unsigned frac, bool is_signed, uint32_t *exc) {
+    return fp_to_fixed(v, 32u, frac, is_signed, exc);
 }
 
 /* ============================================================ entry ====== */

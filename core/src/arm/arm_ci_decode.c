@@ -361,6 +361,12 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, bool v7, ci_op_t *op) {
     if (op->cond == 0xfu) {                               /* unconditional space */
         op->cond = CI_COND_AL;
         if (insn == 0xf57ff01fu) { op->kind = CI_K_CLREX; return CI_DEC_OP; }
+        /* Advanced SIMD on ARMv7 runs in-block through the reference
+         * (neon.c), and must be claimed before the PLD test below: a VLD/VST
+         * with Vd = 15 has the ARMv6 PLD shape, bits 27:26 = 01, Rd = 1111. */
+        if (v7 && ((insn & 0xfe000000u) == 0xf2000000u ||
+                   (insn & 0xff100000u) == 0xf4000000u))
+            return ref(op, false);
         if ((insn & 0x0c00f000u) == 0x0400f000u) { op->kind = CI_K_NOP; return CI_DEC_OP; }
         if ((insn & 0xfe000000u) == 0xfa000000u) {        /* BLX <imm> */
             int32_t off = (int32_t)(insn << 8) >> 6;
@@ -1153,6 +1159,8 @@ unsigned ci_ref_class(uint32_t insn, bool thumb) {
             return ARM_CI_REF_MEM;
         return ARM_CI_REF_OTHER;
     }
+    if ((insn & 0xfe000000u) == 0xf2000000u || (insn & 0xff100000u) == 0xf4000000u)
+        return ARM_CI_REF_VFP;                               /* Advanced SIMD */
     if ((insn >> 28) == 0xfu) return ARM_CI_REF_OTHER;
     const unsigned top = (insn >> 25) & 7u;
     const bool rd_pc = ((insn >> 12) & 0xfu) == 15u;
