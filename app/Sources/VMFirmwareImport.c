@@ -1230,6 +1230,8 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
 
     /* Kernel. */
     vmfw_zip_entry_t entry;
+    /* Zeroed: MSVC cannot see that `have` guards every read (C4701). */
+    memset(&entry, 0, sizeof entry);
     bool have = false;
     if (man.kernel_member[0])
         have = (vmfw_zip_find(&r.zip, man.kernel_member, &entry) == VMFW_ZIP_OK);
