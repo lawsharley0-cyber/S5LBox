@@ -485,7 +485,7 @@ static void test_observe_mode_never_takes_the_call(void) {
  * enough, because the handler could otherwise have changed both before return.
  */
 static void test_trace_cannot_mutate_or_intercept_the_guest(void) {
-    arm_cpu_t cpu, before;
+    arm_cpu_t cpu = {0}, before = {0};
     uint32_t memory_before = 0x12345678u, memory_after = 0u;
     ios3_hle_site_t *s;
 
@@ -1558,7 +1558,7 @@ static void test_rect_root_oracle_captures_two_rows_without_publication(void) {
     ios3_hle_site_t *site = site_named("ogl_poly_scan");
     ios3_hle_oracle_t oracle;
     uint8_t oracle_bytes[64];
-    arm_cpu_t cpu, before;
+    arm_cpu_t cpu = {0}, before = {0};
 
     reset_scan_fixture(site);
     configure_rect_root(&cpu, 0x030bu);
@@ -2028,7 +2028,7 @@ static void test_live_oracle_captures_without_touching_the_guest(void) {
     ios3_hle_site_t *site = site_named("sw_scanline");
     ios3_hle_oracle_t oracle;
     uint8_t oracle_bytes[1280];
-    arm_cpu_t cpu, before;
+    arm_cpu_t cpu = {0}, before = {0};
 
     reset_scan_fixture(site);
     configure_direct_scanline(&cpu, SAMPLE_BGRX8);
@@ -2097,7 +2097,7 @@ static void test_live_oracle_captures_direct_and_blended_solids(void) {
     for (unsigned pass = 0; pass < 2u; pass++) {
         ios3_hle_oracle_t oracle;
         uint8_t oracle_bytes[1280];
-        arm_cpu_t cpu, before;
+        arm_cpu_t cpu = {0}, before = {0};
 
         reset_scan_fixture(site);
         configure_solid_scanline(&cpu, colors[pass]);

@@ -2376,7 +2376,7 @@ static void seed_thumb_read_oracle(arm_cpu_t *cpu, bool warm) {
 
 static bool validate_static_read_oracles(void) {
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     final_state_t reference_state, static_state;
     arm_status_t status = ARM_OK;
     unsigned completed = 0u;
@@ -2554,7 +2554,7 @@ static bool validate_static_store_oracles(void) {
     for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; i++) {
         const store_case_t *sc = &cases[i];
         const uint32_t pc = UINT32_C(0x10000);
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         final_state_t reference_state, static_state;
         a64_static_block_t block;
         arm_status_t status;
@@ -2636,7 +2636,7 @@ static bool validate_static_store_oracles(void) {
             A32_SINGLE_MODE2(14, 0, 1, 1, 0, 0, 0, 4, 3, 0),
         };
         const uint32_t pc = UINT32_C(0x11000);
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         a64_static_block_t block;
         unsigned completed = 0u;
 
@@ -2673,7 +2673,7 @@ static bool validate_static_store_oracles(void) {
         const uint32_t insn =
             A32_SINGLE_MODE2(14, 0, 1, 1, 0, 0, 0, 4, 3, 0);
         const uint32_t pc = UINT32_C(0x12000);
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
         uint64_t ram_before;
@@ -2760,7 +2760,7 @@ static bool validate_static_stm_oracles(void) {
 
     for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; i++) {
         const stm_case_t *sc = &cases[i];
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         final_state_t reference_state, static_state;
         a64_static_block_t block;
         unsigned completed = 99u;
@@ -2820,7 +2820,7 @@ static bool validate_static_stm_oracles(void) {
             14, 0, 1, 0, 0, 0, 4, UINT32_C(0x8109));
         const uint32_t pc = UINT32_C(0x12a00);
         const uint32_t start = DATA_BASE + UINT32_C(0x13f8);
-        arm_cpu_t reference, statik, before;
+        arm_cpu_t reference = {0}, statik = {0}, before = {0};
         final_state_t reference_state, static_state;
         a64_static_block_t block;
         unsigned completed = 99u;
@@ -2874,7 +2874,7 @@ static bool validate_static_stm_oracles(void) {
         const uint32_t insn = A32_BLOCK(
             14, 0, 1, 0, 1, 0, 12, UINT32_C(0x4106));
         const uint32_t pc = UINT32_C(0x12b00) + refusal * 0x100u;
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
         uint64_t ram_before;
@@ -2957,7 +2957,7 @@ static bool validate_static_ldm_oracles(void) {
 
     for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; i++) {
         const ldm_case_t *lc = &cases[i];
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         final_state_t reference_state, static_state;
         a64_static_block_t block;
         unsigned completed = 99u;
@@ -3013,7 +3013,7 @@ static bool validate_static_ldm_oracles(void) {
             14, 0, 1, 0, 0, 1, 4, UINT32_C(0x4109));
         const uint32_t pc = UINT32_C(0x13a00);
         const uint32_t start = DATA_BASE + UINT32_C(0x13f8);
-        arm_cpu_t reference, statik, before;
+        arm_cpu_t reference = {0}, statik = {0}, before = {0};
         final_state_t reference_state, static_state;
         a64_static_block_t block;
         unsigned completed = 99u;
@@ -3054,7 +3054,7 @@ static bool validate_static_ldm_oracles(void) {
         const uint32_t insn = A32_BLOCK(
             14, 0, 1, 0, 1, 1, 12, UINT32_C(0x4106));
         const uint32_t pc = UINT32_C(0x13b00) + refusal * 0x100u;
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
 
@@ -3080,7 +3080,7 @@ static bool validate_static_ldm_oracles(void) {
         const uint32_t insn = A32_BLOCK(
             14, 0, 1, 0, 0, 1, 4, UINT32_C(0x4109));
         const uint32_t pc = UINT32_C(0x13e00);
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = UINT_MAX;
 
@@ -3300,7 +3300,7 @@ static const static_vfp_arith_fallback_t VFP_ARITH_FALLBACKS[] = {
 
 static bool validate_static_vfp_arithmetic_oracles(void) {
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = 0u;
     unsigned exact_cases = 0u;
 
@@ -3621,7 +3621,7 @@ static bool validate_static_vfp_register_oracles(void) {
         ARM_FPSCR_STRIDE,
     };
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = 0u;
     arm_status_t status = ARM_OK;
 
@@ -3797,7 +3797,7 @@ static bool validate_static_vfp_compare_oracles(void) {
     };
     static const uint32_t GUARD[] = {VFP_UN_S(4, 0, 0, 2)};
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = 0u;
 
     if (!a64_static_host_available()) {
@@ -3941,7 +3941,7 @@ static bool validate_static_vfp_widen_oracles(void) {
         VFP_WIDEN(3, 2),                 /* widening must fall back */
     };
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = 0u;
 
     if (!a64_static_host_available()) {
@@ -4082,7 +4082,7 @@ static bool validate_static_vfp_narrow_oracles(void) {
         VFP_NARROW(0, 1), VFP_VMSR(1, 0), VFP_NARROW(2, 2),
     };
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = UINT_MAX;
 
     if (!a64_static_host_available()) {
@@ -4272,7 +4272,7 @@ static bool validate_static_vfp_read_oracles(void) {
         VFP_LDST(14, 1, 1, 0, 0, 1, 0, 0, 1, 0),
     };
     a64_static_block_t block;
-    arm_cpu_t reference, statik, before;
+    arm_cpu_t reference = {0}, statik = {0}, before = {0};
     unsigned completed = 0u;
     arm_status_t status = ARM_OK;
 
@@ -4425,7 +4425,7 @@ static bool validate_static_vfp_write_oracles(void) {
 
     for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; i++) {
         const vfp_write_case_t *sc = &cases[i];
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
         arm_status_t status;
@@ -4478,7 +4478,7 @@ static bool validate_static_vfp_write_oracles(void) {
      * run, including its one hit and one miss. */
     {
         const uint32_t pc = UINT32_C(0x10c00);
-        arm_cpu_t reference, statik, before;
+        arm_cpu_t reference = {0}, statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
 
@@ -4521,7 +4521,7 @@ static bool validate_static_vfp_write_oracles(void) {
      * zero-prefix and must be wholly observational. */
     for (unsigned disabled = 0u; disabled < 2u; disabled++) {
         const uint32_t pc = UINT32_C(0x10d00) + disabled * 0x100u;
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
 
@@ -4605,7 +4605,7 @@ static bool validate_static_vstm_write_oracles(void) {
 
     for (unsigned i = 0u; i < sizeof cases / sizeof cases[0]; i++) {
         const vstm_write_case_t *sc = &cases[i];
-        arm_cpu_t reference, statik;
+        arm_cpu_t reference = {0}, statik = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
         arm_status_t status;
@@ -4659,7 +4659,7 @@ static bool validate_static_vstm_write_oracles(void) {
             VFP_LDST(14, 0, 1, 0, 0, 0, 4, 0, 0, 4);
         const uint32_t pc = UINT32_C(0x11500);
         const uint32_t start = ordinary + UINT32_C(0x3f8);
-        arm_cpu_t reference, statik, before;
+        arm_cpu_t reference = {0}, statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
 
@@ -4701,7 +4701,7 @@ static bool validate_static_vstm_write_oracles(void) {
         const uint32_t insn =
             VFP_LDST(14, 0, 1, 0, 1, 0, 4, 0, 0, 4);
         const uint32_t pc = UINT32_C(0x11600) + refusal * 0x100u;
-        arm_cpu_t statik, before;
+        arm_cpu_t statik = {0}, before = {0};
         a64_static_block_t block;
         unsigned completed = 99u;
 
@@ -5698,7 +5698,7 @@ static bool compact_raw_compare(const char *name, const uint32_t *program,
                                 unsigned insns, uint32_t pc,
                                 unsigned reference_steps, unsigned budget,
                                 unsigned expected_completed) {
-    arm_cpu_t reference, compact;
+    arm_cpu_t reference = {0}, compact = {0};
     final_state_t reference_state, compact_state;
     arm_status_t status = ARM_OK;
     unsigned completed = 0u;
@@ -5739,7 +5739,7 @@ static bool compact_raw_window_compare(const char *name,
                                        unsigned reference_steps,
                                        unsigned budget,
                                        unsigned expected_completed) {
-    arm_cpu_t reference, window;
+    arm_cpu_t reference = {0}, window = {0};
     final_state_t reference_state, window_state;
     arm_status_t status = ARM_OK;
     unsigned completed = 0u;
@@ -5792,7 +5792,7 @@ static bool compact_raw_thumb_instruction_compare(uint16_t insn,
         insn,
         UINT16_C(0xba00), /* unsupported REV sentinel */
     };
-    arm_cpu_t reference, compact;
+    arm_cpu_t reference = {0}, compact = {0};
     final_state_t reference_state, compact_state;
     arm_status_t status;
     unsigned completed = 0u;
@@ -6446,7 +6446,7 @@ static bool compact_raw_resident_compare(
         unsigned expected_fast_refills, bool user_mode,
         bool window_cache_enabled,
         uint64_t expected_window_cache_hits) {
-    arm_cpu_t reference, resident;
+    arm_cpu_t reference = {0}, resident = {0};
     final_state_t reference_state, resident_state;
     compact_raw_resident_oracle_context_t context;
     uint8_t *baseline = (uint8_t *)malloc(sizeof g_ram);
@@ -6613,7 +6613,7 @@ static bool validate_compact_raw_vfp_nonarith_oracles(void) {
         {"widen-snan", UINT32_C(0xff812345), 0u},
         {"widen-default-nan", UINT32_C(0xffc12345), ARM_FPSCR_DN},
     };
-    arm_cpu_t reference, compact, before;
+    arm_cpu_t reference = {0}, compact = {0}, before = {0};
     unsigned completed = UINT_MAX;
     unsigned cases = 0u;
 
@@ -6778,7 +6778,7 @@ static a64_compact_raw_fallback_result_t compact_raw_vfp_fp_callback(
 #endif
 
 static bool validate_compact_raw_vfp_arithmetic_oracles(void) {
-    arm_cpu_t reference, compact, before;
+    arm_cpu_t reference = {0}, compact = {0}, before = {0};
     unsigned completed = UINT_MAX;
     unsigned exact_cases = 0u;
 
@@ -7137,7 +7137,7 @@ static bool validate_compact_raw_vfp_narrow_oracles(void) {
     static const uint32_t PARTIAL[] = {
         VFP_NARROW(0, 1), VFP_VMSR(1, 0), VFP_NARROW(2, 2),
     };
-    arm_cpu_t reference, compact, before;
+    arm_cpu_t reference = {0}, compact = {0}, before = {0};
     unsigned completed = UINT_MAX;
 
     if (!a64_static_host_available()) {
@@ -8643,7 +8643,7 @@ static bool compact_raw_system_coprocessor_case(
         const char *name, const uint32_t *program, unsigned insns,
         uint32_t mode, unsigned expected_completed) {
     const uint32_t pc = UINT32_C(0x2c000);
-    arm_cpu_t reference, compact;
+    arm_cpu_t reference = {0}, compact = {0};
     final_state_t reference_state, compact_state;
     arm_status_t status = ARM_OK;
     unsigned completed = UINT_MAX;

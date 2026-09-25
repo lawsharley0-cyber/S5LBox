@@ -370,6 +370,11 @@ jobs:
     # code that can address anything, so run the whole suite under the address
     # and undefined-behaviour sanitizers. These are unavailable on the Windows
     # dev machine, which makes this job the real safety net.
+    #
+    # Uninitialised locals are filled with 0xFE bytes rather than whatever the
+    # stack held. A test that forgets to zero an arm_cpu_t then gets an ARMv7
+    # `arch` every time, here, instead of only on the runners whose stack
+    # happens to be dirty (the macOS static-engine job found one that way).
     name: asan + ubsan
     runs-on: ubuntu-latest
     steps:
@@ -381,7 +386,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DS5LBOX_JIT=ON \
             -DS5LBOX_STATIC_A64_ENGINE=ON \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -ftrivial-auto-var-init=pattern"
 
       - name: Build
         run: cmake --build build-san
