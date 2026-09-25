@@ -105,7 +105,11 @@
         "purpose: add the new field to " visitor "() in core/src/snapshot.c, " \
         "update this number, and bump SNAPSHOT_VERSION in snapshot.h.")
 
-SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
+/* 76 = 64 + PAR, CSSELR and the A8's L2 auxiliary control: ARMv7-only
+ * registers, zero on the ARM1176. Like d16-d31 below they are not stored, a
+ * read zeroes them, and SNAPSHOT_VERSION does not move. Measured with
+ * sizeof. */
+SNAP_SIZE_GUARD(arm_cp15_t,        76,    "snap_cpu");
 /* 68112 = 66032 + the data-read and data-write block caches (2 x 64 x 16),
  * their four host-only accounting counters (32), and the padding their
  * 8-byte alignment adds after fetch_priv. Like the fetch cache they hold HOST
@@ -122,7 +126,9 @@ SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
  * snap_machine_valid() refuses a machine whose CPU is not the ARM1176. The
  * bytes on disk do not change and SNAPSHOT_VERSION does not move. Measured
  * with sizeof, not inferred. */
-SNAP_SIZE_GUARD(arm_cpu_t,         68240,   "snap_cpu");
+/* 68256 = 68240 + arm_cp15_t's 12 ARMv7 bytes + 4 of alignment padding,
+ * measured with sizeof. Not stored, same reasoning. */
+SNAP_SIZE_GUARD(arm_cpu_t,         68256,   "snap_cpu");
 SNAP_SIZE_GUARD(s5l_uart_t,        8280,  "snap_uart");
 SNAP_SIZE_GUARD(s5l_vic_t,         16,    "snap_vic");
 SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
@@ -238,8 +244,10 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * must be read from the compiler's emitted `.space`, not inferred from source
  * padding.
  * 129968 is the CPU's d16-d31 (128 bytes, see the arm_cpu_t guard): not
- * stored, since the ARM1176 has no such registers, so v33 stands. */
-SNAP_SIZE_GUARD(s5l8900_t,         129968, "snap_mach");
+ * stored, since the ARM1176 has no such registers, so v33 stands.
+ * 129984 is the CPU's ARMv7 CP15 registers (16 bytes with padding, see the
+ * arm_cpu_t guard): not stored either, v33 stands. Measured with sizeof. */
+SNAP_SIZE_GUARD(s5l8900_t,         129984, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -423,6 +431,10 @@ static void snap_cp15(sn_io_t *io, arm_cp15_t *p) {
     F32(p->dfar);       F32(p->ifar);
     F32(p->fcse_pid);   F32(p->context_id);
     F32(p->tpidrurw);   F32(p->tpidruro);   F32(p->tpidrprw);
+    /* PAR, CSSELR and L2AUXCR exist only on the ARMv7 profiles, and a
+     * snapshot only ever holds an ARM1176 (snap_machine_valid), where they
+     * are zero. Not stored; a read leaves them as arm_reset would. */
+    if (sn_reading(io)) { p->par = 0; p->csselr = 0; p->l2auxcr = 0; }
 }
 
 /*

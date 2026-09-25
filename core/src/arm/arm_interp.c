@@ -685,6 +685,229 @@ static arm_status_t undefined_instruction(arm_cpu_t *c, uint32_t pc,
 }
 
 /*
+ * CP15 on the Cortex-A8 profile (ARM_ARCH_V7_A8, and for now ARM_ARCH_V7_SWIFT,
+ * which has no profile of its own yet).
+ *
+ * This is the register set iOS 6's kernel uses, found by scanning every MCR
+ * and MRC in the iPhone 3GS 6.1.6 kernelcache (the scan and its results are in
+ * docs/IOS6_READINESS.md), decoded exactly: each register is named by opc1,
+ * CRn, CRm and opc2, where the ARM1176 path below keys most of them on CRn
+ * alone. Beyond what the ARM1176 has, the kernel needs:
+ *   - the cache identification registers (CLIDR, CCSIDR through CSSELR), read
+ *     once at boot to size its caches for sysctl (0x8007dccc);
+ *   - PAR and the ATS1C* translation operations, which are its virtual-to-
+ *     physical lookup (0x80088e80, 0x80088ed0, 0x80088f20). Treating them as
+ *     cache operations, as the ARM1176 path treats all of c7, would answer
+ *     "not mapped" for every address;
+ *   - the A8's L2 auxiliary control register, read-modify-written at entry
+ *     (0x80086348).
+ * TLB maintenance keeps the ARM1176 path's rule, a full flush for any c8
+ * operation (TLBIASID and TLBIMVAA included), and cache maintenance is a
+ * no-op, there being no cache.
+ *
+ * What differs from the ARM1176 besides the registers:
+ *   - User mode may only issue the three c7 barriers (CP15ISB, CP15DSB,
+ *     CP15DMB), read and write TPIDRURW, and read TPIDRURO. ARMv6's
+ *     user-mode cache operations are PL1-only in ARMv7, and so are PAR and
+ *     ATS, which would otherwise hand a process physical addresses. Unicorn's
+ *     Cortex-A8 agrees on every one.
+ *   - SCTLR's read-as-one and read-as-zero bits are enforced (arm.h), which
+ *     among other things keeps the legacy S and R protection bits out of the
+ *     walk.
+ *   - TTBCR keeps N, PD0 and PD1, as on the ARM1176. PD0 and PD1 are part
+ *     of the Security Extensions, which ID_PFR1 does not report here, but
+ *     the A8 has them and Unicorn's Cortex-A8 keeps them, and a walk they
+ *     disable is simple to model; the ARM1176 path makes the same choice.
+ *   - CPACR keeps the CP10 and CP11 fields only. Access to every other
+ *     coprocessor reads as zero, as ARMv7 requires for coprocessors that do
+ *     not exist, and ASEDIS and D32DIS read as zero, the architecture's
+ *     "not implemented" choice for them (Advanced SIMD and d16-d31 cannot be
+ *     switched off). iOS 6 only ever ORs 0xf << 20 in (0x800863c4).
+ *   - MRC with Rt = 15 sets N, Z, C and V from bits [31:28] (APSR_nzcv), and
+ *     MCR from r15 is UNPREDICTABLE, so refused.
+ * Registers not named here still read as zero and ignore writes, the rule
+ * exec_coprocessor documents for CP15 as a whole. Among them are the A8's
+ * implementation-defined c15 cache and TLB debug arrays, which iOS 6 only
+ * touches from routines that dump them (0x8007c65c-0x8007c830), and PRRR,
+ * NMRR and VBAR, which it never touches.
+ */
+static arm_status_t exec_cp15_v7(arm_cpu_t *c, uint32_t pc, bool load,
+                                 unsigned opc1, unsigned crn, unsigned crm,
+                                 unsigned opc2, unsigned rd) {
+    arm_cp15_t *p = &c->cp15;
+    const bool c7_barrier = crn == 7u && opc1 == 0u &&
+        ((crm == 5u && opc2 == 4u) || (crm == 10u && (opc2 == 4u || opc2 == 5u)));
+    if (!cpu_is_priv(c)) {
+        const bool tid = crn == 13u && opc1 == 0u && crm == 0u;
+        const bool allowed = (c7_barrier && !load)
+                          || (tid && opc2 == 2u)
+                          || (tid && opc2 == 3u && load);
+        if (!allowed) return ARM_UNDEFINED;
+    }
+
+    if (load) {
+        uint32_t v = 0;
+        if (opc1 == 0u && crn == 0u) {
+            static const uint32_t id_crm1[8] = {     /* feature registers */
+                CORTEX_A8_ID_PFR0,  CORTEX_A8_ID_PFR1,
+                CORTEX_A8_ID_DFR0,  CORTEX_A8_ID_AFR0,
+                CORTEX_A8_ID_MMFR0, CORTEX_A8_ID_MMFR1,
+                CORTEX_A8_ID_MMFR2, CORTEX_A8_ID_MMFR3,
+            };
+            static const uint32_t id_crm2[8] = {     /* ISA attributes    */
+                CORTEX_A8_ID_ISAR0, CORTEX_A8_ID_ISAR1,
+                CORTEX_A8_ID_ISAR2, CORTEX_A8_ID_ISAR3,
+                CORTEX_A8_ID_ISAR4, CORTEX_A8_ID_ISAR5, 0, 0,
+            };
+            if (crm == 0u) {
+                /* TCMTR and TLBTR are zero (no TCM, one unified TLB) and
+                 * MPIDR is zero, as on Unicorn's Cortex-A8. The unallocated
+                 * encodings 4, 6 and 7 read as MIDR, which ARMv7 requires. */
+                if (opc2 == 1u) v = CORTEX_A8_CTR;
+                else if (opc2 == 2u || opc2 == 3u || opc2 == 5u) v = 0u;
+                else v = CORTEX_A8_MIDR;
+            } else if (crm == 1u) {
+                v = id_crm1[opc2];
+            } else if (crm == 2u) {
+                v = id_crm2[opc2];
+            }
+        } else if (opc1 == 1u && crn == 0u && crm == 0u) {
+            if (opc2 == 0u) {
+                /* CCSIDR of the cache CSSELR selects: Level [3:1], InD [0].
+                 * A selection of a cache that does not exist reads as zero
+                 * (architecturally UNKNOWN). */
+                switch (p->csselr & 0xfu) {
+                    case 0u: v = CORTEX_A8_CCSIDR_L1D; break;
+                    case 1u: v = CORTEX_A8_CCSIDR_L1I; break;
+                    case 2u: v = CORTEX_A8_CCSIDR_L2;  break;
+                    default: v = 0u; break;
+                }
+            } else if (opc2 == 1u) {
+                v = CORTEX_A8_CLIDR;
+            }                                           /* AIDR (7): zero */
+        } else if (opc1 == 2u && crn == 0u && crm == 0u && opc2 == 0u) {
+            v = p->csselr;
+        } else if (opc1 == 0u && crm == 0u) {
+            switch (crn) {
+                case 1:
+                    if (opc2 == 0u) v = p->sctlr;
+                    else if (opc2 == 1u) v = p->actlr;
+                    else if (opc2 == 2u) v = p->cpacr;
+                    break;
+                case 2:
+                    if (opc2 == 0u) v = p->ttbr0;
+                    else if (opc2 == 1u) v = p->ttbr1;
+                    else if (opc2 == 2u) v = p->ttbcr;
+                    break;
+                case 3:
+                    if (opc2 == 0u) v = p->dacr;
+                    break;
+                case 5:
+                    if (opc2 == 0u) v = p->dfsr;
+                    else if (opc2 == 1u) v = p->ifsr;
+                    break;
+                case 6:
+                    if (opc2 == 0u) v = p->dfar;
+                    else if (opc2 == 2u) v = p->ifar;
+                    break;
+                case 13:
+                    switch (opc2) {
+                        case 0:  v = p->fcse_pid;   break;
+                        case 1:  v = p->context_id; break;
+                        case 2:  v = p->tpidrurw;   break;
+                        case 3:  v = p->tpidruro;   break;
+                        case 4:  v = p->tpidrprw;   break;
+                        default: break;
+                    }
+                    break;
+                default: break;
+            }
+        } else if (opc1 == 0u && crn == 7u && crm == 4u && opc2 == 0u) {
+            v = p->par;
+        } else if (opc1 == 1u && crn == 9u && crm == 0u && opc2 == 2u) {
+            v = p->l2auxcr;
+        }
+        if (rd == 15u)                                  /* APSR_nzcv */
+            c->cpsr = (c->cpsr & 0x0fffffffu) | (v & 0xf0000000u);
+        else
+            c->r[rd] = v;
+        return ARM_OK;
+    }
+
+    if (rd == 15u) return ARM_UNDEFINED;                /* UNPREDICTABLE */
+    const uint32_t v = reg_read(c, pc, rd);
+    if (opc1 == 0u && crn == 7u) {
+        if (crm == 4u && opc2 == 0u) {
+            p->par = v;
+        } else if (crm == 8u && opc2 <= 3u) {
+            /* ATS1CPR, ATS1CPW, ATS1CUR, ATS1CUW: opc2 bit 0 is write,
+             * bit 1 is the User-mode permission check. */
+            p->par = arm_mmu_ats(c, v, (opc2 & 1u) != 0u, (opc2 & 2u) == 0u);
+        }
+        /* Everything else in c7 is a barrier or cache maintenance: no-op.
+         * (c7,c0,4, the ARMv6 WFI, was handled in exec_coprocessor.) */
+        return ARM_OK;
+    }
+    if (opc1 == 0u && crn == 8u) {                      /* TLB maintenance */
+        arm_mmu_tlb_flush(c);
+        return ARM_OK;
+    }
+    if (opc1 == 2u && crn == 0u && crm == 0u && opc2 == 0u) {
+        p->csselr = v & 0xfu;
+        return ARM_OK;
+    }
+    if (opc1 == 1u && crn == 9u && crm == 0u && opc2 == 2u) {
+        p->l2auxcr = v;
+        return ARM_OK;
+    }
+    if (opc1 != 0u || crm != 0u) return ARM_OK;         /* unmodelled */
+    switch (crn) {
+        case 1:
+            if (opc2 == 0u) {
+                p->sctlr = (v & ~ARM_V7_SCTLR_RAZ) | ARM_V7_SCTLR_RAO;
+                arm_mmu_tlb_flush(c);
+            } else if (opc2 == 1u) {
+                p->actlr = v;
+            } else if (opc2 == 2u) {
+                p->cpacr = v & (0xfu << ARM_CPACR_CP10_SHIFT);
+            }
+            break;
+        case 2:
+            if (opc2 == 0u) p->ttbr0 = v;
+            else if (opc2 == 1u) p->ttbr1 = v;
+            else if (opc2 == 2u) p->ttbcr = v & 0x37u;
+            else break;
+            arm_mmu_tlb_flush(c);
+            break;
+        case 3:
+            if (opc2 == 0u) { p->dacr = v; arm_mmu_tlb_flush(c); }
+            break;
+        case 5:
+            if (opc2 == 0u) p->dfsr = v;
+            else if (opc2 == 1u) p->ifsr = v;
+            break;
+        case 6:
+            if (opc2 == 0u) p->dfar = v;
+            else if (opc2 == 2u) p->ifar = v;
+            break;
+        case 13:
+            switch (opc2) {
+                case 0:  p->fcse_pid = v; break;
+                /* The ASID. Translations cached under the old one may not
+                 * answer for the new address space. */
+                case 1:  p->context_id = v; arm_mmu_tlb_flush(c); break;
+                case 2:  p->tpidrurw = v; break;
+                case 3:  p->tpidruro = v; break;
+                case 4:  p->tpidrprw = v; break;
+                default: break;
+            }
+            break;
+        default: break;
+    }
+    return ARM_OK;
+}
+
+/*
  * CP15 access via MCR (write) / MRC (read).
  *
  * Note on coverage: the architecturally significant registers below are modeled
@@ -763,6 +986,9 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             (void)c->bus->wait_for_interrupt(c->bus->ctx);
         return ARM_OK;
     }
+
+    if (arm_arch_is_v7(c->arch))
+        return exec_cp15_v7(c, pc, load, opc1, crn, crm, opc2, rd);
 
     /*
      * CP15 is privileged. The ARM1176JZF-S (ARM DDI 0301H, table 3-3) grants
@@ -860,12 +1086,9 @@ static arm_status_t exec_coprocessor(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
                  * the legacy align-down-and-rotate one, which corrupts loaded
                  * data instead of faulting. */
                 if (crm == 0) {
-                    /* ARMv7 makes U and XP read-as-one: unaligned accesses
-                     * are always the ARMv6 model and there is no legacy page
-                     * table format to fall back to. */
+                    /* (ARMv7's read-as-one U and XP are exec_cp15_v7's.) */
                     if (opc2 == 0) {
-                        p->sctlr = arm_arch_is_v7(c->arch)
-                                 ? v | ARM_SCTLR_U | ARM_SCTLR_XP : v;
+                        p->sctlr = v;
                         arm_mmu_tlb_flush(c);
                     }
                     else if (opc2 == 1) p->actlr = v;
@@ -961,8 +1184,10 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->cpsr   = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
     /* arch survives reset (it names the core, see arm.h), so it can decide
      * the reset value of the bits ARMv7 fixes at one. */
-    if (arm_arch_is_v7(cpu->arch))
-        cpu->cp15.sctlr = ARM_SCTLR_U | ARM_SCTLR_XP;
+    if (arm_arch_is_v7(cpu->arch)) {
+        cpu->cp15.sctlr = ARM_V7_SCTLR_RAO;     /* U and XP among them */
+        cpu->cp15.actlr = CORTEX_A8_ACTLR_RESET;
+    }
     cpu->cycles = 0;
     cpu->bus    = bus;
 }

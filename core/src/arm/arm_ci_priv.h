@@ -58,6 +58,7 @@ enum { CI_A_LDR = 0, CI_A_LDRB, CI_A_STR, CI_A_STRB,
 enum {
     CI_K_REF = 0,      /* execute through the reference semantics            */
     CI_K_NOP,          /* PLD and other architectural no-ops                 */
+    CI_K_NOP_PRIV,     /* a no-op in privileged modes, the reference's in User */
     CI_K_CLREX,
     CI_K_MRS_CPSR,
     CI_K_MUL, CI_K_MULS, CI_K_MLA, CI_K_MLAS,

@@ -10,6 +10,19 @@
  * Table walks read guest memory through the same bus as everything else, so a
  * page table living in emulated RAM behaves exactly as it would on hardware.
  *
+ * The Cortex-A8 profile uses the same walk. ARMv7's short-descriptor format
+ * is the ARMv6 extended one (XP=1), which ARMv7 makes the only one: SCTLR.XP
+ * and SCTLR.U read as one there and S and R read as zero (exec_cp15_v7),
+ * so the legacy subpage and S/R paths below cannot be reached from an ARMv7
+ * guest. SCTLR.AFE is bit 29, where the ARM1176 has FA, with the same meaning.
+ * TEX remap (SCTLR.TRE) changes only memory types, which nothing here
+ * models, and iOS 6's kernel sets neither TRE nor AFE (its SCTLR ORs at
+ * 0x800863a4 are U, XP, V, I, Z, W, C and M). The A8 has no PXN and no 40-bit
+ * addresses, so an L1 descriptor of type 3 stays a translation fault (as in
+ * Unicorn's Cortex-A8) and supersection bits [23:20] and [8:5] are ignored.
+ * tools/unicorn_vmsa_diff.py compares these walks, through ATS and PAR,
+ * against Unicorn.
+ *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
@@ -167,8 +180,21 @@ static bool xn_forbids_fetch(const arm_cpu_t *c, arm_access_t acc, unsigned dac,
         && (c->cp15.sctlr & ARM_SCTLR_XP) != 0u;
 }
 
-static uint32_t mmu_walk(arm_cpu_t *c, uint32_t va, arm_access_t acc,
-                         bool priv, uint32_t *pa);
+/*
+ * Always inlined. It has two callers, the TLB-miss path below and ATS
+ * (arm_mmu_ats); with two, the compiler stops inlining it into the miss path
+ * on its own, and the call cost +0.56% host instructions on cpubench's mmu
+ * workload (cachegrind, interp, ARM, user mode). ATS is rare, so the copy it
+ * gets costs nothing that matters.
+ */
+#if defined(__GNUC__) || defined(__clang__)
+#define MMU_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define MMU_ALWAYS_INLINE inline
+#endif
+static MMU_ALWAYS_INLINE uint32_t mmu_walk(arm_cpu_t *c, uint32_t va,
+                                           arm_access_t acc, bool priv,
+                                           uint32_t *pa, bool *super);
 
 static inline uint32_t mmu_tlb_tag(uint32_t va, arm_access_t acc,
                                    bool priv) {
@@ -318,7 +344,7 @@ uint32_t arm_mmu_translate(arm_cpu_t *c, uint32_t va, arm_access_t acc,
     c->tlb_misses++;
     /* Straight into the caller's pa, so the untouched-on-fault contract is the
      * walk's own rather than something restated here. */
-    uint32_t fsr = mmu_walk(c, va, acc, priv, pa);
+    uint32_t fsr = mmu_walk(c, va, acc, priv, pa, NULL);
     c->tlb[slot].gen = c->tlb_gen;
     c->tlb[slot].tag = tag;
     c->tlb[slot].fsr = fsr;
@@ -360,8 +386,11 @@ bool arm_fetch_cache_try_refill(arm_cpu_t *c, uint32_t va, bool priv) {
     return true;
 }
 
-static uint32_t mmu_walk(arm_cpu_t *c, uint32_t va, arm_access_t acc,
-                         bool priv, uint32_t *pa) {
+/* *super, when asked for, is set on success: whether the translation came
+ * from a supersection, which ATS reports (PAR.SS). */
+static MMU_ALWAYS_INLINE uint32_t mmu_walk(arm_cpu_t *c, uint32_t va,
+                                           arm_access_t acc, bool priv,
+                                           uint32_t *pa, bool *super) {
     /* Only a store sets WnR. A fetch is checked against XN, never against WnR:
      * IFSR has no such field. */
     bool write = (acc == ARM_ACCESS_WRITE);
@@ -459,6 +488,7 @@ static uint32_t mmu_walk(arm_cpu_t *c, uint32_t va, arm_access_t acc,
             *pa = (l1 & 0xff000000u) | (va & 0x00ffffffu);
         else
             *pa = (l1 & 0xfff00000u) | (va & 0x000fffffu);
+        if (super) *super = supersection;
         return 0;
     }
 
@@ -514,9 +544,28 @@ static uint32_t mmu_walk(arm_cpu_t *c, uint32_t va, arm_access_t acc,
 
         if (t2 == 1u) *pa = (l2 & 0xffff0000u) | (va & 0x0000ffffu); /* 64 KB */
         else          *pa = (l2 & 0xfffff000u) | (va & 0x00000fffu); /* 4 KB  */
+        if (super) *super = false;
         return 0;
     }
 
     /* Kept as a defensive fallback if the decoder above gains another type. */
     return fsr_make(ARM_FSR_SECTION_TRANSLATION, domain, write);
+}
+
+/*
+ * ATS1C*: see arm.h. A walk rather than a TLB lookup, because the TLB keeps
+ * no page size and PAR.SS needs one; the TLB is only ever allowed to return
+ * what a walk would, so the answer is the same. The walk's fault is the
+ * DFSR value the access would have raised, reshaped into PAR's fault form.
+ */
+uint32_t arm_mmu_ats(arm_cpu_t *c, uint32_t va, bool write, bool priv) {
+    if (!(c->cp15.sctlr & ARM_SCTLR_M)) return va & 0xfffff000u;
+    uint32_t pa = 0;
+    bool super = false;
+    const uint32_t fsr = mmu_walk(c, va, write ? ARM_ACCESS_WRITE : ARM_ACCESS_READ,
+                                  priv, &pa, &super);
+    if (fsr != 0u)
+        return 1u | ((fsr & 0xfu) << 1) | (((fsr >> 10) & 1u) << 5)
+                  | (((fsr >> 12) & 1u) << 6);
+    return super ? (pa & 0xff000000u) | 2u : pa & 0xfffff000u;
 }

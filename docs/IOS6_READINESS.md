@@ -1,6 +1,6 @@
 # iOS 6 readiness
 
-Status on 2026-09-23: **S5LBox cannot run iOS 6, and no amount of CPU-engine
+Status on 2026-09-25: **S5LBox cannot run iOS 6, and no amount of CPU-engine
 speed changes that.** This document records why, what the cached-interpreter
 work does and does not prepare, and the order of work that would get there.
 It extends `ROADMAP.md` P2 (second machine profile), which already scopes an
@@ -34,7 +34,7 @@ first step below.
 | ARMv7 profile switch | `arm_arch_t` in `core/include/arm.h`: `ARM_ARCH_V6_ARM1176` (default), `ARM_ARCH_V7_SWIFT`, and `ARM_ARCH_V7_A8` (the 3GS). Code asks `arm_arch_is_v7()` / `arm_arch_has_divide()`, never the enum's order: the A8 is ARMv7 without the divider | The engine decodes for the core it runs: ARMv7 ARM state differs in an interworking `MOV pc` and the WFI hint, both handled (step 3). |
 | Thumb-2 (32-bit Thumb) | **Yes, in the reference interpreter** (2026-09-25; see step 2). On the ARM1176 `0xE800..0xFFFF` still decode as the two BL/BLX halves | **Done (step 3, first slice).** ARMv7 Thumb blocks carry a halfword-offset table for their mixed 16/32-bit records; a 32-bit instruction that straddles a 1 KiB block ends the block before it; `IT` and the instructions it covers are REF records, and a block is never entered with ITSTATE live. |
 | Advanced SIMD (NEON) / VFPv3-D32 (VFPv4 on A6) | **Yes** on the A8 profile (2026-09-25): VFPv3-D32 (step 2, second slice) and all of ARMv7 Advanced SIMD, data processing and element/structure loads and stores (third slice) | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
-| ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.U/XP read as one, SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **No** VMSAv7 or v7 CP15 identification | Barriers are no-ops single-core but ISB/`MCR` cache maintenance must keep ending blocks (they already STOP). ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
+| ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **The CP15 set iOS 6's kernel uses** (2026-09-25, step 2 fourth slice): the A8's identification and cache registers, PAR and ATS, the L2 auxiliary control, ARMv7's User-mode rules and SCTLR/TTBCR/CPACR masks; the ARMv7 short-descriptor walk, checked against Unicorn. The A8 has no PXN | Barriers are no-ops in every mode; ARMv7 cache maintenance is a no-op record that hands User mode to the reference, and PAR/ATS stay on `arm_step`. ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
 | Unaligned access always permitted (SCTLR.U fixed) | Handled by the reference through SCTLR | Engine fast paths already fall back on any misalignment. |
 | SMP (A6 only) | **No** | Per-core CPU state and engine instance; the code bitmap and region generations must be shared so a store on one core invalidates blocks the other runs; exclusive monitor becomes global; deterministic interleaving quanta. XNU can boot single-core by boot-arg, which defers it. |
 | SoC: memory map, interrupt controller, timers, clocks, NAND/eMMC, I²C/SPI devices, display | S5L8900 models only. The 3GS inventory is read from its device tree (step 4) | None. New device models, some adapted from the S5L8900 ones. |
@@ -144,10 +144,84 @@ first step below.
    (cachegrind, all workloads, `--div 40`, against 80931e1): ARM +0.045 %
    on the interpreter and +0.043 % on the engine, Thumb under 0.001 %.
 
-   Not yet: SRS/RFE in Thumb state, VMSAv7 (TEX remap, access flag, ASIDs),
-   the A8's CP15 identification and cache registers, CPACR.ASEDIS/D32DIS,
-   ThumbEE, and saving `arch` in snapshots (no ARMv7 machine exists yet to
-   save).
+   **Fourth slice, CP15 and the page tables (2026-09-25).** Scoped by the
+   firmware rather than the ARM ARM: `tools/kcp15.py` lists every MCR/MRC to
+   CP15 in the 6.1.6 kernelcache (the user's, decrypted and kept out of the
+   repository), and each site below was read in a disassembly. What the
+   kernel proper uses, beyond what the ARM1176 path already had:
+
+   | Registers | Where, and what for |
+   |---|---|
+   | MIDR | read once (Thumb, 0x80088278); 0x8007dc8c overwrites its architecture field with 8, and 0x8008db94 maps implementer 0x41, part 0xc08 to its Cortex-A8 CPU family. The revision is not consulted |
+   | CLIDR, CSSELR, CCSIDR | read once at boot (0x8007dccc) to size the L1 data and L2 caches for sysctl: sets x ways x line |
+   | PAR, ATS1CPR/CPW/CUR | its virtual-to-physical lookups (0x80088e80, 0x80088ed0, 0x80088f20), which test PAR.F and PAR.SS and clear [11:0] |
+   | L2 auxiliary control (p15,1,c9,c0,2), ACTLR | read-modify-written at entry (0x80086348, 0x80086364) |
+   | c7 set/way and by-MVA maintenance, TLBIALL/MVA/ASID/MVAA, ITLBIALL | its cache and TLB routines. The set/way loops hard-code the geometry: 128 sets x 4 ways at level 1, 512 x 8 at level 2, 64-byte lines |
+   | c15 (the A8's cache and TLB debug arrays) | only routines that dump them (0x8007c65c-0x8007c830, 0x80093644) |
+
+   Its SCTLR ORs at entry (0x800863a4) are U, XP, V, I, Z, W, C and M, so
+   iOS 6 runs with neither TEX remap nor the access flag, and it only ever
+   writes TTBCR.N (1 or 2). It never touches PRRR, NMRR, VBAR or the
+   performance monitors.
+
+   `exec_cp15_v7()` now decodes the A8's CP15 exactly (opc1, CRn, CRm,
+   opc2, where the ARM1176 path keys most registers on CRn alone):
+   identification values from Unicorn's Cortex-A8, except ID_PFR0/PFR1/DFR0,
+   which report what is implemented here (no ThumbEE, no Security
+   Extensions, no debug); a cache hierarchy encoding the kernel's own loop
+   geometry (32 KB L1, 256 KB L2); PAR and the four ATS1C* operations,
+   through a new `arm_mmu_ats()` that walks without the TLB or an abort;
+   SCTLR's read-as-one and read-as-zero bits; CPACR's CP10/CP11 fields
+   only; and ARMv7's User-mode rule that c7 allows only the three barriers
+   (Unicorn agrees on each). MRC to r15 sets NZCV, and MCR from r15, being
+   UNPREDICTABLE, is refused. The walk itself needed no change: ARMv7's
+   short-descriptor format is the ARMv6 extended one that `mmu.c` already
+   walks. The engine keeps barriers as in-block no-ops, runs other ARMv7
+   cache maintenance as a no-op only in privileged modes, and leaves PAR and
+   ATS to `arm_step`.
+
+   Checked with a new driver, `tools/unicorn_vmsa_diff.py`, which builds a
+   random short-descriptor translation for one address (fault, reserved,
+   section, supersection, or a page table with a fault, large or small page;
+   random AP, APX, domain, XN and attribute bits; random TTBCR.N, PD1, DACR,
+   AFE and TRE), runs all four ATS operations and then a real LDR, STR, LDRT
+   or STRT on both sides, and compares the registers, the PARs and whether
+   the access aborted; when both abort, our DFSR and DFAR must match the
+   fault Unicorn's own ATS reported. `--count 30000 --seed 3`: 21,982 agree
+   (19,116 of them with both sides aborting), 5,177 reach physical memory
+   outside Unicorn's 1 MB (everything before the access is still compared),
+   **0** differences, and 2,841 in a `qemu-bug` bucket with three rules:
+   QEMU 5.0 checks the domain before it reads a page's second-level
+   descriptor and before the access flag, and checks the access flag only in
+   Client domains (1,201 + 995 + 645). The ARM ARM orders these faults
+   Translation, Access flag, Domain, Permission, as `mmu.c` already does,
+   and QEMU's maintainers set out the same order in a 2026 patch that moves
+   QEMU's check ([qemu-arm](https://ratatoskr.run/qemu-arm/2026/08/17460220/t)).
+   A case is accepted into that bucket only if all four of our PARs are the
+   architecture's answer. Three more things were Unicorn's and are kept out
+   of the comparison instead: it stores SCTLR as written, so writing XP = 0
+   switches it to the ARMv5 table format (no APX) and B = 1 to big-endian
+   fetches, both impossible on ARMv7; and its Cortex-A8 runs Non-secure,
+   which sets PAR.NS.
+
+   `test_armv7` gained 55 checks (197 in all): the identification values,
+   CCSIDR's sizes through the kernel's own arithmetic, every mask, ATS over
+   a small table (page, read-only page, hole, supersection, No access
+   domain, PD1, MMU off) with no abort taken, a real STRT agreeing with ATS,
+   and User mode against both the reference and the engine. `test_ci_diff`
+   now reaches PAR, ATS, CSSELR, CCSIDR and the L2 register in its ARMv7
+   ARM pass and compares them: 0 mismatches over 4 seeds. Cost to the
+   iPhone OS 3 machine (cachegrind, `cpubench --mode user --workload
+   mmu,sort,calls,crc32 --div 40`, against 875a3f7): interpreter -0.04 % in
+   ARM and Thumb, engine -0.08 % in both. A first version cost +0.56 % on
+   the `mmu` workload alone, because a second caller made the compiler stop
+   inlining the table walk; it is now always inlined.
+
+   Not yet: SRS/RFE in Thumb state, ThumbEE, the Security Extensions (SMC,
+   Monitor mode, VBAR), PRRR/NMRR (TEX remap changes only memory types,
+   which nothing models), ASID-tagged TLB entries (a speed item: every
+   CONTEXTIDR and TTBR write still flushes), and saving `arch` in snapshots
+   (no ARMv7 machine exists yet to save).
 3. **Cached interpreter for v7**: Thumb-2 variable-length records and the
    straddle rule, IT handling, then specialisations in order of a kernel
    census (`tools/kcensus.py`), each kept only with a fuzzer proof and a

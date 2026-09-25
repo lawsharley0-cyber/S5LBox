@@ -573,7 +573,8 @@ typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
 /* Every specialised kind with a handler of its own, for the dispatch table. */
 #define CI_SIMPLE_KINDS(X)                                                    \
     X(MUL) X(MULS) X(MLA) X(MLAS) X(UMULL) X(UMLAL) X(SMULL) X(SMLAL)         \
-    X(NOP) X(CLREX) X(MRS_CPSR) X(CLZ) X(SXTB) X(SXTH) X(UXTB) X(UXTH)        \
+    X(NOP) X(NOP_PRIV) X(CLREX) X(MRS_CPSR) X(CLZ)                            \
+    X(SXTB) X(SXTH) X(UXTB) X(UXTH)                                           \
     X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
     X(MRC_TID) X(MCR_TID) X(LDR_PC) X(JMP)                                    \
     X(VFP_DP) X(VFP_MOV) X(VFP_SYS) X(VFP_LS)                                 \
@@ -793,6 +794,9 @@ top:
 
         /* ------------------------------------------------ miscellaneous */
         CI_HK(NOP) CI_NEXT();
+        /* ARMv7 c7 cache maintenance: nothing to do, but UNDEFINED from
+         * User mode, which is the reference's to raise. */
+        CI_HK(NOP_PRIV) if (!priv) goto ref; CI_NEXT();
         CI_HK(CLREX) c->excl_valid = false; CI_NEXT();
         CI_HK(MRS_CPSR) R[op->rd] = c->cpsr; CI_NEXT();
         CI_HK(CLZ) R[op->rd] = clz32(R[op->rm]); CI_NEXT();

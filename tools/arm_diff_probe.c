@@ -30,6 +30,13 @@
  * the step. The output gains fpscr and the same 64 words after the hash, and
  * for a refused instruction a final " #reason" (vfp_trap_reason()).
  *
+ * MMU form (tools/unicorn_vmsa_diff.py): the line starts with "m", then
+ *   k addr1 word1 ... addrk wordk
+ * before the extended form's tokens: k words stored into RAM after it is
+ * filled (the page tables, which the extended form's code-after-pc cannot
+ * place). The output gains the CP15 fault registers and PAR after the hash:
+ *   dfsr dfar ifsr ifar par
+ *
  * A malformed input line prints "ERR" and is skipped.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
@@ -70,6 +77,7 @@ static uint8_t pattern_byte(uint32_t i) {
 
 #define MAX_TOKENS 160
 #define VFP_TOKENS 65
+#define MAX_POKES  32
 
 int main(void) {
     static char line[4096];
@@ -78,7 +86,8 @@ int main(void) {
         int n = 0;
         char *p = line;
         const bool vfp = *p == 'v';
-        if (vfp) p++;
+        const bool mmu = *p == 'm';
+        if (vfp || mmu) p++;
         for (; n < MAX_TOKENS; ) {
             char *end;
             while (*p == ' ' || *p == '\t') p++;
@@ -87,6 +96,19 @@ int main(void) {
             if (end == p) { n = -1; break; }
             v[n++] = (uint32_t)x;
             p = end;
+        }
+        uint32_t pokes[2 * MAX_POKES];
+        unsigned npokes = 0;
+        if (mmu) {
+            if (n < 1 || v[0] > MAX_POKES || n < 1 + 2 * (int)v[0] + 20) {
+                printf("ERR\n");
+                continue;
+            }
+            npokes = v[0];
+            memcpy(pokes, &v[1], 2u * npokes * sizeof v[0]);
+            memmove(&v[0], &v[1 + 2 * npokes],
+                    (size_t)(n - 1 - 2 * (int)npokes) * sizeof v[0]);
+            n -= 1 + 2 * (int)npokes;
         }
         const bool extended = n >= 20;
         uint32_t vfp_in[VFP_TOKENS];
@@ -107,6 +129,8 @@ int main(void) {
         } else {
             memset(g_ram, 0, sizeof g_ram);
         }
+        for (unsigned i = 0; i < npokes; i++)
+            m_w32(NULL, pokes[2 * i], pokes[2 * i + 1]);
         arm_cpu_t c = {0};
         if (extended) c.arch = (arm_arch_t)v[18];
         arm_reset(&c, &g_bus);
@@ -148,6 +172,9 @@ int main(void) {
                 h = (h ^ g_ram[i]) * 16777619u;
             printf(" %08x", h);
         }
+        if (mmu)
+            printf(" %08x %08x %08x %08x %08x", c.cp15.dfsr, c.cp15.dfar,
+                   c.cp15.ifsr, c.cp15.ifar, c.cp15.par);
         if (vfp) {
             printf(" %08x", c.vfp_fpscr);
             for (int i = 0; i < 64; i++) printf(" %08x", c.vfp_s[i]);

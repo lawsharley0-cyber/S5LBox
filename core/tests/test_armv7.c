@@ -834,6 +834,223 @@ static void test_neon_on_the_cortex_a8(void) {
           (unsigned long long)dreg(&c, 15), c.r[5], (unsigned long long)s.ref_retired);
 }
 
+/* ---------------------------------------------------------------- CP15 */
+
+#define MRC15(opc1, crn, crm, opc2, rt) (0xee100f10u | ((opc1) << 21) | ((crn) << 16) | \
+                                         ((rt) << 12) | ((opc2) << 5) | (crm))
+#define MCR15(opc1, crn, crm, opc2, rt) (MRC15(opc1, crn, crm, opc2, rt) & ~(1u << 20))
+
+/* Run one ARM word at the current pc. */
+static arm_status_t arm1(arm_cpu_t *c, uint32_t insn) {
+    m_w32(NULL, c->r[15], insn);
+    return arm_step(c);
+}
+
+/* MRC into r0 and return it (0xdeadbeef if the read did not retire). */
+static uint32_t mrc(arm_cpu_t *c, unsigned opc1, unsigned crn, unsigned crm,
+                    unsigned opc2) {
+    c->r[0] = 0xdeadbeefu;
+    if (arm1(c, MRC15(opc1, crn, crm, opc2, 0u)) != ARM_OK) return 0xdeadbeefu;
+    return c->r[0];
+}
+
+static bool mcr(arm_cpu_t *c, unsigned opc1, unsigned crn, unsigned crm,
+                unsigned opc2, uint32_t v) {
+    c->r[1] = v;
+    return arm1(c, MCR15(opc1, crn, crm, opc2, 1u)) == ARM_OK;
+}
+
+static void test_cp15_identification_on_the_a8(void) {
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    CHECK(mrc(&c, 0, 0, 0, 0) == CORTEX_A8_MIDR, "MIDR %08x", c.r[0]);
+    CHECK(mrc(&c, 0, 0, 0, 1) == 0x82048004u, "CTR %08x", c.r[0]);
+    /* The unallocated c0,c0 encodings read as MIDR; MPIDR, TCMTR and TLBTR
+     * read zero. */
+    CHECK(mrc(&c, 0, 0, 0, 4) == CORTEX_A8_MIDR && mrc(&c, 0, 0, 0, 7) == CORTEX_A8_MIDR,
+          "c0,c0,4/7 alias MIDR: %08x", c.r[0]);
+    CHECK(mrc(&c, 0, 0, 0, 5) == 0u && mrc(&c, 0, 0, 0, 3) == 0u, "MPIDR/TLBTR %08x", c.r[0]);
+    CHECK(mrc(&c, 0, 0, 1, 0) == 0x31u && mrc(&c, 0, 0, 1, 1) == 1u,
+          "ID_PFR0/1: no ThumbEE, no Security Extensions: %08x", c.r[0]);
+    CHECK(mrc(&c, 0, 0, 2, 1) == 0x12112111u, "ID_ISAR1 %08x", c.r[0]);
+    CHECK(mrc(&c, 1, 0, 0, 1) == 0x0a000023u, "CLIDR %08x", c.r[0]);
+
+    /* iOS 6 sizes its caches from CCSIDR as sets x ways x line (0x8007dd78):
+     * the same arithmetic must give the geometry its set/way loops assume. */
+    static const struct { uint32_t sel, ccsidr, bytes; } cache[] = {
+        { 0u, 0xe00fe01au,  32u * 1024u },          /* L1 data        */
+        { 1u, 0x200fe01au,  32u * 1024u },          /* L1 instruction */
+        { 2u, 0xf03fe03au, 256u * 1024u },          /* L2 unified     */
+    };
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(mcr(&c, 2, 0, 0, 0, cache[i].sel), "CSSELR write");
+        const uint32_t v = mrc(&c, 1, 0, 0, 0);
+        const uint32_t line = 4u << ((v & 7u) + 2u), ways = ((v >> 3) & 0x3ffu) + 1u;
+        const uint32_t sets = ((v >> 13) & 0x7fffu) + 1u;
+        CHECK(v == cache[i].ccsidr && sets * ways * line == cache[i].bytes && line == 64u,
+              "CCSIDR[%u]=%08x: %u sets x %u ways x %u bytes", cache[i].sel, v, sets,
+              ways, line);
+    }
+    CHECK(mcr(&c, 2, 0, 0, 0, 3u) && mrc(&c, 1, 0, 0, 0) == 0u,
+          "no level-2 instruction cache: %08x", c.r[0]);
+    CHECK(mcr(&c, 2, 0, 0, 0, 0xffffffffu) && mrc(&c, 2, 0, 0, 0) == 0xfu,
+          "CSSELR keeps Level and InD: %08x", c.r[0]);
+    CHECK(mrc(&c, 1, 0, 0, 7) == 0u, "AIDR %08x", c.r[0]);
+
+    boot(&c, &g_bus, ARM_ARCH_V6_ARM1176, 0x100, false);
+    CHECK(mrc(&c, 0, 0, 0, 0) == ARM1176_MIDR, "ARM1176 MIDR %08x", c.r[0]);
+}
+
+static void test_cp15_register_masks_on_the_a8(void) {
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    CHECK(c.cp15.sctlr == 0x00c50078u && c.cp15.actlr == 2u,
+          "reset: sctlr=%08x actlr=%08x", c.cp15.sctlr, c.cp15.actlr);
+    /* Everything but M (which would turn translation on over empty tables):
+     * the read-as-zero bits drop, the read-as-one bits stay. */
+    CHECK(mcr(&c, 0, 1, 0, 0, 0xfffffffeu) && mrc(&c, 0, 1, 0, 0) == 0x73e5787eu,
+          "SCTLR all ones: %08x", c.r[0]);
+    CHECK(mcr(&c, 0, 1, 0, 0, 0u) && mrc(&c, 0, 1, 0, 0) == 0x00c50078u,
+          "SCTLR zero: %08x", c.r[0]);
+    CHECK(mcr(&c, 0, 2, 0, 2, 0xffffffffu) && mrc(&c, 0, 2, 0, 2) == 0x37u,
+          "TTBCR keeps N, PD0, PD1: %08x", c.r[0]);
+    CHECK(mcr(&c, 0, 1, 0, 2, 0xffffffffu) && mrc(&c, 0, 1, 0, 2) == 0x00f00000u,
+          "CPACR keeps CP10/CP11 only: %08x", c.r[0]);
+    CHECK(mcr(&c, 1, 9, 0, 2, 0x10600000u) && mrc(&c, 1, 9, 0, 2) == 0x10600000u,
+          "L2 auxiliary control stores: %08x", c.r[0]);
+    CHECK(mcr(&c, 0, 7, 4, 0, 0x12345001u) && mrc(&c, 0, 7, 4, 0) == 0x12345001u,
+          "PAR is writable: %08x", c.r[0]);
+    /* An unallocated register in a modelled CRn: reads zero, ignores writes. */
+    CHECK(mcr(&c, 0, 2, 1, 0, 0x5555u) && mrc(&c, 0, 2, 1, 0) == 0u &&
+          c.cp15.ttbr0 == 0u, "c2,c1,0 is not TTBR0: %08x", c.r[0]);
+
+    /* MRC to r15 sets NZCV from [31:28]; MCR from r15 is UNPREDICTABLE. */
+    c.cpsr &= 0x0fffffffu;
+    CHECK(arm1(&c, MRC15(0, 0, 0, 0, 15u)) == ARM_OK &&
+          (c.cpsr >> 28) == (CORTEX_A8_MIDR >> 28) && c.r[15] != 0x410fc080u,
+          "MRC APSR_nzcv: cpsr=%08x pc=%08x", c.cpsr, c.r[15]);
+    CHECK(arm1(&c, MCR15(0, 13, 0, 2, 15u)) == ARM_UNDEFINED, "MCR from r15 refused");
+}
+
+/*
+ * ATS1C* and PAR over a small table: a page table at VA 0x80000000 with a
+ * user-read-only page, a read-only page and a hole; a supersection at
+ * 0x90000000; a section in a No access domain at 0xa0000000. The code runs
+ * from an identity section at 0.
+ */
+static void ats_tables(arm_cpu_t *c) {
+    const uint32_t l1 = 0x4000, l2 = 0x5000;
+    m_w32(NULL, l1 + (0x000u << 2), (1u << 10) | 2u);
+    m_w32(NULL, l1 + (0x800u << 2), l2 | 1u);
+    m_w32(NULL, l2 + 0u, 0x10000u | (2u << 4) | 2u);            /* priv RW, user RO */
+    m_w32(NULL, l2 + 4u, 0x11000u | (1u << 9) | (2u << 4) | 3u);  /* RO for all, XN */
+    for (uint32_t i = 0; i < 16u; i++)          /* a supersection fills 16 entries */
+        m_w32(NULL, l1 + ((0x900u + i) << 2), 0x2b000000u | (1u << 18) | (3u << 10) | 2u);
+    m_w32(NULL, l1 + (0xa00u << 2), 0x00300000u | (1u << 5) | (3u << 10) | 2u);
+    c->cp15.ttbr0 = c->cp15.ttbr1 = l1;
+    c->cp15.dacr = 1u;                                   /* domain 0 client, 1 none */
+    c->cp15.sctlr |= ARM_SCTLR_M;
+    arm_mmu_tlb_flush(c);
+}
+
+static uint32_t ats(arm_cpu_t *c, unsigned op, uint32_t va) {
+    if (!mcr(c, 0, 7, 8, op, va)) return 0xdeadbeefu;
+    return mrc(c, 0, 7, 4, 0);
+}
+
+static void test_ats_and_par_on_the_a8(void) {
+    enum { CPR = 0, CPW = 1, CUR = 2, CUW = 3 };
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SVC;
+    ats_tables(&c);
+    c.cp15.dfsr = 0x1111u; c.cp15.dfar = 0x2222u;
+
+    CHECK(ats(&c, CPR, 0x80000abcu) == 0x00010000u, "privileged read: %08x", c.r[0]);
+    CHECK(ats(&c, CUR, 0x80000abcu) == 0x00010000u, "user read: %08x", c.r[0]);
+    CHECK(ats(&c, CPW, 0x80000abcu) == 0x00010000u, "privileged write: %08x", c.r[0]);
+    CHECK(ats(&c, CUW, 0x80000abcu) == 0x1fu,
+          "user write: page permission fault (FS 0xf) %08x", c.r[0]);
+    CHECK(ats(&c, CPR, 0x80001004u) == 0x00011000u, "read-only page, read: %08x", c.r[0]);
+    CHECK(ats(&c, CPW, 0x80001004u) == 0x1fu, "read-only page, write: %08x", c.r[0]);
+    CHECK(ats(&c, CPR, 0x80002000u) == 0x0fu, "hole: page translation fault %08x", c.r[0]);
+    CHECK(ats(&c, CPR, 0x90123456u) == 0x2b000002u,
+          "supersection: PA[31:24] and SS %08x", c.r[0]);
+    CHECK(ats(&c, CPR, 0xa0000000u) == 0x13u,
+          "No access domain: section domain fault (FS 9) %08x", c.r[0]);
+    CHECK(c.cp15.dfsr == 0x1111u && c.cp15.dfar == 0x2222u &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_SVC,
+          "no abort taken: dfsr=%08x dfar=%08x cpsr=%08x", c.cp15.dfsr, c.cp15.dfar, c.cpsr);
+
+    /* TTBCR.N = 1, PD1: 0x80000000 now walks TTBR1, which PD1 disables. */
+    c.cp15.ttbcr = 0x21u;
+    CHECK(ats(&c, CPR, 0x80000abcu) == 0x0bu,
+          "PD1: section translation fault (FS 5) %08x", c.r[0]);
+    c.cp15.ttbcr = 0u;
+
+    /* A real access agrees with ATS: the user-mode store aborts with the
+     * fault PAR predicted. STRT r0, [r2], #0. */
+    c.r[2] = 0x80000abcu;
+    CHECK(arm1(&c, 0xe4a20000u) == ARM_OK && c.r[15] == ARM_VEC_DATA_ABORT &&
+          (c.cp15.dfsr & 0x80fu) == 0x80fu && c.cp15.dfar == 0x80000abcu,
+          "STRT: pc=%08x dfsr=%08x dfar=%08x", c.r[15], c.cp15.dfsr, c.cp15.dfar);
+
+    /* MMU off: the flat mapping. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    CHECK(ats(&c, CUW, 0x12345678u) == 0x12345000u, "MMU off: %08x", c.r[0]);
+}
+
+static void test_user_mode_cp15_on_the_a8(void) {
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_USR;
+    CHECK(mcr(&c, 0, 7, 10, 4, 0) && mcr(&c, 0, 7, 10, 5, 0) && mcr(&c, 0, 7, 5, 4, 0),
+          "User mode: CP15DSB, CP15DMB and CP15ISB");
+    static const unsigned ops[][2] = { {5, 0}, {5, 1}, {6, 1}, {10, 1}, {11, 1}, {14, 1}, {8, 0} };
+    for (unsigned i = 0; i < 7; i++) {
+        c.r[15] = 0x100;
+        CHECK(arm1(&c, MCR15(0, 7, ops[i][0], ops[i][1], 1u)) == ARM_UNDEFINED,
+              "User mode c7,c%u,%u refused", ops[i][0], ops[i][1]);
+    }
+    c.r[15] = 0x100;
+    CHECK(arm1(&c, MRC15(0, 7, 4, 0, 0u)) == ARM_UNDEFINED, "User mode PAR refused");
+    c.r[15] = 0x100;
+    c.cp15.tpidruro = 0x77u;
+    CHECK(mrc(&c, 0, 13, 0, 3) == 0x77u, "User mode reads TPIDRURO");
+    CHECK(arm1(&c, MCR15(0, 13, 0, 3, 1u)) == ARM_UNDEFINED, "but may not write it");
+    c.r[15] = 0x100;
+    CHECK(mcr(&c, 0, 13, 0, 2, 0x99u) && mrc(&c, 0, 13, 0, 2) == 0x99u,
+          "User mode TPIDRURW read/write");
+
+    /* The ARM1176 still lets User mode clean and invalidate by MVA. */
+    boot(&c, &g_bus, ARM_ARCH_V6_ARM1176, 0x100, false);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_USR;
+    CHECK(mcr(&c, 0, 7, 5, 0, 0), "ARM1176 User mode ICIALLU");
+
+    /* The engine agrees: in User mode a cache operation leaves the block for
+     * the reference, which refuses it; in System mode it is a no-op. The
+     * barrier before it is a no-op in either. */
+    for (unsigned priv = 0; priv < 2; priv++) {
+        boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0x100, false);
+        if (!priv) c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_USR;
+        m_w32(NULL, 0x100, MCR15(0, 7, 10, 4, 1u));        /* CP15DSB */
+        m_w32(NULL, 0x104, MCR15(0, 7, 14, 1, 1u));        /* DCCIMVAC */
+        m_w32(NULL, 0x108, 0xe3a05009u);                  /* MOV r5, #9 */
+        arm_ci_config_t cfg = { .ram = g_ram, .ram_base = 0, .ram_size = RAM_SIZE };
+        arm_ci_t *ci = arm_ci_create(&cfg);
+        arm_status_t st = ARM_OK;
+        arm_ci_stop_t stop;
+        unsigned ran = ci ? arm_ci_run(ci, &c, 3u, &st, &stop) : 0u;
+        if (ci) arm_ci_destroy(ci);
+        if (priv)
+            CHECK(st == ARM_OK && ran == 3u && c.r[5] == 9u && c.r[15] == 0x10cu,
+                  "System mode: ran %u st %d pc=%08x", ran, (int)st, c.r[15]);
+        else
+            CHECK(st == ARM_UNDEFINED && ran == 1u && c.r[15] == 0x104u && c.r[5] != 9u,
+                  "User mode: ran %u st %d pc=%08x", ran, (int)st, c.r[15]);
+    }
+}
+
 int main(void) {
     printf("S5LBox ARMv7 profile tests\n");
     test_profile_predicates();
@@ -856,6 +1073,10 @@ int main(void) {
     test_engine_leaves_a_block_when_itstate_turns_live();
     test_vfpv3_on_the_cortex_a8();
     test_neon_on_the_cortex_a8();
+    test_cp15_identification_on_the_a8();
+    test_cp15_register_masks_on_the_a8();
+    test_ats_and_par_on_the_a8();
+    test_user_mode_cp15_on_the_a8();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

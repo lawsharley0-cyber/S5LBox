@@ -218,18 +218,24 @@ static uint32_t gen_arm(unsigned idx, unsigned len) {
             return f;
         }
         case 21: case 22: {                                              /* CP15 MCR/MRC */
-            /* c7 (barriers, cache maintenance, sometimes WFI), c13 (thread
-             * and context IDs), c0 (identification): the forms the engine
-             * specialises or must leave to arm_step. Never c1-c3, which would
-             * wreck this harness's own translation set-up. */
-            static const uint8_t crns[] = { 7u, 7u, 13u, 13u, 13u, 0u };
-            unsigned crn = crns[rnd_n(6u)];
+            /* c7 (barriers, cache maintenance, sometimes WFI, and on ARMv7
+             * PAR and the ATS operations at CRm 4 and 8), c13 (thread and
+             * context IDs), c0 (identification, and on ARMv7 CSSELR at opc1
+             * 2 and CCSIDR/CLIDR at opc1 1), c9 (the A8's L2 auxiliary
+             * control at opc1 1): the forms the engine specialises or must
+             * leave to arm_step. Never c1-c3, which would wreck this
+             * harness's own translation set-up. */
+            static const uint8_t crns[] = { 7u, 7u, 7u, 13u, 13u, 13u, 0u, 0u, 9u };
+            unsigned crn = crns[rnd_n(9u)];
             unsigned opc2 = crn == 13u ? rnd_n(8u) : rnd_n(8u);
-            unsigned crm = crn == 7u ? (chance(10) ? 0u : rnd_n(16u)) : (chance(80) ? 0u : rnd_n(2u));
-            unsigned L = crn == 0u ? 1u : rnd_n(2u);
+            unsigned crm = crn == 7u ? (chance(10) ? 0u : chance(20) ? (chance(50) ? 4u : 8u)
+                                                                    : rnd_n(16u))
+                                     : (chance(80) ? 0u : rnd_n(2u));
+            unsigned L = crn == 0u ? (chance(80) ? 1u : 0u) : rnd_n(2u);
             unsigned r = chance(5) ? 15u : rnd_n(15u);
+            unsigned opc1 = crn == 9u ? 1u : chance(10) ? rnd_n(8u) : 0u;
             return c | 0x0e000f10u | (L << 20) | (crn << 16) | (r << 12) | (opc2 << 5) | crm |
-                   ((chance(10) ? rnd_n(8u) : 0u) << 21);
+                   (opc1 << 21);
         }
         case 23: {                                                       /* CPS */
             static const uint32_t modes[] = { ARM_MODE_USR, ARM_MODE_SVC, ARM_MODE_IRQ,
@@ -610,6 +616,7 @@ static void apply_state(s5l8900_t *m, const state_t *s) {
     c->cp15.tpidruro = s->tid[1];
     c->cp15.tpidrprw = s->tid[2];
     c->cp15.context_id = 0;
+    c->cp15.par = c->cp15.csselr = c->cp15.l2auxcr = 0;
     arm_mmu_tlb_flush(c);
     /* A real, level-asserted IRQ (VIC0 software interrupt, line 5) or none,
      * so unmasking with something pending is exercised. The previous case's
@@ -642,6 +649,7 @@ static int compare(const s5l8900_t *a, const s5l8900_t *b, char *why, size_t n) 
     DIFF(cp15.tpidrurw, "%08x"); DIFF(cp15.tpidruro, "%08x");
     DIFF(cp15.tpidrprw, "%08x"); DIFF(cp15.context_id, "%08x");
     DIFF(cp15.fcse_pid, "%08x"); DIFF(cp15.sctlr, "%08x");
+    DIFF(cp15.par, "%08x"); DIFF(cp15.csselr, "%08x"); DIFF(cp15.l2auxcr, "%08x");
     DIFF(irq_line, "%d"); DIFF(fiq_line, "%d");
     DIFF(abort_pending, "%d");
     DIFF(vfp_fpscr, "%08x"); DIFF(vfp_fpexc, "%08x");

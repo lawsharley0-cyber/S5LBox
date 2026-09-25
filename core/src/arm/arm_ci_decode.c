@@ -443,17 +443,32 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, bool v7, ci_op_t *op) {
             const unsigned opc1 = (insn >> 21) & 7u, crn = (insn >> 16) & 0xfu;
             const unsigned rd = (insn >> 12) & 0xfu, opc2 = (insn >> 5) & 7u;
             const unsigned crm = insn & 0xfu;
+            /* ARMv7 (exec_cp15_v7): the three barriers are no-ops in every
+             * mode, other opc1 0 cache maintenance only in privileged ones.
+             * PAR (c7,c4,0) and ATS (c7,c8) are real operations, and the
+             * ARMv6 WFI encoding and any other opc1 stay on arm_step. */
+            if (v7 && !L && crn == 7u) {
+                if (opc1 != 0u || rd == 15u || (crm == 0u && opc2 == 4u) ||
+                    (crm == 4u && opc2 == 0u) || crm == 8u)
+                    return CI_DEC_STOP;
+                const bool barrier = (crm == 5u && opc2 == 4u) ||
+                                     (crm == 10u && (opc2 == 4u || opc2 == 5u));
+                op->kind = barrier ? CI_K_NOP : CI_K_NOP_PRIV;
+                return CI_DEC_OP;
+            }
             /* c7 writes other than WFI (MCR p15,0,Rd,c7,c0,4): the memory
              * barriers and cache maintenance, a no-op in the reference in
              * every mode (User mode may issue c7). */
-            if (!L && crn == 7u && !(opc1 == 0u && opc2 == 4u && crm == 0u)) {
+            if (!v7 && !L && crn == 7u && !(opc1 == 0u && opc2 == 4u && crm == 0u)) {
                 op->kind = CI_K_NOP;
                 return CI_DEC_OP;
             }
             /* c13 opc2 2..4: TPIDRURW/URO/PRW, plain registers in the
              * reference. Opc2 1 (CONTEXTIDR) flushes the TLB and stays on
-             * arm_step, as does anything naming r15. */
-            if (crn == 13u && rd != 15u && opc2 >= 2u && opc2 <= 4u) {
+             * arm_step, as does anything naming r15. ARMv7 names them by
+             * opc1 0 and CRm 0 only; anything else there is unmodelled. */
+            if (crn == 13u && rd != 15u && opc2 >= 2u && opc2 <= 4u &&
+                (!v7 || (opc1 == 0u && crm == 0u))) {
                 op->kind = L ? CI_K_MRC_TID : CI_K_MCR_TID;
                 op->rd = (uint8_t)rd;
                 op->sa = (uint8_t)opc2;
