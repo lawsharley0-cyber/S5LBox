@@ -1,8 +1,9 @@
 /*
  * S5LBox — compiled guest workloads as a correctness test.
  *
- * Every workload in bench/guest runs at a small scale, in both images (ARM and
- * Thumb-1) and both privilege levels, through s5l8900_run() with the MMU on and
+ * Every workload in bench/guest runs at a small scale, in all three images
+ * (ARM and Thumb-1 on the ARM1176, Thumb-2 on the Cortex-A8 profile) and both
+ * privilege levels, through s5l8900_run() with the MMU on and
  * device ticks live. Each run must finish, report the checksum the host
  * computes from the same C source, and -- for every backend listed below --
  * end in exactly the architectural state the reference interpreter reaches.

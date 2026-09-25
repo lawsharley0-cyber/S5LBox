@@ -202,6 +202,10 @@ add_executable(test_arm tests/test_arm.c)
 target_link_libraries(test_arm PRIVATE emucore)
 add_test(NAME arm_interp COMMAND test_arm)
 
+add_executable(test_armv7 tests/test_armv7.c)
+target_link_libraries(test_armv7 PRIVATE emucore)
+add_test(NAME armv7 COMMAND test_armv7)
+
 add_executable(test_vfp tests/test_vfp.c)
 target_link_libraries(test_vfp PRIVATE emucore)
 add_test(NAME vfp COMMAND test_vfp)

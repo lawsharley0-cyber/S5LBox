@@ -43,6 +43,12 @@
 #define ARM_CPSR_I (1u << 7)  /* IRQ disable  */
 #define ARM_CPSR_F (1u << 6)  /* FIQ disable  */
 #define ARM_CPSR_T (1u << 5)  /* Thumb state  */
+/* ARMv7 execution-state bits besides T: ITSTATE is IT[7:2] = CPSR[15:10] and
+ * IT[1:0] = CPSR[26:25]; J is CPSR[24]. On the ARM1176 these are reserved and
+ * nothing here reads them. MSR cannot write them on ARMv7 and MRS reads them
+ * as zero; exception entry clears IT and SPSR carries it across a handler. */
+#define ARM_CPSR_IT_MASK 0x0600fc00u
+#define ARM_CPSR_J (1u << 24)
 #define ARM_CPSR_MODE_MASK 0x1fu
 
 /* CP15 c1 system control register (SCTLR) bits we act on. */
@@ -56,6 +62,7 @@
 #define ARM_SCTLR_U (1u << 22)  /* ARMv6 unaligned half/word support */
 #define ARM_SCTLR_EE (1u << 25) /* CPSR.E value taken on exception entry */
 #define ARM_SCTLR_FA (1u << 29) /* force extended-descriptor access flag */
+#define ARM_SCTLR_TE (1u << 30) /* ARMv7: exceptions are taken in Thumb state */
 /*
  * XP: extended page tables. Clear, the MMU reads the ARMv5-compatible
  * descriptor layout, where a small page carries four sets of subpage AP bits
@@ -349,8 +356,26 @@ typedef struct arm_cp15 {
  */
 typedef enum {
     ARM_ARCH_V6_ARM1176 = 0,  /* S5L8900 / iPhone OS 3 -- the current target */
-    ARM_ARCH_V7_SWIFT   = 1   /* S5L8950X / iPhone 5, ARMv7s -- roadmap P2   */
+    ARM_ARCH_V7_SWIFT   = 1,  /* S5L8950X / iPhone 5, ARMv7s -- roadmap P2   */
+    ARM_ARCH_V7_A8      = 2   /* S5L8920 / iPhone 3GS, Cortex-A8 ARMv7-A --
+                                 the iOS 6 target (docs/IOS6_READINESS.md)  */
 } arm_arch_t;
+
+/*
+ * Ask these, never compare the enum's order. The values are not a ladder: the
+ * Cortex-A8 is ARMv7-A without the integer divider, so "SWIFT or later" would
+ * hand it SDIV/UDIV it does not have.
+ *
+ *   ARMv7 (either core):  Thumb-2, the IT block, MOVW/MOVT, bitfield ops,
+ *                         barriers, CPSR execution-state bits.
+ *   hardware divide:      SDIV/UDIV, ARM and Thumb. Swift only.
+ */
+static inline bool arm_arch_is_v7(arm_arch_t a) {
+    return a != ARM_ARCH_V6_ARM1176;
+}
+static inline bool arm_arch_has_divide(arm_arch_t a) {
+    return a == ARM_ARCH_V7_SWIFT;
+}
 
 /*
  * Direct-mapped, power of two so the index is a mask rather than a modulo.

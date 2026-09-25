@@ -9,15 +9,19 @@ and running the benchmarks needs no ARM toolchain -- in particular not on
 Windows. Regenerating needs Clang with the ARM target, ld.lld and
 llvm-objcopy/llvm-nm (any recent LLVM; 18 was used).
 
-Two images are produced from the same sources (bench/guest/*):
-  arm    workloads compiled -marm, VFPv2 hard-float (the vfp workload runs)
-  thumb  workloads compiled -mthumb (Thumb-1: the ARM1176 has no Thumb-2),
-         soft-float ABI; vfp is compiled out and returns 0 in this image
-start.S (vectors, startup, SVC handler) is ARM state in both.
+Three images are produced from the same sources (bench/guest/*):
+  arm     ARM1176: workloads compiled -marm, VFPv2 hard-float (the vfp
+          workload runs)
+  thumb   ARM1176: workloads compiled -mthumb (Thumb-1: the ARM1176 has no
+          Thumb-2), soft-float ABI; vfp is compiled out and returns 0 here
+  thumb2  Cortex-A8 (ARMv7-A): workloads compiled -mthumb, so Thumb-2 with
+          IT blocks, CBZ, TBB/TBH and the wide encodings; VFPv2 hard-float,
+          which is VFP in Thumb state. Runs on the ARM_ARCH_V7_A8 profile.
+start.S (vectors, startup, SVC handler) is ARM state in all three.
 
-The header records the SHA-256 of every input and the tool versions, and
---check recomputes the input digests, so a stale image is detected even on a
-machine that cannot rebuild it.
+The header records the SHA-256 of every input, of the compiler flags, and the
+tool versions, and --check recomputes the digest, so a stale image is detected
+even on a machine that cannot rebuild it.
 """
 import argparse
 import hashlib
@@ -34,14 +38,19 @@ OUT = os.path.join(SRC, "generated", "guest_images.h")
 INPUTS = ["start.S", "runtime.c", "workloads.c", "workloads.h", "link.ld"]
 SYMBOLS = ["_start", "mbox", "svc_counter", "fiq_counter", "wl_arena", "__bss_end"]
 
-COMMON = ["--target=armv6kz-none-eabi", "-mcpu=arm1176jzf-s", "-O2",
-          "-ffreestanding", "-fno-builtin", "-nostdlib", "-fno-pic",
+ARMV6 = ["--target=armv6kz-none-eabi", "-mcpu=arm1176jzf-s"]
+ARMV7 = ["--target=armv7a-none-eabi", "-mcpu=cortex-a8"]
+COMMON = ["-O2", "-ffreestanding", "-fno-builtin", "-nostdlib", "-fno-pic",
           "-fno-strict-aliasing", "-ffp-contract=off", "-fno-math-errno",
           "-fno-exceptions", "-fno-unwind-tables",
           "-fno-asynchronous-unwind-tables", "-Wall", "-Wextra", "-Werror"]
+# Per image: (target flags, instruction-set flags for the C sources). The
+# Cortex-A8's own FPU is VFPv3 with NEON; -mfpu=vfpv2 keeps the compiler to
+# the VFP encodings this emulator implements (vfp.c: VFPv2, d0-d15).
 ISAS = {
-    "arm":   ["-marm", "-mfloat-abi=hard", "-mfpu=vfpv2"],
-    "thumb": ["-mthumb", "-mfloat-abi=soft"],
+    "arm":    (ARMV6, ["-marm", "-mfloat-abi=hard", "-mfpu=vfpv2"]),
+    "thumb":  (ARMV6, ["-mthumb", "-mfloat-abi=soft"]),
+    "thumb2": (ARMV7, ["-mthumb", "-mfloat-abi=hard", "-mfpu=vfpv2"]),
 }
 
 
@@ -66,17 +75,20 @@ def input_digest():
         with open(os.path.join(SRC, name), "rb") as f:
             data = f.read().replace(b"\r\n", b"\n")
         h.update(name.encode() + b"\0" + data + b"\0")
+    h.update(repr((COMMON, sorted(ISAS.items()))).encode())
     return h.hexdigest()
 
 
 def build(isa, tmp, cc, ld, objcopy, nm):
     objs = []
     start_o = os.path.join(tmp, isa + "_start.o")
-    run([cc] + COMMON + ["-marm", "-c", os.path.join(SRC, "start.S"), "-o", start_o])
+    target, flags = ISAS[isa]
+    run([cc] + target + COMMON + ["-marm", "-c", os.path.join(SRC, "start.S"),
+                                  "-o", start_o])
     objs.append(start_o)
     for c in ("runtime.c", "workloads.c"):
         o = os.path.join(tmp, "%s_%s.o" % (isa, c[:-2]))
-        run([cc] + COMMON + ISAS[isa] + ["-c", os.path.join(SRC, c), "-o", o])
+        run([cc] + target + COMMON + flags + ["-c", os.path.join(SRC, c), "-o", o])
         objs.append(o)
     elf = os.path.join(tmp, isa + ".elf")
     run([ld, "-T", os.path.join(SRC, "link.ld"), "--no-undefined",
@@ -153,7 +165,7 @@ def main():
     with open(OUT, "w", newline="\n") as f:
         f.write(emit(images, digest, versions))
     for isa, (image, syms) in images.items():
-        print("%-5s %7d bytes  entry 0x%08x  mbox 0x%08x  bss_end 0x%08x"
+        print("%-6s %7d bytes  entry 0x%08x  mbox 0x%08x  bss_end 0x%08x"
               % (isa, len(image), syms["_start"], syms["mbox"], syms["__bss_end"]))
     print("wrote", os.path.relpath(OUT, ROOT))
 

@@ -32,13 +32,19 @@
 typedef struct {
     const uint8_t *image;
     uint32_t size, entry, mbox, bss_end, fiq_counter;
+    arm_arch_t arch;
 } gb_image_t;
 
 static const gb_image_t g_images[GB_ISA_COUNT] = {
     { guest_bench_arm_image, GUEST_BENCH_ARM_SIZE, GUEST_BENCH_ARM_START,
-      GUEST_BENCH_ARM_MBOX, GUEST_BENCH_ARM_BSSEND, GUEST_BENCH_ARM_FIQCOUNTER },
+      GUEST_BENCH_ARM_MBOX, GUEST_BENCH_ARM_BSSEND, GUEST_BENCH_ARM_FIQCOUNTER,
+      ARM_ARCH_V6_ARM1176 },
     { guest_bench_thumb_image, GUEST_BENCH_THUMB_SIZE, GUEST_BENCH_THUMB_START,
-      GUEST_BENCH_THUMB_MBOX, GUEST_BENCH_THUMB_BSSEND, GUEST_BENCH_THUMB_FIQCOUNTER },
+      GUEST_BENCH_THUMB_MBOX, GUEST_BENCH_THUMB_BSSEND, GUEST_BENCH_THUMB_FIQCOUNTER,
+      ARM_ARCH_V6_ARM1176 },
+    { guest_bench_thumb2_image, GUEST_BENCH_THUMB2_SIZE, GUEST_BENCH_THUMB2_START,
+      GUEST_BENCH_THUMB2_MBOX, GUEST_BENCH_THUMB2_BSSEND, GUEST_BENCH_THUMB2_FIQCOUNTER,
+      ARM_ARCH_V7_A8 },
 };
 
 #if defined(CLOCK_MONOTONIC)
@@ -68,7 +74,11 @@ static bool gb_active_now(void *ctx, uint64_t *nanoseconds) {
 }
 
 const char *gb_isa_name(gb_isa_t isa) {
-    return isa == GB_ISA_THUMB ? "thumb" : "arm";
+    switch (isa) {
+        case GB_ISA_THUMB:  return "thumb";
+        case GB_ISA_THUMB2: return "thumb2";
+        default:            return "arm";
+    }
 }
 
 bool gb_workload_supported(uint32_t workload, gb_isa_t isa) {
@@ -207,6 +217,10 @@ bool gb_run(const gb_config_t *cfg, gb_result_t *out) {
     build_tables(m);
 
     arm_cpu_t *c = &m->cpu;
+    /* The core, not the machine: the S5L8900's peripherals with a Cortex-A8
+     * CPU is not a real phone, but the workloads touch nothing but RAM, the
+     * MMU and (for the FIQ variant) the timer and interrupt controller. */
+    c->arch = img->arch;
     c->cp15.sctlr = ARM_SCTLR_M | ARM_SCTLR_XP | ARM_SCTLR_U;
     c->cp15.ttbr0 = GB_L1_PA;
     c->cp15.ttbcr = 0u;

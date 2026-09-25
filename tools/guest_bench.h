@@ -22,7 +22,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef enum { GB_ISA_ARM = 0, GB_ISA_THUMB = 1, GB_ISA_COUNT } gb_isa_t;
+/* The images: ARM and Thumb-1 run on the ARM1176 profile, Thumb-2 on the
+ * Cortex-A8 (ARM_ARCH_V7_A8) -- see tools/gen_guest_bench.py. */
+typedef enum {
+    GB_ISA_ARM = 0, GB_ISA_THUMB = 1, GB_ISA_THUMB2 = 2, GB_ISA_COUNT
+} gb_isa_t;
 
 typedef struct {
     uint32_t              workload;   /* wl_id_t */

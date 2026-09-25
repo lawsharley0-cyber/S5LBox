@@ -1075,6 +1075,15 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         goto done;
     }
 
+    /* The engine's decoder is the ARM1176's. An ARMv7 core would need
+     * Thumb-2 and the IT block in it, and gets every instruction from
+     * arm_step instead: slower, never wrong. */
+    if (c->arch != ARM_ARCH_V6_ARM1176) {
+        stop_local = ARM_CI_STOP_STEP;
+        ci->st.step_cause[ARM_CI_STEP_PROFILE]++;
+        goto done;
+    }
+
     const bool priv = (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
     const uint8_t *const ram = ci->cfg.ram;
     const uint8_t *const ram_end = ram + ci->cfg.ram_size;
@@ -1173,7 +1182,7 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
     if (!out || !cap) return 0;
     out[0] = '\0';
     if (!st) return 0;
-    char q[20][16];            /* one buffer per argument of one snprintf */
+    char q[21][16];            /* one buffer per argument of one snprintf */
     const uint64_t *sc = st->step_cause, *rc = st->ref_class;
     int w = snprintf(out, cap,
         "Engine retired %s instructions%s%.1f%%%s; via reference %.1f%% "
@@ -1181,7 +1190,7 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
         "Runs: %s (budget %s, step %s, event %s, status %s)\n"
         "Blocks: %s run, %s built, %s stale, %s invalidations, %s flushes\n"
         "Handed to arm_step: SVC %s, CP15 c13 %s, WFI %s, CP15 %s, CP14 %s, "
-        "other %s, interrupt/abort %s, fetch %s\n",
+        "other %s, interrupt/abort %s, fetch %s, not ARMv6 %s\n",
         qty(q[0], st->retired),
         total_retired ? " (" : "", pct(st->retired, total_retired),
         total_retired ? " of all)" : "",
@@ -1196,7 +1205,8 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
         qty(q[6], sc[ARM_CI_STEP_SVC]), qty(q[7], sc[ARM_CI_STEP_CP15_TLS]),
         qty(q[8], sc[ARM_CI_STEP_WFI]), qty(q[9], sc[ARM_CI_STEP_CP15]),
         qty(q[10], sc[ARM_CI_STEP_CP14]), qty(q[11], sc[ARM_CI_STEP_OTHER]),
-        qty(q[12], sc[ARM_CI_STEP_EXCEPTION]), qty(q[13], sc[ARM_CI_STEP_FETCH]));
+        qty(q[12], sc[ARM_CI_STEP_EXCEPTION]), qty(q[13], sc[ARM_CI_STEP_FETCH]),
+        qty(q[19], sc[ARM_CI_STEP_PROFILE]));
     if (w < 0) return 0;
     size_t len = (size_t)w < cap ? (size_t)w : cap - 1u;
     w = snprintf(out + len, cap - len,
