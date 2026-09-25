@@ -1,10 +1,16 @@
 <div align="center">
 
-# S5LBox
+# NEON
 
 ### Project goal: boot **real iPhone OS 3** — Apple's actual kernel, `launchd`, and SpringBoard — inside an app on a modern iPhone. **No jailbreak required** — see *Requirements*.
 
 *A from-scratch emulator of the 2007 iPhone's chip, written in portable C.*
+
+*Formerly **S5LBox**. Renamed NEON on 2026-09-25 as the project grows an ARMv7
+Cortex-A8 CPU towards iOS 6 on the iPhone 3GS; see
+[`docs/IOS6_READINESS.md`](docs/IOS6_READINESS.md). Older docs and internal
+names still say S5LBox, and the bundle ID is unchanged, so an install updates
+the app already on a phone.*
 
 [![core-tests](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/core-tests.yml/badge.svg)](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/core-tests.yml)
 [![ios-build](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/ios-build.yml/badge.svg)](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/ios-build.yml)
@@ -16,7 +22,7 @@
 
 ---
 
-S5LBox does not reimplement iPhone OS or fake its apps. It emulates the
+NEON does not reimplement iPhone OS or fake its apps. It emulates the
 **hardware** of the original iPhone — the Samsung **S5L8900** chip and its ARMv6
 processor — in software, then runs Apple's own unmodified operating system on
 top of that model. You supply the firmware; none is included here. To the
@@ -382,7 +388,7 @@ so historical 768 MiB experiments are not valid recipes.
 [`docs/debugging.md`](docs/debugging.md) is the procedure these add up to.
 
 **Get the app:** on a matching push or manual dispatch, the `ios-build` workflow
-produces an ad-hoc-signed `S5LBox.ipa` as a temporary GitHub Actions artifact.
+produces an ad-hoc-signed `NEON.ipa` as a temporary GitHub Actions artifact.
 CI has no Apple signing identity, so that artifact **will not install on stock
 iOS as-is**. Re-sign it with your own ordinary provisioning profile using your
 preferred stock-device installation method. The app requests no private, JIT,
@@ -433,7 +439,7 @@ value cannot. Results from such a hybrid do not test the newly selected mode.
 
 ## Legal
 
-S5LBox is an independently written emulator under the MIT license. It ships
+NEON is an independently written emulator under the MIT license. It ships
 **no Apple firmware images or decryption keys.** You supply firmware you are
 entitled to use. "iPhone", "iOS", and "iPhone OS" are trademarks of Apple Inc.;
 this project is not affiliated with or endorsed by Apple.

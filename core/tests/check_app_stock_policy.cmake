@@ -10,7 +10,7 @@ if(NOT DEFINED APP_DIR OR NOT IS_DIRECTORY "${APP_DIR}")
         "check_app_stock_policy.cmake requires -DAPP_DIR=<app directory>")
 endif()
 
-set(entitlements "${APP_DIR}/S5LBox.entitlements")
+set(entitlements "${APP_DIR}/NEON.entitlements")
 set(project "${APP_DIR}/project.yml")
 set(info_plist "${APP_DIR}/Info.plist")
 foreach(required "${entitlements}" "${project}" "${info_plist}")

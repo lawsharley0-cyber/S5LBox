@@ -391,7 +391,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [self.view addSubview:_toolbar];
     [self refreshRunControls];
 
-    [self append:@"S5LBox  ·  on-device self-test"];
+    [self append:@"NEON  ·  on-device self-test"];
     [self append:@"================================\n"];
     [self reportEnvironment];
     [self append:@"\n-- emulated S5L8900 --"];
@@ -1276,7 +1276,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
  * Sound text, which machine and graphics mode this is, the whole console
  * scrollback, the guest profile since the last copy, and the whole audio
  * kext with the kernel functions it calls. Written to Documents/Reports (the
- * Files app shows it under S5LBox) and offered to the share sheet; nothing is
+ * Files app shows it under NEON) and offered to the share sheet; nothing is
  * sent anywhere unless the user sends it.
  */
 - (void)saveFullTestReport {
@@ -1297,7 +1297,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     stamp.dateFormat = @"yyyy-MM-dd'T'HH-mm-ss";
     NSString *when = [stamp stringFromDate:[NSDate date]];
     NSMutableString *full = [NSMutableString stringWithFormat:
-        @"S5LBox full test report %@\nMachine: %@ (%@)\n\n=== PERFORMANCE & SOUND ===\n%@\n\n=== GUEST CONSOLE (all kept lines) ===\n%@\n\n",
+        @"NEON full test report %@\nMachine: %@ (%@)\n\n=== PERFORMANCE & SOUND ===\n%@\n\n=== GUEST CONSOLE (all kept lines) ===\n%@\n\n",
         when, machine, graphics ?: @"graphics not recorded",
         [self performanceReportText], [self consoleTail:NSUIntegerMax]];
 
@@ -1316,7 +1316,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                 NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
             NSString *dir = [documents stringByAppendingPathComponent:@"Reports"];
             NSString *path = [dir stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"S5LBox-test-%@.txt", when]];
+                [NSString stringWithFormat:@"NEON-test-%@.txt", when]];
             NSError *error = nil;
             BOOL saved = [[NSFileManager defaultManager] createDirectoryAtPath:dir
                     withIntermediateDirectories:YES attributes:nil error:&error] &&

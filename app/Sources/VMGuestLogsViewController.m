@@ -116,7 +116,7 @@ static const NSTimeInterval kHFSEpochOffset = 2082844800.0;
 static NSString *Explain(rootfs_work_status_t status, const rootfs_work_result_t *result) {
     NSString *detail = result->detail[0] ? [NSString stringWithUTF8String:result->detail] : @"";
     if ([detail containsString:@"not cleanly unmounted"])
-        return @"Shut down iPhone OS first: hold Power, slide to power off, wait for it to halt, then return to Machines. Crash reports are read from the stopped guest disk; pausing or closing S5LBox does not cleanly unmount it.";
+        return @"Shut down iPhone OS first: hold Power, slide to power off, wait for it to halt, then return to Machines. Crash reports are read from the stopped guest disk; pausing or closing NEON does not cleanly unmount it.";
     return [NSString stringWithFormat:@"The guest disk could not be read (%s). %@",
             rootfs_work_status_name(status), detail];
 }

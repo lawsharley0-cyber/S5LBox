@@ -18,12 +18,12 @@
 #define VM_DEFAULT_MBX                true
 #define VM_DEFAULT_CA_SOFTWARE_RENDER false
 #define VM_MBX_DETAIL \
-    "On only in the separately labelled S5LBox MBX phone experiment. It " \
+    "On only in the separately labelled NEON MBX phone experiment. It " \
     "uses a separate app container so its first machine gets a fresh MBX work " \
     "image rather than silently reusing the normal app's CPU-renderer image. " \
     "The path is still experimental: no phone run has proved 30 fps."
 #define VM_CA_RENDER_DETAIL \
-    "Off only in the separately labelled S5LBox MBX phone experiment, paired " \
+    "Off only in the separately labelled NEON MBX phone experiment, paired " \
     "with MBX on before its first work image is created. The normal app keeps " \
     "Apple's CPU renderer on. Changing this after an image exists cannot " \
     "convert that image and is not a controlled comparison."

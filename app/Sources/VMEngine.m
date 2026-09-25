@@ -608,7 +608,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
                       selector:@selector(provisionRootFilesystem:)
                         object:where] : nil;
             if (worker) {
-                worker.name = @"S5LBox rootfs provisioning";
+                worker.name = @"NEON rootfs provisioning";
                 worker.qualityOfService = NSQualityOfServiceUtility;
                 [worker start];
             } else {
@@ -1047,7 +1047,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
         [self appendConsole:@"[vm] could not allocate the emulator thread\n"];
         return NO;
     }
-    thread.name = @"S5LBox emulator";
+    thread.name = @"NEON emulator";
     thread.qualityOfService = NSQualityOfServiceUserInitiated;
     thread.stackSize = 512 * 1024;
 
@@ -2360,7 +2360,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
  * The kernel code around every guest pc that touched the audio block (AMC
  * registers and SRAM), from this machine's own RAM: the kernel maps
  * 0xc0000000 -> physical 0x08000000 linearly. Opt-in and copied by the
- * user; it is their firmware and it is never stored by S5LBox. Code pages do
+ * user; it is their firmware and it is never stored by NEON. Code pages do
  * not change while the guest runs, so reading them from this thread is safe.
  */
 /* The lowest and highest kernel pc seen touching the audio block (AMC
@@ -2415,7 +2415,7 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     NSMutableString *hex = [NSMutableString string];
     for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
     return [NSString stringWithFormat:
-        @"S5LBox audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"
+        @"NEON audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by NEON)\n"
         @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x accesses=%llu\n%@\n",
         start, end - start, hex, lo, hi, (unsigned long long)accesses,
         [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
@@ -2621,7 +2621,7 @@ static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunk
     NSMutableString *out = [NSMutableString string];
     const uint64_t kept = window->samples - window->dropped;
     [out appendFormat:
-        @"S5LBox guest profile (the guest pc sampled after every %u retired instructions)\n"
+        @"NEON guest profile (the guest pc sampled after every %u retired instructions)\n"
         @"Build: %@\nWindow: %.1f s, %llu samples = %.1f M instructions; %llu shorter chunks (guest idle or a stop) not sampled\n",
         kVMChunkInstructions, revision, seconds,
         (unsigned long long)window->samples,
@@ -2987,7 +2987,7 @@ static NSString *VMKernelSha1Text(const ksyms_t *ks, const uint8_t *window,
     if (stop - lo > 0x4000u) stop = lo + 0x4000u;
     if (lo < start || stop > end) return nil;
     return [NSString stringWithFormat:
-        @"KERNEL CODE FOR SPEED WORK (this machine's own kernel, for analysis; not stored by S5LBox)\n"
+        @"KERNEL CODE FOR SPEED WORK (this machine's own kernel, for analysis; not stored by NEON)\n"
         @"SHA-1 behind code-signing page checks: _SHA1Init 0x%08x .. 0x%08x\n%@",
         lo, stop, VMDriverKextText(window + (lo - start), lo, stop - lo, "mach_kernel SHA-1", ks)];
 }
@@ -3151,7 +3151,7 @@ static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSMutableString *out = [NSMutableString string];
         @autoreleasepool {
-            [out appendString:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by S5LBox)\n"];
+            [out appendString:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by NEON)\n"];
             if (amcSeen)
                 [out appendFormat:@"audio pcs=0x%08x..0x%08x accesses=%llu\n", lo, hi,
                     (unsigned long long)accesses];

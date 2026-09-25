@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <!--
-      Intentionally empty. S5LBox's shipping execution path is a no-JIT
+      Intentionally empty. NEON's shipping execution path is a no-JIT
       interpreter and must run inside an ordinary stock-iOS app sandbox.
 
       CI's ad-hoc signature is only a transport/build artifact and grants no

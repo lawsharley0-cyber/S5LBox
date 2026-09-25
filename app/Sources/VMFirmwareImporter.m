@@ -419,7 +419,7 @@ static void vmfw_strip_trailing_slash(char *path) {
 - (vm_fw_status_t)runImportOfURL:(NSURL *)url intoReport:(vm_fw_report_t *)report {
     if (!url.isFileURL)
         return vmfw_fail(report, VM_FW_ERR_ARCHIVE_UNREADABLE,
-                         "That is not a file S5LBox can open.");
+                         "That is not a file NEON can open.");
 
     /* Where the three results go. Created if absent: on a fresh install nobody
      * has put anything in Documents/firmware, so it does not exist yet. */

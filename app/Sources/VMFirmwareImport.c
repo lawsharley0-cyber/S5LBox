@@ -98,7 +98,7 @@ const char *vm_fw_strerror(vm_fw_status_t st) {
         case VM_FW_ERR_MANIFEST_TOO_BIG:     return "the manifest is implausibly large";
         case VM_FW_ERR_MANIFEST_MALFORMED:   return "the manifest will not parse";
         case VM_FW_ERR_MANIFEST_INCOMPLETE:  return "the manifest does not name the files this needs";
-        case VM_FW_ERR_UNSUPPORTED_DEVICE:   return "this firmware is for a device S5LBox does not emulate";
+        case VM_FW_ERR_UNSUPPORTED_DEVICE:   return "this firmware is for a device NEON does not emulate";
         case VM_FW_ERR_MEMBER_MISSING:       return "the archive is missing a member its own manifest names";
         case VM_FW_ERR_MEMBER_UNREADABLE:    return "a member could not be read out of the archive";
         case VM_FW_ERR_MEMBER_CHECKSUM:      return "a member's contents do not match the archive's own checksum";
@@ -856,7 +856,7 @@ static void import_img3_artefact(run_t *r, vm_fw_artefact_t which,
                  r->rep->build);
     } else {
         snprintf(ar->detail, sizeof ar->detail,
-                 "Extracted %llu bytes. S5LBox has no reference hash for "
+                 "Extracted %llu bytes. NEON has no reference hash for "
                  "%s %s, so this is unpacked but unverified.",
                  (unsigned long long)ar->produced,
                  r->rep->product_type, r->rep->build);
@@ -1110,7 +1110,7 @@ static void import_root_filesystem(run_t *r, const vmfw_zip_entry_t *entry,
                  r->rep->product_type, r->rep->build);
     } else {
         snprintf(ar->detail, sizeof ar->detail,
-                 "Produced %llu bytes. S5LBox has no reference hash for "
+                 "Produced %llu bytes. NEON has no reference hash for "
                  "%s %s, so this is unpacked but unverified.",
                  (unsigned long long)ar->produced,
                  r->rep->product_type, r->rep->build);
@@ -1185,7 +1185,7 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     if (report->platform[0] && strcmp(report->platform, "s5l8900x") != 0) {
         report->status = VM_FW_ERR_UNSUPPORTED_DEVICE;
         snprintf(report->detail, sizeof report->detail,
-                 "This is %s %s (%s, %s). S5LBox emulates the S5L8900 -- the "
+                 "This is %s %s (%s, %s). NEON emulates the S5L8900 -- the "
                  "iPhone 2G and 3G -- so this firmware will not run on it.",
                  report->product_type, report->build,
                  report->product_version[0] ? report->product_version : "?",

@@ -374,11 +374,11 @@ static const uint64_t kVMInstructionCaps[] = {
         stringByAppendingPathComponent:@"README.txt"] copy];
     if (readme && ![fm fileExistsAtPath:readme]) {
         NSString *text =
-            @"S5LBox firmware folder\n"
+            @"NEON firmware folder\n"
             @"======================\n"
             @"\n"
             @"Put an IPSW here. Any file ending in .ipsw in this folder (or one\n"
-            @"level up, in the S5LBox folder itself) is found by the Firmware\n"
+            @"level up, in the NEON folder itself) is found by the Firmware\n"
             @"screen's \"Detect IPSW\" row -- no file picker needed.\n"
             @"\n"
             @"The importer produces three files, and they end up here too:\n"
@@ -388,7 +388,7 @@ static const uint64_t kVMInstructionCaps[] = {
             @"    rootfs.img        the root filesystem, decrypted and expanded\n"
             @"\n"
             @"Every payload inside a 3.x IPSW is encrypted and the keys are NOT\n"
-            @"in the archive. S5LBox ships none and cannot compute any. The\n"
+            @"in the archive. NEON ships none and cannot compute any. The\n"
             @"Firmware screen says which artefact needs which key; you supply\n"
             @"them, and they are held in memory for that session only.\n"
             @"\n"
@@ -406,7 +406,7 @@ static const uint64_t kVMInstructionCaps[] = {
 
     /*
      * Both the firmware folder and Documents itself, because a user dropping a
-     * 239 MB file into "S5LBox" in Files is at least as likely as one who
+     * 239 MB file into "NEON" in Files is at least as likely as one who
      * navigates into firmware/ first. Looking in the obvious place and the
      * place we asked for costs one extra directory read.
      */

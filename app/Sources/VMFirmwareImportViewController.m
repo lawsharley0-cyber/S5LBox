@@ -47,7 +47,7 @@ typedef NS_ENUM(NSInteger, VMImportChooseRow) {
     VMImportChooseRowPick = 0,
     /*
      * Whatever is sitting in the firmware folder. This is the row that makes
-     * the Files-app route work end to end: copy an IPSW into S5LBox's folder,
+     * the Files-app route work end to end: copy an IPSW into NEON's folder,
      * come back here, tap once. No picker, no security-scoped URL, and no
      * second copy of a 239 MB file.
      */
@@ -273,12 +273,12 @@ static BOOL VMProbeFirmware(vm_firmware_boot_state_t *out) {
         @"This turns an IPSW you already have into the three files the "
         @"emulator accepts: kernel.macho, devicetree.bin and rootfs.img. "
         @"Nothing is downloaded, and no firmware ships with the app.\n\n"
-        @"Two ways in. Copy the IPSW into S5LBox > firmware using the Files "
+        @"Two ways in. Copy the IPSW into NEON > firmware using the Files "
         @"app and tap Detect IPSW below — the file is read where it lands, so "
         @"a 239 MB archive is not copied twice. Or use Choose an IPSW to pick "
         @"one from anywhere else.\n\n"
         @"Every payload inside a 3.x IPSW is encrypted, and the keys are not "
-        @"in the archive and cannot be worked out from it. S5LBox has none of "
+        @"in the archive and cannot be worked out from it. NEON has none of "
         @"them. Where one is needed, this screen says which file needs it and "
         @"what kind it is, and you supply it.";
     UIView *header = [[UIView alloc] initWithFrame:CGRectZero];
@@ -436,7 +436,7 @@ titleForFooterInSection:(NSInteger)section {
                     @"Files are written to\n\n%@\n\n"
                     @"\"verified\" means the bytes are identical to the "
                     @"known-good file for this build. \"extracted, "
-                    @"unverified\" means it was produced, but S5LBox holds no "
+                    @"unverified\" means it was produced, but NEON holds no "
                     @"reference hash for this build to check it against.",
                     [[VMSettings sharedSettings] firmwareDirectory]
                         ?: @"(no documents directory)"];
@@ -453,7 +453,7 @@ titleForFooterInSection:(NSInteger)section {
                     "machine has one yet.";
 
         case VMImportSectionKeys:
-            return @"These are yours, not the app's. S5LBox ships no keys, "
+            return @"These are yours, not the app's. NEON ships no keys, "
                     "downloads none, and cannot compute any -- they were "
                     "recovered from hardware, this app has no list of them, "
                     "and it will not fetch one or suggest where to look.\n\n"
@@ -624,7 +624,7 @@ estimatedHeightForRowAtIndexPath:(NSIndexPath *)indexPath {
                     cell.textLabel.text = @"No IPSW in the firmware folder";
                     cell.textLabel.textColor = [UIColor secondaryLabelColor];
                     cell.detailTextLabel.text =
-                        @"copy one into S5LBox > firmware in the Files app";
+                        @"copy one into NEON > firmware in the Files app";
                     cell.selectionStyle = UITableViewCellSelectionStyleNone;
                 } else {
                     cell.textLabel.text = @"Detect IPSW";
@@ -887,11 +887,11 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSString *message = isRoot
         ? [NSString stringWithFormat:
             @"One hexadecimal value that you supply: %u characters, an AES key "
-            @"followed by an HMAC key. S5LBox does not have it, cannot work it "
+            @"followed by an HMAC key. NEON does not have it, cannot work it "
             @"out from the IPSW, and will not look for it.",
             (unsigned)(VMFW_DMG_KEY_BLOB_SIZE * 2u)]
         : @"Two hexadecimal values that you supply: the key (32, 48 or 64 "
-          @"characters) and the IV (32 characters). S5LBox has neither, cannot "
+          @"characters) and the IV (32 characters). NEON has neither, cannot "
           @"work either out from the IPSW, and will not look for them.\n\n"
           @"The IV is the published one, not the value inside the container -- "
           @"that one is wrapped and would corrupt the first block.";

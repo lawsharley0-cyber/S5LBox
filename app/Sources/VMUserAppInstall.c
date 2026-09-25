@@ -36,7 +36,7 @@ bool vm_user_app_install(const char *work, const vm_user_app_plan_t *plan,
     rootfs_work_status_t status = rootfs_work_validate_source(live, &disk);
     if (status != ROOTFS_WORK_OK) {
         if (strstr(disk.detail, "not cleanly unmounted"))
-            return refusal(detail, capacity, "Shut down iPhone OS first: hold Power, slide to power off, wait for it to halt, then return to Machines. Pausing or closing S5LBox does not cleanly unmount the guest disk.");
+            return refusal(detail, capacity, "Shut down iPhone OS first: hold Power, slide to power off, wait for it to halt, then return to Machines. Pausing or closing NEON does not cleanly unmount the guest disk.");
         return refusal(detail, capacity, disk.detail[0] ? disk.detail : rootfs_work_status_name(status));
     }
     if (vm_guest_apps_prepare_stage(work, result, detail, capacity) != VM_GUEST_INSTALL_OK) return false;

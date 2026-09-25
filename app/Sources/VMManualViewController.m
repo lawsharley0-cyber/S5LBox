@@ -62,7 +62,7 @@ typedef struct {
     NSMutableArray *e = [NSMutableArray array];
 
     [e addObject:@{ @"h": @"What this is",
-        @"b": @"S5LBox emulates the chip inside an iPhone 3G — the Samsung "
+        @"b": @"NEON emulates the chip inside an iPhone 3G — the Samsung "
               @"S5L8900 — instruction by instruction, from scratch. The goal "
               @"is to run a real, unmodified copy of iPhone OS 3 on it.\n\n"
               @"It is not a simulator and not a skin. Nothing here pretends to "

@@ -64,7 +64,7 @@ static bool thin_macho(const uint8_t *b, size_t n, bool main_executable,
             return fail(detail, capacity, "An executable load command has an invalid size.");
         if (command == 0x21u || command == 0x2cu) {
             if (size < 20u || le32(b + offset + 16u) != 0u)
-                return fail(detail, capacity, "This app is encrypted. Import an unencrypted app you own; S5LBox does not remove DRM.");
+                return fail(detail, capacity, "This app is encrypted. Import an unencrypted app you own; NEON does not remove DRM.");
             uint32_t crypt_offset = le32(b + offset + 8u), crypt_size = le32(b + offset + 12u);
             if ((uint64_t)crypt_offset + crypt_size > n)
                 return fail(detail, capacity, "The executable encryption range is outside its slice.");

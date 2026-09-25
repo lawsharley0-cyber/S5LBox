@@ -876,7 +876,7 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *message = self.guestInstallRequest
         ? @"For a new install, this downloads exact, pinned iPhone OS 3 "
            @"packages from the publisher's archive and replaces only the "
-           @"selected virtual machine's writable disk. S5LBox does not bundle "
+           @"selected virtual machine's writable disk. NEON does not bundle "
            @"the packages. A compatible older Cydia machine is instead copied "
            @"to expand it to 2 GiB and, when needed, repair the exact known "
            @"legacy Cydia executable permissions without redownloading or "

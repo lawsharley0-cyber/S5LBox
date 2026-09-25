@@ -40,7 +40,7 @@ cd app
 mkdir -p Generated
 python3 ../tools/gen_a64_static.py Generated/a64_static_handlers.S
 xcodegen generate
-open S5LBox.xcodeproj
+open NEON.xcodeproj
 ```
 Select your team for signing in Xcode, then build and run on the device. The
 `Info.plist`, entitlements and asset catalog in `app/` are unchanged by the

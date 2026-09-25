@@ -63,7 +63,7 @@ jobs:
       EXPERIMENTAL_HLE: ${{ github.event_name == 'workflow_dispatch' && inputs.experimental_hle && 'true' || 'false' }}
       EXPERIMENTAL_MBX: ${{ github.event_name == 'workflow_dispatch' && inputs.experimental_mbx && 'true' || 'false' }}
       SIMULATOR_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.experimental_simulator && 'true' || 'false' }}
-      IPA_ARTIFACT: ${{ github.event_name == 'workflow_dispatch' && inputs.experimental_hle && 'S5LBox-hle-experimental-ipa' || github.event_name == 'workflow_dispatch' && inputs.experimental_mbx && 'S5LBox-mbx-experimental-ipa' || 'S5LBox-ipa' }}
+      IPA_ARTIFACT: ${{ github.event_name == 'workflow_dispatch' && inputs.experimental_hle && 'NEON-hle-experimental-ipa' || github.event_name == 'workflow_dispatch' && inputs.experimental_mbx && 'NEON-mbx-experimental-ipa' || 'NEON-ipa' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +88,7 @@ jobs:
           import plistlib
           from pathlib import Path
 
-          entitlements = plistlib.loads(Path("S5LBox.entitlements").read_bytes())
+          entitlements = plistlib.loads(Path("NEON.entitlements").read_bytes())
           if entitlements:
               raise SystemExit(
                   f"shipping app requests entitlements: {entitlements!r}"
@@ -107,7 +107,7 @@ jobs:
               "libhooker",
               "ElleKit",
           )
-          checked = [Path("project.yml"), Path("S5LBox.entitlements")]
+          checked = [Path("project.yml"), Path("NEON.entitlements")]
           checked.extend(Path("Sources").rglob("*"))
           violations = []
           for path in checked:
@@ -179,7 +179,7 @@ jobs:
             set -- \
               "OTHER_CFLAGS=-DS5LBOX_MBX_EXPERIMENT=1" \
               "PRODUCT_BUNDLE_IDENTIFIER=com.j0shua.S5LBox.MBXExperiment" \
-              "S5LBOX_DISPLAY_NAME=S5LBox MBX"
+              "S5LBOX_DISPLAY_NAME=NEON MBX"
           fi
           # The simulator needs no device signing story at all -- it is not
           # a stock-device install path and never will be, so this branch
@@ -190,8 +190,8 @@ jobs:
             sdk=iphonesimulator
           fi
           xcodebuild \
-            -project S5LBox.xcodeproj \
-            -target S5LBox \
+            -project NEON.xcodeproj \
+            -target NEON \
             -configuration Release \
             -sdk "$sdk" \
             -arch arm64 \
@@ -200,7 +200,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             "$@" \
             build
-          binary="$PWD/dist/S5LBox.app/S5LBox"
+          binary="$PWD/dist/NEON.app/NEON"
           test -f "$binary"
           xcrun nm "$binary" |
             awk '$NF == "_a64_static_execute" { found=1 }
@@ -211,11 +211,11 @@ jobs:
                    END { exit !found }'
           fi
           if [ "$EXPERIMENTAL_MBX" = true ]; then
-            plist="$PWD/dist/S5LBox.app/Info.plist"
+            plist="$PWD/dist/NEON.app/Info.plist"
             test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = \
               "com.j0shua.S5LBox.MBXExperiment"
             test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$plist")" = \
-              "S5LBox MBX"
+              "NEON MBX"
           fi
 
       - name: Ad-hoc sign transport artifact + package .ipa
@@ -223,14 +223,14 @@ jobs:
         working-directory: app
         run: |
           set -euo pipefail
-          APP="dist/S5LBox.app"
+          APP="dist/NEON.app"
           test -d "$APP"
           # Apple's built-in signer creates a structurally complete transport
           # artifact with the deliberately empty entitlement contract. This is
           # not a stock-device provisioning signature; stock installers must
           # replace it with the user's valid profile/signature.
           codesign --force --sign - --timestamp=none \
-            --entitlements S5LBox.entitlements "$APP"
+            --entitlements NEON.entitlements "$APP"
           codesign --verify --strict --verbose=2 "$APP"
           codesign --display --entitlements :- "$APP" \
             > dist/embedded-entitlements.plist
@@ -238,7 +238,7 @@ jobs:
           import plistlib
           from pathlib import Path
 
-          declared = plistlib.loads(Path("S5LBox.entitlements").read_bytes())
+          declared = plistlib.loads(Path("NEON.entitlements").read_bytes())
           embedded = plistlib.loads(
               Path("dist/embedded-entitlements.plist").read_bytes()
           )
@@ -250,30 +250,30 @@ jobs:
           PY
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          zip -qry S5LBox.ipa Payload
-          ls -lh S5LBox.ipa
+          zip -qry NEON.ipa Payload
+          ls -lh NEON.ipa
 
       - name: Package .app for simulator (unsigned, no .ipa)
         if: env.SIMULATOR_BUILD == 'true'
         working-directory: app
         run: |
           set -euo pipefail
-          test -d dist/S5LBox.app
-          ditto -c -k --sequesterRsrc --keepParent dist/S5LBox.app S5LBox-simulator.zip
-          ls -lh S5LBox-simulator.zip
+          test -d dist/NEON.app
+          ditto -c -k --sequesterRsrc --keepParent dist/NEON.app NEON-simulator.zip
+          ls -lh NEON-simulator.zip
 
       - name: Upload .ipa
         if: env.SIMULATOR_BUILD != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.IPA_ARTIFACT }}
-          path: app/S5LBox.ipa
+          path: app/NEON.ipa
           if-no-files-found: error
 
       - name: Upload simulator .app
         if: env.SIMULATOR_BUILD == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: S5LBox-simulator-app
-          path: app/S5LBox-simulator.zip
+          name: NEON-simulator-app
+          path: app/NEON-simulator.zip
           if-no-files-found: error
