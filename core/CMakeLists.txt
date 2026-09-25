@@ -50,6 +50,7 @@ add_library(emucore STATIC
     src/soc/nand.c
     src/soc/storage.c
     src/soc/machine.c
+    src/soc/n88.c
     src/firmware/img3.c
     src/firmware/aes.c
     src/firmware/loader.c
@@ -206,6 +207,10 @@ add_test(NAME arm_interp COMMAND test_arm)
 add_executable(test_armv7 tests/test_armv7.c)
 target_link_libraries(test_armv7 PRIVATE emucore)
 add_test(NAME armv7 COMMAND test_armv7)
+
+add_executable(test_n88 tests/test_n88.c)
+target_link_libraries(test_n88 PRIVATE emucore)
+add_test(NAME n88 COMMAND test_n88)
 
 add_executable(test_vfp tests/test_vfp.c)
 target_link_libraries(test_vfp PRIVATE emucore)

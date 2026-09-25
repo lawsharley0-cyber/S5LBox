@@ -3,7 +3,8 @@
 Status on 2026-09-25: **NEON cannot run iOS 6 yet, and no amount of CPU-engine
 speed changes that.** Its kernel does now start: on a bare research machine
 (`tools/boot3gs.c`, step 4) it boots to IOKit and prints over the serial
-console, but there is no iPhone 3GS machine in the product. This document records why, what the cached-interpreter
+console, and that machine is now in the core (`core/src/soc/n88.c`), but it
+has no storage, display or input yet. This document records why, what the cached-interpreter
 work does and does not prepare, and the order of work that would get there.
 It extends `ROADMAP.md` P2 (second machine profile), which already scopes an
 iPhone 5 / iOS 8.4.1 target, rather than competing with it.
@@ -369,8 +370,22 @@ first step below.
 
    Not yet: the kernel also copies a vector-like block to physical address
    0, which this machine has no memory at (probably the reset trampoline
-   for waking the core; only sleep would use it); nothing is in the SoC
-   model yet; and what the kernel asks for next is what the next runs find.
+   for waking the core; only sleep would use it); and what the kernel asks
+   for next is what the next runs find.
+
+   **The machine moves into the core (2026-09-25).** What the harness
+   discovered is now `core/src/soc/n88.c` (`core/include/n88.h`): DRAM,
+   UART0 as a polled console, the PMGR timer, the three VICs, and bring-up
+   as iBoot does it, with `core/tests/test_n88.c` covering each on
+   synthetic inputs (no Apple bytes). `tools/boot3gs.c` is now a thin
+   reporter on top of it, so the app and the harness run the same code.
+   The machine can run on the cached interpreter (`boot3gs -e`); on this
+   kernel both engines give byte-identical console output, identical
+   registers, device-access counts and guest time at 1,000,000,000
+   instructions, and the cached interpreter reaches "Still waiting for root
+   device" within 3,000,000,000 instructions in 48.3 s of host CPU time
+   (62.1 M instructions/s, Linux x86-64 container, one run; single-stepping
+   ran about 24 M/s on the same host).
 
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
