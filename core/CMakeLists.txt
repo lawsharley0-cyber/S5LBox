@@ -1505,3 +1505,8 @@ endif()
 # than by anything in this repo. See tools/arm_diff_probe.c.
 add_executable(arm_diff_probe ../tools/arm_diff_probe.c)
 target_link_libraries(arm_diff_probe PRIVATE emucore)
+
+# iPhone 3GS / iOS 6 bring-up research harness: runs the user's kernelcache on
+# a bare Cortex-A8 machine and logs every device access (tools/boot3gs.c).
+add_executable(boot3gs ../tools/boot3gs.c)
+target_link_libraries(boot3gs PRIVATE emucore)

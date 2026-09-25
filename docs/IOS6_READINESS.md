@@ -1,7 +1,9 @@
 # iOS 6 readiness
 
-Status on 2026-09-25: **S5LBox cannot run iOS 6, and no amount of CPU-engine
-speed changes that.** This document records why, what the cached-interpreter
+Status on 2026-09-25: **NEON cannot run iOS 6 yet, and no amount of CPU-engine
+speed changes that.** Its kernel does now start: on a bare research machine
+(`tools/boot3gs.c`, step 4) it boots to IOKit and prints over the serial
+console, but there is no iPhone 3GS machine in the product. This document records why, what the cached-interpreter
 work does and does not prepare, and the order of work that would get there.
 It extends `ROADMAP.md` P2 (second machine profile), which already scopes an
 iPhone 5 / iOS 8.4.1 target, rather than competing with it.
@@ -284,6 +286,55 @@ first step below.
    The nearest milestone, the kernel's first console line, needs the CPU
    pieces above plus the VIC, a timer source, a UART and `pmgr`; the rest
    waits for the boot to ask for it, as it did on the current machine.
+
+   **First console line reached (2026-09-25).** `tools/boot3gs.c` is a
+   research harness, not a machine model: it loads the user's decrypted
+   6.1.6 kernelcache and device tree into 256 MB of DRAM at `0x40000000`
+   (the kernel is linked at `0x80000000`; `/arm-io` puts devices at
+   physical `0x80000000` and up), fills in what iBoot would (`/memory`, the
+   clock frequencies, `/pram`, the memory-map entries, `boot_args`), starts
+   the Cortex-A8 profile at the entry point with the MMU off, and logs every
+   device access, exception and UART byte. Two things stood between the
+   kernel and its console, each found by running it:
+
+   - `boot_args.Version` must be **5**. `pe_identify_machine` (0x8027ace0)
+     loads it and panics "Epoch Mismatch" otherwise. iPhone OS 3's kernel
+     wants 6.
+   - `/pram:reg` must name real memory of at least 16 KB. The platform
+     expert maps it for its panic log (0x8027ba54) and faulted on the
+     template's {0, 0}. The harness reserves the top 1 MB of DRAM for it,
+     with `boot_args.memSize` stopping below.
+
+   With those, the kernel (`xnu-2107.7.55.2.2~1/RELEASE_ARM_S5L8920X`) turns
+   its MMU on, maps UART0 and configures it exactly as the S5L8900's
+   Samsung UART is configured (ULCON 3, UCON 0x405, UBRDIV 0x80019, FIFOs
+   on), starts IOKit and loads corecrypto, whose eight FIPS self-tests
+   (integrity, AES-CBC, TDES-CBC, SHA, HMAC, ECDSA, DRBG) all pass on the
+   emulated Cortex-A8 with NEON. The devices it has touched, in order, and
+   what the kernel's own code says about them:
+
+   | Device | Where | What the kernel does |
+   |---|---|---|
+   | UART0 | `0x82500000` | polled console output (`_serial_init`) |
+   | PMGR timer | `0xbf100200` | +0x200/+0x204 a 64-bit count read high/low/high (0x800895a4); +0x208 a decrementer, written with an interval and read back as what remains (0x800895d0, 0x800895dc); +0x220 control, bit 0 enable, bit 1 written to acknowledge |
+   | VIC0 | `0xbf200000` | line 6 (the timer) selected as FIQ and enabled (0x8027b4f8) |
+
+   The timer's interrupt reaches the kernel through the FIQ vector's
+   `mov pc, r9` into a fast path (0x8008958c) that acknowledges it and
+   re-arms; its first interval is `0x3a975` = 240,000 ticks, 10 ms at the
+   24 MHz timebase the harness advertises. Modelled that way (count =
+   retired instructions / 25, i.e. a 600 MHz core; the existing PL192
+   model for the VICs), the kernel takes its timer interrupts and keeps
+   going: 3 billion instructions, 5.0 s of guest time, 33 interrupts, no
+   panic, still inside IOKit. The harness runs the reference interpreter
+   one step at a time with its own checks, 3 billion instructions in 131.7 s
+   on this host (about 23 M instructions/s); that is the harness's speed,
+   not the product's.
+
+   Not yet: the kernel also copies a vector-like block to physical address
+   0, which this machine has no memory at (probably the reset trampoline
+   for waking the core; only sleep would use it); nothing is in the SoC
+   model yet; and what the kernel asks for next is what the next runs find.
 
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
