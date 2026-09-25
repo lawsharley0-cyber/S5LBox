@@ -341,6 +341,160 @@ static uint16_t gen_thumb(unsigned idx, unsigned len, bool *pair) {
     }
 }
 
+/* ------------------------------------------------------ Thumb-2 gen --- */
+
+/*
+ * ARMv7 Thumb for the Cortex-A8 profile: the ARM1176 generator's 16-bit
+ * forms (less its BL halves, which are 32-bit here), IT with every
+ * condition and mask, CBZ/CBNZ, the hints, and 32-bit instructions from
+ * every encoding group with random low bits. Registers come from reg_field(),
+ * so PC and SP turn up in every operand position and the engine has to agree
+ * with the reference about each refusal too. Returns the halfwords written.
+ */
+static uint16_t t2_reg4(void) { return (uint16_t)reg_field(); }
+
+static unsigned gen_thumb2(unsigned idx, unsigned len, uint16_t *h) {
+    const int32_t fwd = (int32_t)rnd_n(len + 4u) - (int32_t)idx - 2;  /* halfwords */
+    switch (rnd_n(24u)) {
+    case 0: case 1: case 2: case 3: case 4: case 5: {
+        bool pair;
+        uint16_t t = gen_thumb(idx, len, &pair);
+        if (pair) t = (uint16_t)(0xe000u | ((uint32_t)fwd & 0x7ffu));   /* B instead */
+        h[0] = t;
+        return 1u;
+    }
+    case 6: {                                           /* IT, any cond and mask */
+        unsigned first = rnd_n(chance(90) ? 14u : 16u), mask = 1u + rnd_n(15u);
+        h[0] = (uint16_t)(0xbf00u | (first << 4) | mask);
+        return 1u;
+    }
+    case 7:                                             /* CBZ/CBNZ, hints */
+        if (chance(60)) {
+            uint32_t off = rnd_n(64u);                  /* halfwords, forward */
+            h[0] = (uint16_t)(0xb100u | (rnd_n(2u) << 11) | ((off >> 5) << 9) |
+                              ((off & 0x1fu) << 3) | rnd_n(8u));
+        } else {
+            h[0] = (uint16_t)(0xbf00u | (rnd_n(chance(90) ? 5u : 16u) << 4));
+        }
+        return 1u;
+    case 8: case 9: {                                   /* DP modified immediate */
+        h[0] = (uint16_t)(0xf000u | (rnd_n(2u) << 10) | (rnd_n(16u) << 5) |
+                          (rnd_n(2u) << 4) | t2_reg4());
+        h[1] = (uint16_t)((rnd() & 0x7000u) | (t2_reg4() << 8) | (rnd() & 0xffu));
+        return 2u;
+    }
+    case 10: {                                          /* plain immediate */
+        static const uint8_t ops[] = { 0x00, 0x04, 0x0a, 0x0c, 0x10, 0x12, 0x14,
+                                       0x16, 0x18, 0x1a, 0x1c };
+        unsigned op = ops[rnd_n((uint32_t)sizeof ops)];
+        h[0] = (uint16_t)(0xf200u | (rnd_n(2u) << 10) | (op << 4) | t2_reg4());
+        h[1] = (uint16_t)((rnd() & 0x70ffu) | (t2_reg4() << 8));
+        if (op >= 0x10u) h[1] &= (uint16_t)~0x20u;
+        return 2u;
+    }
+    case 11: case 12: {                                 /* DP shifted register */
+        h[0] = (uint16_t)(0xea00u | (rnd_n(16u) << 5) | (rnd_n(2u) << 4) | t2_reg4());
+        h[1] = (uint16_t)((rnd() & 0x70f0u) | (t2_reg4() << 8) | t2_reg4());
+        return 2u;
+    }
+    case 13: case 14: {                                 /* load/store single */
+        unsigned form = rnd_n(4u), size = rnd_n(chance(90) ? 3u : 4u);
+        bool load = chance(60), sgn = load && size < 2u && chance(30);
+        h[0] = (uint16_t)(0xf800u | (sgn ? 0x100u : 0u) | (size << 5) |
+                          (load ? 0x10u : 0u) | (form == 0u ? 0x80u : 0u) |
+                          (chance(8) ? 15u : t2_reg4()));
+        uint16_t lo;
+        switch (form) {
+            case 0:  lo = (uint16_t)(rnd() & 0xfffu); break;              /* imm12 */
+            case 1:  lo = (uint16_t)(0x800u | (rnd() & 0x7ffu)); break;   /* imm8  */
+            case 2:  lo = (uint16_t)((rnd_n(4u) << 4) | t2_reg4()); break; /* reg */
+            default: lo = (uint16_t)(rnd() & 0xfffu); break;
+        }
+        h[1] = (uint16_t)((t2_reg4() << 12) | lo);
+        return 2u;
+    }
+    case 15: {                                          /* LDM/STM, PUSH/POP.W */
+        h[0] = (uint16_t)(0xe800u | ((1u + rnd_n(2u)) << 7) | (rnd_n(2u) << 5) |
+                          (rnd_n(2u) << 4) | (chance(40) ? 13u : t2_reg4()));
+        h[1] = (uint16_t)(rnd() & (chance(80) ? 0x5fffu : 0xffffu));
+        return 2u;
+    }
+    case 16: {                                          /* dual, exclusive, TBB */
+        h[0] = (uint16_t)(0xe840u | (rnd_n(4u) << 7) | (rnd_n(2u) << 5) |
+                          (rnd_n(2u) << 4) | t2_reg4());
+        h[1] = (uint16_t)((t2_reg4() << 12) | (t2_reg4() << 8) | (rnd() & 0xffu));
+        if (chance(30)) h[1] = (uint16_t)(0xf000u | (rnd_n(2u) << 4) | rnd_n(8u));  /* TBB/TBH */
+        return 2u;
+    }
+    case 17: {                                          /* branches */
+        const uint32_t off = (uint32_t)fwd * 2u;        /* bytes, from pc + 4 - 4 */
+        const uint32_t S = (off >> 24) & 1u, I1 = (off >> 23) & 1u, I2 = (off >> 22) & 1u;
+        switch (rnd_n(4u)) {
+        case 0: case 1: {                               /* B.W / BL / BLX */
+            static const uint16_t op1[] = { 0x9000u, 0xd000u, 0xc000u };
+            unsigned k = rnd_n(3u);
+            h[0] = (uint16_t)(0xf000u | (S << 10) | ((off >> 12) & 0x3ffu));
+            h[1] = (uint16_t)(op1[k] | (((I1 ^ S) ^ 1u) << 13) | (((I2 ^ S) ^ 1u) << 11) |
+                              ((off >> 1) & 0x7ffu));
+            if (k == 2u) h[1] &= (uint16_t)~1u;          /* BLX: H must be 0 */
+            break;
+        }
+        default:                                        /* B<c>.W */
+            h[0] = (uint16_t)(0xf000u | (((off >> 20) & 1u) << 10) | (rnd_n(14u) << 6) |
+                              ((off >> 12) & 0x3fu));
+            h[1] = (uint16_t)(0x8000u | (((off >> 18) & 1u) << 13) |
+                              (((off >> 19) & 1u) << 11) | ((off >> 1) & 0x7ffu));
+            break;
+        }
+        return 2u;
+    }
+    case 18: {                                          /* system */
+        switch (rnd_n(6u)) {
+            case 0:  h[0] = (uint16_t)(0xf3efu | (rnd_n(2u) << 4));
+                     h[1] = (uint16_t)(0x8000u | (t2_reg4() << 8)); break;        /* MRS */
+            case 1:  h[0] = (uint16_t)(0xf380u | (rnd_n(2u) << 4) | t2_reg4());
+                     h[1] = (uint16_t)(0x8000u | (rnd_n(16u) << 8)); break;        /* MSR */
+            case 2:  h[0] = 0xf3afu;
+                     h[1] = (uint16_t)(0x8000u | (rnd_n(4u) << 9) | (rnd_n(2u) << 8) |
+                                       (rnd_n(8u) << 5) | (chance(50) ? ARM_MODE_SYS : rnd_n(32u)));
+                     break;                                                        /* CPS */
+            case 3:  h[0] = 0xf3afu;
+                     h[1] = (uint16_t)(0x8000u | rnd_n(chance(90) ? 5u : 256u)); break; /* hints */
+            case 4:  h[0] = 0xf3bfu;
+                     h[1] = (uint16_t)(0x8f00u | (rnd_n(8u) << 4) | rnd_n(16u)); break; /* barriers */
+            default: h[0] = (uint16_t)(0xf380u | (rnd() & 0x7fu));
+                     h[1] = (uint16_t)(0x8000u | (rnd() & 0x7fffu)); break;
+        }
+        return 2u;
+    }
+    case 19: case 20: {                                 /* DP register */
+        h[0] = (uint16_t)(0xfa00u | (rnd_n(16u) << 4) | t2_reg4());
+        h[1] = (uint16_t)((chance(95) ? 0xf000u : (rnd() & 0xf000u)) | (t2_reg4() << 8) |
+                          (rnd_n(16u) << 4) | t2_reg4());
+        return 2u;
+    }
+    case 21: {                                          /* multiplies */
+        h[0] = (uint16_t)(0xfb00u | (rnd_n(16u) << 4) | t2_reg4());
+        h[1] = (uint16_t)((t2_reg4() << 12) | (t2_reg4() << 8) |
+                          ((chance(70) ? 0u : rnd_n(16u)) << 4) | t2_reg4());
+        return 2u;
+    }
+    case 22: {                                          /* VFP in Thumb state */
+        uint32_t w = gen_arm(idx, len) & 0x0fffffffu;
+        if ((w & 0x0c000e00u) != 0x0c000a00u)            /* want cp10/cp11 */
+            w = 0x0e300a00u | (rnd() & 0x00cff0efu);      /* VADD/VSUB family */
+        w |= 0xe0000000u;
+        h[0] = (uint16_t)(w >> 16);
+        h[1] = (uint16_t)w;
+        return 2u;
+    }
+    default:                                            /* anything 32-bit */
+        h[0] = (uint16_t)(0xe800u + rnd_n(0x1800u));
+        h[1] = (uint16_t)rnd();
+        return 2u;
+    }
+}
+
 /* ------------------------------------------------------------ one case --- */
 
 typedef struct {
@@ -496,11 +650,21 @@ int main(int argc, char **argv) {
     uint64_t retired_total = 0;
     uint8_t data_init[DATA_BYTES + 0x1000u];
 
-    /* ARM, Thumb, then ARM again with the VFP-heavy mix (half as many). */
-    for (int isa = 0; isa < 3; isa++) {
-        const bool thumb = isa == 1;
+    /* ARM, Thumb, ARM again with the VFP-heavy mix (half as many), then the
+     * Cortex-A8 profile: Thumb-2, and ARM state (half as many), where ARMv7
+     * changes what an ALU write of PC and the hint space mean. */
+    for (int isa = 0; isa < 5; isa++) {
+        const bool thumb2 = isa == 3, armv7 = isa == 4;
+        const bool thumb = isa == 1 || thumb2;
         g_vfp_heavy = isa == 2;
-        const unsigned count = g_vfp_heavy ? cases / 2u : cases;
+        const unsigned count = (g_vfp_heavy || armv7) ? cases / 2u : cases;
+        const arm_arch_t arch = (thumb2 || armv7) ? ARM_ARCH_V7_A8 : ARM_ARCH_V6_ARM1176;
+        ref.cpu.arch = arch;
+        ci.cpu.arch = arch;
+        arm_ci_stats_t before;
+        arm_ci_get_stats(ci.ci, &before);
+        const uint64_t retired_before = retired_total;
+        const unsigned failures_before = failures;
         for (unsigned k = 0; k < count; k++) {
             const uint64_t case_seed = g_rng;
             const unsigned len = 1u + rnd_n(12u);
@@ -508,6 +672,12 @@ int main(int argc, char **argv) {
             unsigned nwords = 0;
             if (!thumb) {
                 for (unsigned i = 0; i < len; i++) words[nwords++] = gen_arm(i, len);
+            } else if (thumb2) {
+                uint16_t h[40];
+                unsigned nh = 0;
+                while (nh < len + 4u && nh < 36u) nh += gen_thumb2(nh, len + 4u, h + nh);
+                if (nh & 1u) h[nh++] = 0x46c0u;
+                for (unsigned i = 0; i < nh; i += 2u) words[nwords++] = h[i] | ((uint32_t)h[i + 1u] << 16);
             } else {
                 uint16_t h[40];
                 unsigned nh = 0;
@@ -554,6 +724,21 @@ int main(int argc, char **argv) {
             state_t st;
             random_state(&st, thumb);
             st.r[15] = pc0;
+            if (thumb2 || armv7) st.sctlr_extra |= ARM_SCTLR_U;  /* ARMv7: RAO */
+            if (thumb2) {
+                /* Sometimes enter with an IT block in progress (as after an
+                 * interrupt inside one), and give the SPSRs ITSTATE for
+                 * exception returns to restore. */
+                if (chance(15)) {
+                    const uint32_t it = (rnd_n(14u) << 4) | (1u + rnd_n(15u));
+                    st.cpsr |= ((it & 0xfcu) << 8) | ((it & 3u) << 25);
+                }
+                for (int i = 0; i < ARM_BANK_COUNT; i++)
+                    if (chance(20) && (st.spsr[i] & ARM_CPSR_T)) {
+                        const uint32_t it = (rnd_n(14u) << 4) | (1u + rnd_n(15u));
+                        st.spsr[i] |= ((it & 0xfcu) << 8) | ((it & 3u) << 25);
+                    }
+            }
             apply_state(&ref, &st);
             apply_state(&ci, &st);
 
@@ -572,13 +757,23 @@ int main(int argc, char **argv) {
                 failures++;
                 if (failures <= 20u) {
                     printf("MISMATCH %s case %u seed=0x%016" PRIx64 " steps=%u: %s\n",
-                           thumb ? "thumb" : g_vfp_heavy ? "arm-vfp" : "arm", k, case_seed, steps, why);
+                           thumb2 ? "thumb2" : armv7 ? "arm-v7" : thumb ? "thumb"
+                                  : g_vfp_heavy ? "arm-vfp" : "arm",
+                           k, case_seed, steps, why);
                     printf("  code @%08x:", pc0);
                     for (unsigned i = 0; i < nwords; i++) printf(" %08x", words[i]);
                     printf("\n  cpsr0=%08x sctlr+=%08x\n", st.cpsr, st.sctlr_extra);
                 }
             }
         }
+        arm_ci_stats_t after;
+        arm_ci_get_stats(ci.ci, &after);
+        printf("  %-7s %6u runs, %7" PRIu64 " instructions, %u mismatches; engine %" PRIu64
+               " retired (%" PRIu64 " via reference)\n",
+               thumb2 ? "thumb2" : armv7 ? "arm-v7" : thumb ? "thumb"
+                      : g_vfp_heavy ? "arm-vfp" : "arm",
+               count, retired_total - retired_before, failures - failures_before,
+               after.retired - before.retired, after.ref_retired - before.ref_retired);
     }
     arm_ci_stats_t cs;
     arm_ci_get_stats(ci.ci, &cs);

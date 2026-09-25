@@ -21,6 +21,11 @@
  * owns them. */
 arm_status_t arm_exec_arm_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn);
 arm_status_t arm_exec_thumb_insn(arm_cpu_t *c, uint32_t pc, uint16_t insn);
+/* ARMv7 only: a 32-bit Thumb instruction, both halves already fetched.
+ * arm_exec_thumb_insn() on an ARMv7 core is the 16-bit case of the same
+ * path; both keep ITSTATE exactly as arm_step() does. */
+arm_status_t arm_exec_thumb32_insn(arm_cpu_t *c, uint32_t pc, uint16_t hw1,
+                                   uint16_t hw2);
 
 /* The same for an ARM-state VFP instruction (cp10/cp11 MCR/MRC, CDP,
  * LDC/STC, MCRR/MRRC; condition field not 0xF) whose condition the caller

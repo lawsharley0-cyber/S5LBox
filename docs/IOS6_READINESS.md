@@ -31,8 +31,8 @@ first step below.
 
 | Needed for iOS 6 | Exists today | Cached interpreter impact |
 |---|---|---|
-| ARMv7 profile switch | `arm_arch_t` in `core/include/arm.h`: `ARM_ARCH_V6_ARM1176` (default), `ARM_ARCH_V7_SWIFT`, and `ARM_ARCH_V7_A8` (the 3GS). Code asks `arm_arch_is_v7()` / `arm_arch_has_divide()`, never the enum's order: the A8 is ARMv7 without the divider | Today the engine hands an ARMv7 core to `arm_step` whole (`ARM_CI_STEP_PROFILE`): correct, and as slow as the reference. Step 3 below removes that. |
-| Thumb-2 (32-bit Thumb) | **Yes, in the reference interpreter** (2026-09-25; see step 2). On the ARM1176 `0xE800..0xFFFF` still decode as the two BL/BLX halves | Largest engine change: variable-length Thumb records; a 32-bit Thumb instruction may straddle a 1 KiB fetch block, so the block builder must stop before it (the reference already fetches the second half separately); `IT` blocks carry state in CPSR (ITSTATE), so `IT` and the instructions it covers must either be REF with a block end or handled with explicit ITSTATE advance. |
+| ARMv7 profile switch | `arm_arch_t` in `core/include/arm.h`: `ARM_ARCH_V6_ARM1176` (default), `ARM_ARCH_V7_SWIFT`, and `ARM_ARCH_V7_A8` (the 3GS). Code asks `arm_arch_is_v7()` / `arm_arch_has_divide()`, never the enum's order: the A8 is ARMv7 without the divider | The engine decodes for the core it runs: ARMv7 ARM state differs in an interworking `MOV pc` and the WFI hint, both handled (step 3). |
+| Thumb-2 (32-bit Thumb) | **Yes, in the reference interpreter** (2026-09-25; see step 2). On the ARM1176 `0xE800..0xFFFF` still decode as the two BL/BLX halves | **Done (step 3, first slice).** ARMv7 Thumb blocks carry a halfword-offset table for their mixed 16/32-bit records; a 32-bit instruction that straddles a 1 KiB block ends the block before it; `IT` and the instructions it covers are REF records, and a block is never entered with ITSTATE live. |
 | NEON / VFPv3-D32 (VFPv4 on A6) | **No** (VFPv2 only) | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
 | ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.U/XP read as one, SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **No** VMSAv7 or v7 CP15 identification | Barriers are no-ops single-core but ISB/`MCR` cache maintenance must keep ending blocks (they already STOP). ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
 | Unaligned access always permitted (SCTLR.U fixed) | Handled by the reference through SCTLR | Engine fast paths already fall back on any misalignment. |
@@ -93,6 +93,38 @@ first step below.
    straddle rule, IT handling, then specialisations in order of a kernel
    census (`tools/kcensus.py`), each kept only with a fuzzer proof and a
    measured gain.
+
+   **First slice done (2026-09-25).** Before it the engine handed an ARMv7
+   core to `arm_step` one instruction at a time, and measured *slower* than
+   the plain interpreter on the `thumb2` image: 0.61-0.72x per workload
+   (`cpubench --isa thumb2 --mode svc --div 4`). Now 32-bit Thumb-2 maps onto
+   the existing specialised records wherever the operation is the same
+   (data processing with immediates and shifted registers, ADDW/SUBW/ADR,
+   MOVW, loads and stores in their immediate, register and literal forms,
+   LDM/STM/PUSH/POP, B/BL/BLX/B<c>, the multiplies and long multiplies,
+   extends, REV, CLZ, the hints and barriers) plus four new ones (Thumb
+   BL and BLX, CBZ/CBNZ, MOVT); the rest runs through the reference. Result
+   on the same image: 4.29x the interpreter, geometric mean of 21 rows (SVC
+   and User); vfp is the weak row (1.48-1.74x) because Thumb VFP is still a
+   reference record.
+
+   How it was checked: `test_ci_diff` gained a Thumb-2 pass and an ARMv7
+   ARM-state pass (0 mismatches over 4 seeds, each 20,000 + 10,000 runs, with
+   random ITSTATE at entry and in the SPSRs); `test_guest_workloads` compares
+   the engine with the interpreter on the `thumb2` image, FIQ variant
+   included; `test_armv7` covers the case the fuzzer cannot reach (an
+   exception return landing, in the same mode, on the next instruction with
+   ITSTATE live). Of ten planted engine bugs, nine were caught; the tenth
+   (IT-covered 16-bit instructions decoded as specialised records) changes
+   no result, because the ITSTATE guard in the reference path then leaves
+   the block, and it is caught together with that guard's removal. Cost to
+   the iPhone OS 3 machine in host instructions
+   (cachegrind, 7 workloads, `--div 40`): Thumb on the engine +0.40 %, ARM on
+   it -0.19 %.
+
+   Next in this step: Thumb VFP as specialised records (it needs the VFPv3
+   and NEON of step 2 before it matters for iOS 6 code), LDRD/STRD and the
+   IT-covered instructions as specialised records with explicit conditions.
 4. **SoC model** for the chosen device, then boot to the kernel's first
    console output, then userspace.
 5. SMP only if the chosen device needs it and a single-core boot-arg is not

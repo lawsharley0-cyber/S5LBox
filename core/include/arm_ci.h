@@ -68,7 +68,7 @@ typedef enum {
     ARM_CI_STEP_OTHER,          /* BKPT, undefined, CPS/SRS/RFE, reserved      */
     ARM_CI_STEP_EXCEPTION,      /* pending IRQ/FIQ/abort or invalid mode        */
     ARM_CI_STEP_FETCH,          /* PC misaligned, not in RAM, or fetch fault    */
-    ARM_CI_STEP_PROFILE,        /* not an ARM1176: the engine decodes ARMv6 only */
+    ARM_CI_STEP_IT,             /* ARMv7: entered with an IT block in progress  */
     ARM_CI_STEP_CAUSES
 } arm_ci_step_cause_t;
 

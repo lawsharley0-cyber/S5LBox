@@ -79,6 +79,7 @@ void arm_ci_destroy(arm_ci_t *ci) {
     free(ci->table);
     free(ci->blocks);
     free(ci->ops);
+    free(ci->hw);
     free(ci);
 }
 
@@ -112,6 +113,7 @@ void arm_ci_flush(arm_ci_t *ci) {
     memset(ci->code_map, 0, ((ci->regions + 31u) / 32u) * sizeof *ci->code_map);
     ci->nblocks = 0;
     ci->nops = 0;
+    ci->nhw = 0;
     ci->code_written = true;
     ci->st.flushes++;
 }
@@ -384,8 +386,98 @@ CI_INLINE uint32_t hash_slot(uint32_t pa_off, bool thumb) {
     return h & (CI_HASH_SIZE - 1u);
 }
 
+/* Register a decoded block: the code map, the hash chain, the counters. */
+static ci_block_t *finish_block(arm_ci_t *ci, arm_cpu_t *c, ci_block_t *b,
+                                ci_op_t *ops, unsigned n, uint32_t pc,
+                                uint32_t pa_off, bool thumb, uint8_t stop_cause,
+                                const uint16_t *hw) {
+    const uint32_t r = pa_off >> 10;
+    mark_code(ci, c, r);
+    b->va = pc;
+    b->pa_off = pa_off;
+    b->gen = ci->region_gen[r];
+    b->n = (uint16_t)n;
+    b->thumb = thumb ? 1u : 0u;
+    b->stop_cause = stop_cause;
+    b->ops = ops;
+    b->hw = hw;
+    ci->nblocks++;
+    ci->nops += n;
+    /* Newest first: a rebuilt (stale-generation) block shadows its old copy,
+     * which stays unreachable in the chain until the next flush. */
+    const uint32_t slot = hash_slot(pa_off, thumb);
+    b->next = ci->table[slot];
+    ci->table[slot] = b;
+    ci->st.builds++;
+    ci->st.build_ops += n;
+    return b;
+}
+
+#define CI_MAX_HW (CI_MAX_OPS + CI_MAX_BLOCKS)   /* one extra entry per block */
+
+static inline uint16_t rd16(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+/*
+ * An ARMv7 Thumb block: 16- and 32-bit instructions, so each record's PC
+ * offset goes in the halfword table. A 32-bit instruction whose second half
+ * is past the end of the 1 KiB block ends the block before it; alone at the
+ * start of a block it is arm_step's (the reference translates the second
+ * half on its own, and may take the prefetch abort). An IT and the
+ * instructions it covers become reference records (ci_decode_thumb2).
+ */
+static ci_block_t *build_thumb2(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
+                                uint32_t pc, uint32_t pa_off) {
+    if (!ci->hw && !(ci->hw = malloc(CI_MAX_HW * sizeof *ci->hw))) {
+        /* No table: an empty block, so every instruction here runs on arm_step. */
+        if (ci->nblocks >= CI_MAX_BLOCKS) arm_ci_flush(ci);
+        return finish_block(ci, c, &ci->blocks[ci->nblocks], &ci->ops[ci->nops], 0u,
+                            pc, pa_off, true, ARM_CI_STEP_OTHER, NULL);
+    }
+    if (ci->nblocks >= CI_MAX_BLOCKS || ci->nops + CI_BLOCK_MAX_OPS > CI_MAX_OPS ||
+        ci->nhw + CI_BLOCK_MAX_OPS + 1u > CI_MAX_HW)
+        arm_ci_flush(ci);
+    ci_block_t *b = &ci->blocks[ci->nblocks];
+    ci_op_t *ops = &ci->ops[ci->nops];
+    uint16_t *hw = &ci->hw[ci->nhw];
+    const uint32_t room = 0x400u - (pa_off & 0x3ffu);
+    uint32_t off = 0;
+    unsigned n = 0, it_left = 0;
+    uint8_t stop_cause = ARM_CI_STEP_OTHER;
+    while (n < CI_BLOCK_MAX_OPS && off + 2u <= room) {
+        const uint16_t hw1 = rd16(host + off);
+        const bool wide = ci_thumb_is_wide(hw1);
+        if (wide && off + 4u > room) {
+            if (n == 0u) stop_cause = ARM_CI_STEP_FETCH;
+            break;
+        }
+        const uint16_t hw2 = wide ? rd16(host + off + 2u) : 0u;
+        unsigned covers = 0;
+        const ci_dec_t d = ci_decode_thumb2(pc + off, hw1, hw2, it_left != 0u,
+                                            &covers, &ops[n]);
+        if (d == CI_DEC_STOP) {
+            stop_cause = (uint8_t)ci_stop_cause_t2(wide ? ((uint32_t)hw1 | ((uint32_t)hw2 << 16))
+                                                        : hw1);
+            break;
+        }
+        if (ops[n].kind == CI_K_REF) ops[n].sa = (uint8_t)ci_ref_class_t2(ops[n].raw);
+        hw[n] = (uint16_t)(off >> 1);
+        if (it_left) it_left--;
+        if (covers) it_left = covers;
+        n++;
+        off += wide ? 4u : 2u;
+        if (d == CI_DEC_END) break;
+    }
+    hw[n] = (uint16_t)(off >> 1);
+    ci->nhw += n + 1u;
+    return finish_block(ci, c, b, ops, n, pc, pa_off, true, stop_cause, hw);
+}
+
 static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
                          uint32_t pc, uint32_t pa_off, bool thumb) {
+    const bool v7 = arm_arch_is_v7(c->arch);
+    if (thumb && v7) return build_thumb2(ci, c, host, pc, pa_off);
     if (ci->nblocks >= CI_MAX_BLOCKS || ci->nops + CI_BLOCK_MAX_OPS > CI_MAX_OPS)
         arm_ci_flush(ci);
     ci_block_t *b = &ci->blocks[ci->nblocks];
@@ -401,9 +493,10 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
             : (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
               ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
         ci_dec_t d = thumb ? ci_decode_thumb(pc + off, (uint16_t)word, &ops[n])
-                           : ci_decode_arm(pc + off, word, &ops[n]);
+                           : ci_decode_arm(pc + off, word, v7, &ops[n]);
         if (d == CI_DEC_STOP) {
-            stop_cause = (uint8_t)ci_stop_cause(word, thumb);
+            stop_cause = (uint8_t)(v7 && !thumb ? ci_stop_cause_v7_arm(word)
+                                                : ci_stop_cause(word, thumb));
             break;
         }
         /* A reference record uses only kind and raw; its class rides in sa
@@ -413,29 +506,20 @@ static ci_block_t *build(arm_ci_t *ci, arm_cpu_t *c, const uint8_t *host,
         n++;
         if (d == CI_DEC_END) break;
     }
-    const uint32_t r = pa_off >> 10;
-    mark_code(ci, c, r);
-    b->va = pc;
-    b->pa_off = pa_off;
-    b->gen = ci->region_gen[r];
-    b->n = (uint16_t)n;
-    b->thumb = thumb ? 1u : 0u;
-    b->stop_cause = stop_cause;
-    b->ops = ops;
-    ci->nblocks++;
-    ci->nops += n;
-    /* Newest first: a rebuilt (stale-generation) block shadows its old copy,
-     * which stays unreachable in the chain until the next flush. */
-    const uint32_t slot = hash_slot(pa_off, thumb);
-    b->next = ci->table[slot];
-    ci->table[slot] = b;
-    ci->st.builds++;
-    ci->st.build_ops += n;
-    return b;
+    return finish_block(ci, c, b, ops, n, pc, pa_off, thumb, stop_cause, NULL);
 }
 
 /* Verify mode: the block's instruction words must still be RAM's. */
 static bool block_matches_ram(const ci_block_t *b, const uint8_t *host) {
+    if (b->hw) {
+        for (unsigned i = 0; i < b->n; i++) {
+            const uint8_t *p = host + ((uint32_t)b->hw[i] << 1);
+            uint32_t w = rd16(p);
+            if (ci_thumb_is_wide(w)) w |= (uint32_t)rd16(p + 2) << 16;
+            if (w != b->ops[i].raw) return false;
+        }
+        return true;
+    }
     const unsigned isz = b->thumb ? 2u : 4u;
     for (unsigned i = 0; i < b->n; i++) {
         const uint8_t *p = host + i * isz;
@@ -493,7 +577,8 @@ typedef enum { EXEC_CONTINUE, EXEC_STOP } exec_result_t;
     X(REV) X(REV16) X(REVSH) X(LDR_LIT) X(LDM) X(LDM_PC) X(STM)               \
     X(MRC_TID) X(MCR_TID) X(LDR_PC) X(JMP)                                    \
     X(VFP_DP) X(VFP_MOV) X(VFP_SYS) X(VFP_LS)                                 \
-    X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)
+    X(B) X(BL) X(TBL2) X(BX) X(BLX_R) X(BLX_I)                               \
+    X(TBL) X(TBLX) X(CBZ) X(MOVT)
 
 /* The data-processing and memory families, shared by the handlers and the
  * table: each form expands the per-opcode / per-access macro below. */
@@ -578,7 +663,10 @@ static exec_result_t exec_block(arm_ci_t *ci, arm_cpu_t *c, const ci_block_t *b,
     uint32_t next_pc = 0;
     exec_result_t result = EXEC_CONTINUE;
 
-#define PC_OF(o) (b->va + ((uint32_t)((o) - base) << shift))
+/* A record's guest PC: its index scaled, or, in an ARMv7 Thumb block, its
+ * entry in the halfword table (which has one more entry, for `end`). */
+#define PC_OF(o) (b->hw ? b->va + ((uint32_t)b->hw[(o) - base] << 1)              \
+                        : b->va + ((uint32_t)((o) - base) << shift))
 
 #if CI_THREADED
 #define LOGIC(OPC, F, B, BC, EXPR)                                              \
@@ -928,6 +1016,25 @@ top:
             next_pc = op->imm;
             op++;
             goto out;
+        CI_HK(TBL)
+            R[14] = (PC_OF(op) + 4u) | 1u;
+            next_pc = op->imm;
+            op++;
+            goto out;
+        CI_HK(TBLX)
+            R[14] = (PC_OF(op) + 4u) | 1u;
+            c->cpsr &= ~ARM_CPSR_T;
+            next_pc = op->imm;
+            op++;
+            goto out;
+        CI_HK(CBZ)
+            if ((R[op->rn] != 0u) == (op->sa != 0u)) {
+                next_pc = op->imm;
+                op++;
+                goto out;
+            }
+            CI_NEXT();
+        CI_HK(MOVT) R[op->rd] = (R[op->rd] & 0xffffu) | op->imm; CI_NEXT();
 
         CI_HK(REF)
         default:
@@ -949,9 +1056,13 @@ top:
             R[15] = pc;
             const bool vfp = op->kind == CI_K_VFP ||
                              (op->kind >= CI_K_VFP_DP && op->kind <= CI_K_VFP_LS);
-            arm_status_t st = vfp ? arm_exec_vfp_insn(c, pc, op->raw)
-                            : b->thumb ? arm_exec_thumb_insn(c, pc, (uint16_t)op->raw)
-                                       : arm_exec_arm_insn(c, pc, op->raw);
+            arm_status_t st;
+            if (vfp) st = arm_exec_vfp_insn(c, pc, op->raw);
+            else if (!b->thumb) st = arm_exec_arm_insn(c, pc, op->raw);
+            else if (b->hw && ci_thumb_is_wide(op->raw & 0xffffu))
+                st = arm_exec_thumb32_insn(c, pc, (uint16_t)op->raw,
+                                           (uint16_t)(op->raw >> 16));
+            else st = arm_exec_thumb_insn(c, pc, (uint16_t)op->raw);
             flushed = op + 1;
             if (CI_UNLIKELY(st != ARM_OK)) {
                 *status = st;
@@ -986,9 +1097,14 @@ top:
             }
             /* Branched, or switched instruction set without branching (MSR
              * may write CPSR.T): the rest of this block was decoded for the
-             * wrong PC or the wrong state, so continue through a lookup. */
-            if (R[15] != pc + (1u << shift) ||
-                ((c->cpsr >> 5) & 1u) != b->thumb) {
+             * wrong PC or the wrong state, so continue through a lookup.
+             * The same when ITSTATE is live and the next record is not one
+             * the decoder knew an IT covers: only reference records may run
+             * inside an IT block. */
+            if (R[15] != PC_OF(op) ||
+                ((c->cpsr >> 5) & 1u) != b->thumb ||
+                (b->hw && CI_UNLIKELY(c->cpsr & ARM_CPSR_IT_MASK) &&
+                 (op == end || op->kind != CI_K_REF || !op->rd))) {
                 next_pc = R[15];
                 goto out;
             }
@@ -1014,7 +1130,8 @@ out:
         done += n;
         budget -= n;
         const bool thumb = (c->cpsr & ARM_CPSR_T) != 0u;
-        if (budget && !ci->verify && !(next_pc & (thumb ? 1u : 3u))) {
+        if (budget && !ci->verify && !(next_pc & (thumb ? 1u : 3u)) &&
+            !((c->cpsr & ARM_CPSR_IT_MASK) && thumb && arm_arch_is_v7(c->arch))) {
             const ci_fast_t *f = &ci->fast[fast_slot(next_pc)];
             const ci_block_t *nb = f->b;
             if (nb && f->va == next_pc && f->ctx == ((thumb ? 1u : 0u) | (priv ? 2u : 0u)) &&
@@ -1052,6 +1169,13 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
     if (!g_cond_ready) cond_table_init();
     if (!ci || !c || !budget) goto done;
     ci->st.runs++;
+    /* Blocks are decoded for one core: a different arch (a host reusing an
+     * engine) makes every one of them suspect. Before code_written is
+     * cleared, which a flush sets. */
+    if (CI_UNLIKELY(c->arch != ci->arch)) {
+        if (ci->nblocks) arm_ci_flush(ci);
+        ci->arch = c->arch;
+    }
     ci->code_written = false;
 
     /* Direct host mutation of the translation registers is only noticed by a
@@ -1075,16 +1199,8 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         goto done;
     }
 
-    /* The engine's decoder is the ARM1176's. An ARMv7 core would need
-     * Thumb-2 and the IT block in it, and gets every instruction from
-     * arm_step instead: slower, never wrong. */
-    if (c->arch != ARM_ARCH_V6_ARM1176) {
-        stop_local = ARM_CI_STOP_STEP;
-        ci->st.step_cause[ARM_CI_STEP_PROFILE]++;
-        goto done;
-    }
-
     const bool priv = (c->cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
+    const bool v7 = arm_arch_is_v7(c->arch);
     const uint8_t *const ram = ci->cfg.ram;
     const uint8_t *const ram_end = ram + ci->cfg.ram_size;
 
@@ -1094,6 +1210,15 @@ unsigned arm_ci_run(arm_ci_t *ci, arm_cpu_t *c, unsigned budget,
         if (pc & (thumb ? 1u : 3u)) {
             stop_local = ARM_CI_STOP_STEP;
             ci->st.step_cause[ARM_CI_STEP_FETCH]++;
+            break;
+        }
+        /* ARMv7: blocks are decoded as if no IT block were in progress.
+         * Entering one inside an IT block (an interrupt returned into it, or
+         * a run ended in it) is arm_step's until ITSTATE runs out. On the
+         * ARM1176 these CPSR bits are reserved and mean nothing. */
+        if (CI_UNLIKELY(c->cpsr & ARM_CPSR_IT_MASK) && thumb && v7) {
+            stop_local = ARM_CI_STOP_STEP;
+            ci->st.step_cause[ARM_CI_STEP_IT]++;
             break;
         }
         const uint32_t ctx = (thumb ? 1u : 0u) | (priv ? 2u : 0u);
@@ -1190,7 +1315,7 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
         "Runs: %s (budget %s, step %s, event %s, status %s)\n"
         "Blocks: %s run, %s built, %s stale, %s invalidations, %s flushes\n"
         "Handed to arm_step: SVC %s, CP15 c13 %s, WFI %s, CP15 %s, CP14 %s, "
-        "other %s, interrupt/abort %s, fetch %s, not ARMv6 %s\n",
+        "other %s, interrupt/abort %s, fetch %s, inside IT %s\n",
         qty(q[0], st->retired),
         total_retired ? " (" : "", pct(st->retired, total_retired),
         total_retired ? " of all)" : "",
@@ -1206,7 +1331,7 @@ size_t arm_ci_describe_stats(const arm_ci_stats_t *st, uint64_t total_retired,
         qty(q[8], sc[ARM_CI_STEP_WFI]), qty(q[9], sc[ARM_CI_STEP_CP15]),
         qty(q[10], sc[ARM_CI_STEP_CP14]), qty(q[11], sc[ARM_CI_STEP_OTHER]),
         qty(q[12], sc[ARM_CI_STEP_EXCEPTION]), qty(q[13], sc[ARM_CI_STEP_FETCH]),
-        qty(q[19], sc[ARM_CI_STEP_PROFILE]));
+        qty(q[19], sc[ARM_CI_STEP_IT]));
     if (w < 0) return 0;
     size_t len = (size_t)w < cap ? (size_t)w : cap - 1u;
     w = snprintf(out + len, cap - len,

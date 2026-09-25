@@ -490,33 +490,138 @@ static void test_wfi_hint_waits_when_privileged(void) {
     }
 }
 
-static void test_cached_interpreter_hands_armv7_to_the_reference(void) {
+/* One arm_ci_run over a fresh engine; returns the number retired. */
+static unsigned ci_run_once(arm_cpu_t *c, unsigned budget, arm_ci_stop_t *stop,
+                            arm_ci_stats_t *s) {
     arm_ci_config_t cfg = { .ram = g_ram, .ram_base = 0, .ram_size = RAM_SIZE };
-    static const arm_arch_t BOTH[] = { ARM_ARCH_V6_ARM1176, ARM_ARCH_V7_A8 };
-    for (unsigned i = 0; i < 2; i++) {
-        arm_cpu_t c;
-        boot(&c, &g_bus_fast, BOTH[i], 0, false);
-        m_w32(NULL, 0, 0xe3a00001u);                  /* MOV r0, #1 */
-        m_w32(NULL, 4, 0xe3a01002u);                  /* MOV r1, #2 */
-        arm_ci_t *ci = arm_ci_create(&cfg);
-        CHECK(ci != NULL, "arm_ci_create");
-        if (!ci) return;
-        arm_status_t st;
-        arm_ci_stop_t stop;
-        unsigned ran = arm_ci_run(ci, &c, 2u, &st, &stop);
-        arm_ci_stats_t s;
-        arm_ci_get_stats(ci, &s);
-        if (arm_arch_is_v7(BOTH[i]))
-            CHECK(ran == 0u && stop == ARM_CI_STOP_STEP &&
-                  s.step_cause[ARM_CI_STEP_PROFILE] == 1u && c.r[15] == 0u,
-                  "A8: ran %u stop %d profile %llu", ran, (int)stop,
-                  (unsigned long long)s.step_cause[ARM_CI_STEP_PROFILE]);
-        else
-            CHECK(ran == 2u && c.r[0] == 1u && c.r[1] == 2u &&
-                  s.step_cause[ARM_CI_STEP_PROFILE] == 0u,
-                  "ARM1176: ran %u r0=%u r1=%u", ran, c.r[0], c.r[1]);
-        arm_ci_destroy(ci);
+    arm_ci_t *ci = arm_ci_create(&cfg);
+    CHECK(ci != NULL, "arm_ci_create");
+    if (!ci) return 0u;
+    arm_status_t st = ARM_OK;
+    unsigned ran = arm_ci_run(ci, c, budget, &st, stop);
+    CHECK(st == ARM_OK, "engine status %d", (int)st);
+    arm_ci_get_stats(ci, s);
+    arm_ci_destroy(ci);
+    return ran;
+}
+
+static void test_cached_interpreter_runs_armv7(void) {
+    arm_ci_stop_t stop;
+    arm_ci_stats_t s;
+    arm_cpu_t c;
+
+    /* A Thumb-2 block mixing 16- and 32-bit records: MOVW r0, #0x1234;
+     * ADD.W r1, r0, #1; MOVT r0, #0xbeef; LDR.W r3, [r4, #8]; MOVS r5, #9.
+     * Every PC after the first depends on the halfword table. */
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0x100, true);
+    put16(0x100, 0xf241); put16(0x102, 0x2034);
+    put16(0x104, 0xf100); put16(0x106, 0x0101);
+    put16(0x108, 0xf6cb); put16(0x10a, 0x60ef);
+    put16(0x10c, 0xf8d4); put16(0x10e, 0x3008);
+    put16(0x110, 0x2509);
+    m_w32(NULL, 0x2008, 0x5a5a1234u);
+    c.r[4] = 0x2000u;
+    unsigned ran = ci_run_once(&c, 5u, &stop, &s);
+    CHECK(ran == 5u && c.r[15] == 0x112u, "ran %u pc=%08x", ran, c.r[15]);
+    CHECK(c.r[0] == 0xbeef1234u && c.r[1] == 0x1235u && c.r[3] == 0x5a5a1234u &&
+          c.r[5] == 9u, "r0=%08x r1=%08x r3=%08x r5=%u", c.r[0], c.r[1], c.r[3], c.r[5]);
+    CHECK(s.retired == 5u && s.ref_retired == 0u,
+          "all five specialised: retired %llu via reference %llu",
+          (unsigned long long)s.retired, (unsigned long long)s.ref_retired);
+    CHECK(c.cycles == 5u, "cycles %llu", (unsigned long long)c.cycles);
+
+    /* An IT and what it covers run through the reference, then the block
+     * goes on: IT EQ; MOVEQ r2, #7; MOVS r5, #9. */
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0x100, true);
+    put16(0x100, 0xbf08); put16(0x102, 0x2207); put16(0x104, 0x2509);
+    c.cpsr |= ARM_CPSR_Z;
+    ran = ci_run_once(&c, 3u, &stop, &s);
+    CHECK(ran == 3u && c.r[2] == 7u && c.r[5] == 9u && c.r[15] == 0x106u &&
+          (c.cpsr & ARM_CPSR_IT_MASK) == 0u,
+          "IT block: ran %u r2=%u r5=%u pc=%08x cpsr=%08x", ran, c.r[2], c.r[5],
+          c.r[15], c.cpsr);
+    CHECK(s.ref_retired == 2u, "IT and MOVEQ via reference: %llu",
+          (unsigned long long)s.ref_retired);
+
+    /* Entered with an IT block in progress: arm_step's, not the engine's. */
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0x102, true);
+    put16(0x102, 0x2207);
+    c.cpsr |= 0x08u << 8;                 /* ITSTATE 08: EQ, last instruction */
+    ran = ci_run_once(&c, 1u, &stop, &s);
+    CHECK(ran == 0u && stop == ARM_CI_STOP_STEP && s.step_cause[ARM_CI_STEP_IT] == 1u,
+          "inside IT: ran %u stop %d it-steps %llu", ran, (int)stop,
+          (unsigned long long)s.step_cause[ARM_CI_STEP_IT]);
+
+    /* ARM state: MOV pc, r0 with r0 odd interworks on the A8 (and the engine
+     * agrees with the reference); the WFI hint is left to arm_step. */
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0, false);
+    m_w32(NULL, 0, 0xe1a0f000u);
+    c.r[0] = 0x201u;
+    ran = ci_run_once(&c, 1u, &stop, &s);
+    CHECK(ran == 1u && c.r[15] == 0x200u && (c.cpsr & ARM_CPSR_T),
+          "A8 MOV pc: ran %u pc=%08x cpsr=%08x", ran, c.r[15], c.cpsr);
+    boot(&c, &g_bus_fast, ARM_ARCH_V6_ARM1176, 0, false);
+    m_w32(NULL, 0, 0xe1a0f000u);
+    c.r[0] = 0x201u;
+    ran = ci_run_once(&c, 1u, &stop, &s);
+    CHECK(ran == 1u && c.r[15] == 0x200u && !(c.cpsr & ARM_CPSR_T),
+          "ARM1176 MOV pc: ran %u pc=%08x cpsr=%08x", ran, c.r[15], c.cpsr);
+    boot(&c, &g_bus_fast, ARM_ARCH_V7_A8, 0, false);
+    m_w32(NULL, 0, 0xe320f003u);
+    ran = ci_run_once(&c, 1u, &stop, &s);
+    CHECK(ran == 0u && s.step_cause[ARM_CI_STEP_WFI] == 1u,
+          "A8 WFI hint: ran %u wfi-steps %llu", ran,
+          (unsigned long long)s.step_cause[ARM_CI_STEP_WFI]);
+}
+
+/*
+ * An exception return that lands, in the same mode, on the very next
+ * instruction with an IT block in progress: SUBS PC, LR, #0 with LR = the
+ * next instruction and SPSR_svc = SVC | T | ITSTATE (EQ, one instruction).
+ * The next instruction is a 16-bit ADDS, which outside an IT block the
+ * engine runs as a specialised record that always executes and sets flags.
+ * Inside this IT block, with Z clear, it must be skipped. The engine only
+ * gets that right by leaving the block when ITSTATE turns live under a record
+ * the decoder did not know an IT covers; this checks it against the
+ * reference, step for step.
+ */
+static void test_engine_leaves_a_block_when_itstate_turns_live(void) {
+    arm_cpu_t ref, eng;
+    for (int k = 0; k < 2; k++) {
+        arm_cpu_t *c = k ? &eng : &ref;
+        boot(c, &g_bus_fast, ARM_ARCH_V7_A8, 0x100, true);
+        put16(0x100, 0xf3de); put16(0x102, 0x8f00);     /* SUBS PC, LR, #0 */
+        put16(0x104, 0x1840);                           /* ADDS r0, r0, r1 */
+        put16(0x106, 0x2509);                           /* MOVS r5, #9     */
+        c->cpsr = (c->cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_SVC;
+        c->r[14] = 0x104u;
+        c->r[0] = 5u; c->r[1] = 7u;
+        c->spsr[arm_bank_of_mode(ARM_MODE_SVC)] =
+            ARM_MODE_SVC | ARM_CPSR_T | (c->cpsr & (ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A)) |
+            ARM_CPSR_N | (0x08u << 8);                  /* ITSTATE: EQ, last */
     }
+    for (int i = 0; i < 3; i++) arm_step(&ref);
+
+    arm_ci_config_t cfg = { .ram = g_ram, .ram_base = 0, .ram_size = RAM_SIZE };
+    arm_ci_t *ci = arm_ci_create(&cfg);
+    CHECK(ci != NULL, "arm_ci_create");
+    if (!ci) return;
+    unsigned done = 0;
+    for (int guard = 0; done < 3u && guard < 8; guard++) {
+        arm_status_t st = ARM_OK;
+        arm_ci_stop_t stop;
+        unsigned ran = arm_ci_run(ci, &eng, 3u - done, &st, &stop);
+        done += ran;
+        if (done < 3u && stop == ARM_CI_STOP_STEP) { arm_step(&eng); done++; }
+    }
+    arm_ci_destroy(ci);
+    CHECK(ref.r[0] == 5u && ref.r[5] == 9u && ref.r[15] == 0x108u,
+          "reference: ADDS skipped, r0=%u r5=%u pc=%08x", ref.r[0], ref.r[5], ref.r[15]);
+    CHECK(eng.r[0] == ref.r[0] && eng.r[5] == ref.r[5] && eng.r[15] == ref.r[15] &&
+          eng.cpsr == ref.cpsr && eng.cycles == ref.cycles,
+          "engine r0=%u r5=%u pc=%08x cpsr=%08x cycles=%llu; reference cpsr=%08x cycles=%llu",
+          eng.r[0], eng.r[5], eng.r[15], eng.cpsr, (unsigned long long)eng.cycles,
+          ref.cpsr, (unsigned long long)ref.cycles);
 }
 
 int main(void) {
@@ -537,7 +642,8 @@ int main(void) {
     test_arm_state_armv7_additions();
     test_alu_write_to_pc_interworks_on_armv7();
     test_wfi_hint_waits_when_privileged();
-    test_cached_interpreter_hands_armv7_to_the_reference();
+    test_cached_interpreter_runs_armv7();
+    test_engine_leaves_a_block_when_itstate_turns_live();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

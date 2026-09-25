@@ -12,11 +12,14 @@
 
 /* ------------------------------------------------------------ op records ---
  *
- * One record per guest instruction (a Thumb BL pair is two), 16 bytes, stored
- * contiguously per block in a pooled arena: no allocation per instruction.
- * The guest PC of a record is implied by its index (block va + i*4 or i*2),
- * so it is not stored. `raw` keeps the instruction word for reference
- * fallback and for verify mode.
+ * One record per guest instruction (a Thumb BL pair is two on the ARM1176,
+ * one on ARMv7), 16 bytes, stored contiguously per block in a pooled arena:
+ * no allocation per instruction. For ARM and ARM1176 Thumb blocks the guest PC
+ * of a record is implied by its index (block va + i*4 or i*2), so it is not
+ * stored; ARMv7 Thumb mixes 16- and 32-bit instructions, and its blocks carry
+ * a table of halfword offsets instead (ci_block_t.hw). `raw` keeps the
+ * instruction for reference fallback and for verify mode: a 32-bit Thumb
+ * instruction as hw1 | hw2 << 16.
  */
 typedef struct ci_op {
     uint8_t  kind;   /* CI_K_* below                                        */
@@ -104,6 +107,11 @@ enum {
     CI_K_BX,           /* target = rm; bit 0 selects Thumb                   */
     CI_K_BLX_R,        /* as BX, LR = imm (precomputed return address)       */
     CI_K_BLX_I,        /* ARM BLX imm: LR = pc + 4, enter Thumb at imm       */
+    /* ARMv7 Thumb. */
+    CI_K_TBL,          /* 32-bit BL: LR = (pc + 4) | 1, target imm           */
+    CI_K_TBLX,         /* 32-bit BLX imm: as TBL, and enter ARM state        */
+    CI_K_CBZ,          /* CBZ/CBNZ rn: branch to imm when (rn != 0) == sa    */
+    CI_K_MOVT,         /* rd = (rd & 0xffff) | imm (imm already << 16)       */
     CI_K_DP,
     CI_K_DP_END = CI_K_DP + 16 * 4 * 2,
     CI_K_MEM = CI_K_DP_END,
@@ -133,6 +141,9 @@ typedef struct ci_block {
     uint8_t  stop_cause; /* arm_ci_step_cause_t of the instruction that ended
                             decoding with CI_DEC_STOP (meaningful when n == 0) */
     ci_op_t *ops;
+    /* ARMv7 Thumb only (NULL otherwise): hw[i] is record i's offset from va
+     * in halfwords, and hw[n] the offset just past the last instruction. */
+    const uint16_t *hw;
 } ci_block_t;
 
 /* How a decode ended, for the caller that builds blocks. */
@@ -142,17 +153,30 @@ typedef enum {
     CI_DEC_STOP        /* nothing written: must run through arm_step         */
 } ci_dec_t;
 
-/* Decode one instruction at guest `pc` into *op. arch selects ARMv6/v7
- * encodings exactly as the reference does (currently only for MOVW/MOVT,
- * which stay reference-executed). */
-ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op);
+/* Decode one instruction at guest `pc` into *op, for the ARM1176 or, with
+ * `v7`, for an ARMv7 core, whose ARM state differs in two places the engine
+ * specialises (an ALU write of PC interworks; WFI is a hint that waits). */
+ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, bool v7, ci_op_t *op);
+/* ARM1176 Thumb: one halfword. */
 ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op);
+/* ARMv7 Thumb: hw1, and hw2 when hw1 starts a 32-bit instruction.
+ * `in_it`: an IT earlier in this block covers the instruction, which then
+ * runs through the reference (it keeps ITSTATE). *it_covers is set to the
+ * number of instructions an IT decoded here covers, else left alone. */
+ci_dec_t ci_decode_thumb2(uint32_t pc, uint16_t hw1, uint16_t hw2, bool in_it,
+                          unsigned *it_covers, ci_op_t *op);
+static inline bool ci_thumb_is_wide(uint32_t hw1) { return (hw1 >> 11) >= 0x1du; }
 
 /* Diagnostics: why an instruction that decoded to CI_DEC_STOP must run on
  * arm_step (arm_ci_step_cause_t), and the class of one that decoded to
  * CI_K_REF (arm_ci_ref_class_t). Build-time only. */
 unsigned ci_stop_cause(uint32_t insn, bool thumb);
 unsigned ci_ref_class(uint32_t insn, bool thumb);
+/* The same for an ARMv7 Thumb instruction (raw as in ci_op_t) and, for
+ * ci_stop_cause_v7_arm, an ARMv7 ARM one. */
+unsigned ci_stop_cause_t2(uint32_t raw);
+unsigned ci_ref_class_t2(uint32_t raw);
+unsigned ci_stop_cause_v7_arm(uint32_t insn);
 
 /* --------------------------------------------------------- engine state --- */
 
@@ -192,6 +216,10 @@ struct arm_ci {
     uint32_t     nblocks;
     ci_op_t     *ops;          /* pool                                         */
     uint32_t     nops;
+    uint16_t    *hw;           /* pool of ARMv7 Thumb PC offsets; allocated on
+                                  the first such block                         */
+    uint32_t     nhw;
+    arm_arch_t   arch;         /* the core the cached blocks were decoded for  */
 
     ci_tlb_t rtlb[CI_TLB_ENTRIES];
     ci_tlb_t wtlb[CI_TLB_ENTRIES];

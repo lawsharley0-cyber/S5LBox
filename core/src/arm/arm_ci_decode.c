@@ -85,7 +85,7 @@ static ci_dec_t decode_block(uint32_t insn, ci_op_t *op) {
     return block_transfer(op, L, rn, list, start, delta);
 }
 
-static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
+static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, bool v7, ci_op_t *op) {
     unsigned opc = (insn >> 21) & 0xfu;
     unsigned S   = (insn >> 20) & 1u;
     unsigned rn  = (insn >> 16) & 0xfu;
@@ -115,6 +115,14 @@ static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
             op->kind = CI_K_MRS_CPSR; op->rd = (uint8_t)rd;
             return CI_DEC_OP;
         }
+        /* ARMv7 hints are MSR-immediate encodings with an empty mask.
+         * WFI waits for an interrupt, which advances device time, so it is
+         * arm_step's; the others are no-ops in the reference. */
+        if (v7 && (insn & 0x0fffff00u) == 0x0320f000u) {
+            if ((insn & 0xffu) == 3u) return CI_DEC_STOP;
+            op->kind = CI_K_NOP;
+            return CI_DEC_OP;
+        }
         return ref(op, false);        /* MSR, MRS SPSR, QADD..., MOVW/MOVT */
     }
 
@@ -123,7 +131,9 @@ static ci_dec_t decode_dp(uint32_t pc, uint32_t insn, ci_op_t *op) {
          * (ARM state, S clear). Every other form stays reference. */
         const unsigned rm = insn & 0xfu;
         if (opc == 13u && !S && !I && (insn & 0xff0u) == 0u && rm != 15u) {
-            op->kind = CI_K_JMP; op->rm = (uint8_t)rm; op->imm = 0u;
+            /* ARMv7's ALUWritePC interworks in ARM state: BX exactly,
+             * including its refusal of a target with bits 1:0 == 10. */
+            op->kind = v7 ? CI_K_BX : CI_K_JMP; op->rm = (uint8_t)rm; op->imm = 0u;
             return CI_DEC_END;
         }
         return ref(op, true);
@@ -343,7 +353,7 @@ static ci_dec_t decode_vfp(uint32_t pc, uint32_t insn, ci_op_t *op) {
     return CI_DEC_OP;
 }
 
-ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
+ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, bool v7, ci_op_t *op) {
     memset(op, 0, sizeof *op);
     op->raw = insn;
     op->cond = (uint8_t)(insn >> 28);
@@ -370,7 +380,7 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         (insn & 0x01900000u) != 0x01000000u &&
         !((insn & 0x0e000000u) == 0x00000000u &&
           (insn & 0x00000090u) == 0x00000090u))
-        return decode_dp(pc, insn, op);
+        return decode_dp(pc, insn, v7, op);
 
     if ((insn & 0x0e000000u) == 0x0a000000u) {            /* B / BL */
         int32_t off = (int32_t)(insn << 8) >> 6;
@@ -413,6 +423,9 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
     if ((insn & 0x0fb00ff0u) == 0x01000090u ||            /* SWP/SWPB */
         (insn & 0x0f800ff0u) == 0x01800f90u)              /* LDREX/STREX family */
         return ref(op, false);
+    if ((insn & 0x0ff000f0u) == 0x00400090u ||            /* UMAAL */
+        (v7 && (insn & 0x0ff000f0u) == 0x00600090u))      /* MLS (ARMv6T2) */
+        return ref(op, false);
     if ((insn & 0x0e000000u) == 0x00000000u &&
         (insn & 0x00000090u) == 0x00000090u)
         return CI_DEC_STOP;                               /* reserved: UNDEFINED */
@@ -448,7 +461,7 @@ ci_dec_t ci_decode_arm(uint32_t pc, uint32_t insn, ci_op_t *op) {
         (insn & 0x0e000e00u) == 0x0c000a00u)              /* VFP LDC/STC/MCRR */
         return decode_vfp(pc, insn, op);
     if ((insn & 0x0f000000u) == 0x0f000000u) return CI_DEC_STOP;       /* SVC */
-    if ((insn & 0x0c000000u) == 0x00000000u) return decode_dp(pc, insn, op);
+    if ((insn & 0x0c000000u) == 0x00000000u) return decode_dp(pc, insn, v7, op);
     return CI_DEC_STOP;
 }
 
@@ -673,6 +686,387 @@ ci_dec_t ci_decode_thumb(uint32_t pc, uint16_t insn, ci_op_t *op) {
 
 #undef TB
 
+/* ----------------------------------------------------- ARMv7 Thumb --- */
+
+/*
+ * The ARMv7 Thumb decoder. What it specialises it maps onto the records the
+ * ARM and ARM1176 Thumb decoders already produce wherever the operation is
+ * the same, so the executor's handlers (and their fallbacks) are shared: the
+ * data-processing, memory and block-transfer families, the multiplies, the
+ * extends and byte reverses, B with a condition, LDR literal. What it cannot
+ * express exactly -- ORN, PKH, bit-field and saturating ops, LDRD/STRD, the
+ * exclusives, TBB/TBH, anything with PC in an unusual place, anything the
+ * reference refuses -- is a CI_K_REF record, and the reference decides.
+ *
+ * Every instruction an IT covers, and the IT itself, is a reference record:
+ * the reference keeps ITSTATE exactly, and a specialised record never runs
+ * with ITSTATE set (the engine also refuses to enter a block inside an IT
+ * block; see arm_ci_run). Such records are marked rd = 1, which the executor
+ * uses to leave the block if ITSTATE turns out live anywhere else.
+ */
+
+static uint32_t t2_raw(uint16_t hw1, uint16_t hw2) {
+    return (uint32_t)hw1 | ((uint32_t)hw2 << 16);
+}
+
+/* Must run on arm_step: CP14/CP15 in any form, and WFI (it waits, which
+ * advances device time). SVC is 16-bit only and handled by ci_decode_thumb. */
+static bool t2_must_stop(uint16_t hw1, uint16_t hw2) {
+    if ((hw1 & 0xec00u) == 0xec00u) {                     /* coprocessor space */
+        const unsigned cp = (hw2 >> 8) & 0xfu;
+        return (hw1 & 0xef00u) != 0xef00u && (cp == 14u || cp == 15u);
+    }
+    return hw1 == 0xf3afu && hw2 == 0x8003u;              /* WFI.W */
+}
+
+/* Thumb data-processing opcode (hw1[8:5], both immediate and register
+ * forms) to the ARM opcode the DP records use, or -1 when there is none:
+ * ORN has no ARM form, and PKH lives in the same space. rd == 15 with S is
+ * the test form of AND/EOR/ADD/SUB; rn == 15 the move form of ORR/ORN. */
+static int t2_dp_opcode(unsigned op, bool test, bool move) {
+    switch (op) {
+        case 0x0: return test ? 8 : 0;          /* TST / AND */
+        case 0x1: return 14;                    /* BIC       */
+        case 0x2: return move ? 13 : 12;        /* MOV / ORR */
+        case 0x3: return move ? 15 : -1;        /* MVN / ORN */
+        case 0x4: return test ? 9 : 1;          /* TEQ / EOR */
+        case 0x8: return test ? 11 : 4;         /* CMN / ADD */
+        case 0xa: return 5;                     /* ADC       */
+        case 0xb: return 6;                     /* SBC       */
+        case 0xd: return test ? 10 : 2;         /* CMP / SUB */
+        case 0xe: return 3;                     /* RSB       */
+        default:  return -1;
+    }
+}
+
+static ci_dec_t t2_dp(ci_op_t *op, uint16_t hw1, uint16_t hw2, bool imm_form,
+                      uint32_t imm, bool rotated) {
+    const unsigned op4 = (hw1 >> 5) & 0xfu, S = (hw1 >> 4) & 1u;
+    const unsigned rn = hw1 & 0xfu, rd = (hw2 >> 8) & 0xfu, rm = hw2 & 0xfu;
+    const bool test = rd == 15u && S &&
+                      (op4 == 0x0u || op4 == 0x4u || op4 == 0x8u || op4 == 0xdu);
+    const bool move = rn == 15u && (op4 == 0x2u || op4 == 0x3u);
+    const int opc = t2_dp_opcode(op4, test, move);
+    if (opc < 0 || (rd == 15u && !test) || (rn == 15u && !move))
+        return ref(op, false);
+    unsigned form = CI_F_IMM;
+    if (imm_form) {
+        op->imm = imm;
+        if (rotated) { op->sa = 1u; op->sh = (uint8_t)(imm >> 31); }
+    } else {
+        const unsigned imm5 = ((hw2 >> 10) & 0x1cu) | ((hw2 >> 6) & 3u);
+        if (rm == 15u) return ref(op, false);
+        form = norm_imm_shift((hw2 >> 4) & 3u, imm5, &op->sh, &op->sa) ? CI_F_SHI
+                                                                       : CI_F_REG;
+        op->rm = (uint8_t)rm;
+    }
+    op->kind = CI_DP_KIND((unsigned)opc, form, S);
+    op->rd = (uint8_t)(test ? 0u : rd);
+    op->rn = (uint8_t)(move ? 0u : rn);
+    return CI_DEC_OP;
+}
+
+/* ThumbExpandImm_C. False for the UNPREDICTABLE zero replications. */
+static bool t2_expand_imm(uint32_t imm12, uint32_t *out, bool *rotated) {
+    const uint32_t imm8 = imm12 & 0xffu;
+    *rotated = (imm12 & 0xc00u) != 0u;
+    if (*rotated) {
+        *out = ror32(0x80u | (imm12 & 0x7fu), (imm12 >> 7) & 0x1fu);
+        return true;
+    }
+    switch ((imm12 >> 8) & 3u) {
+        case 0:  *out = imm8; return true;
+        case 1:  *out = imm8 | (imm8 << 16); break;
+        case 2:  *out = (imm8 << 8) | (imm8 << 24); break;
+        default: *out = imm8 * 0x01010101u; break;
+    }
+    return imm8 != 0u;
+}
+
+static ci_dec_t t2_plain_imm(uint32_t pc, ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const unsigned op5 = (hw1 >> 4) & 0x1fu, rn = hw1 & 0xfu;
+    const unsigned rd = (hw2 >> 8) & 0xfu;
+    const uint32_t imm12 = ((uint32_t)(hw1 & 0x400u) << 1) |
+                           ((uint32_t)(hw2 >> 4) & 0x700u) | (hw2 & 0xffu);
+    if (rd == 15u) return ref(op, false);
+    switch (op5) {
+        case 0x00: case 0x0a:                              /* ADDW / SUBW / ADR */
+            if (rn == 15u) {
+                const uint32_t base = (pc + 4u) & ~3u;
+                op->kind = CI_DP_KIND(13u, CI_F_IMM, 0u);
+                op->imm = op5 ? base - imm12 : base + imm12;
+            } else {
+                op->kind = CI_DP_KIND(op5 ? 2u : 4u, CI_F_IMM, 0u);
+                op->rn = (uint8_t)rn;
+                op->imm = imm12;
+            }
+            op->rd = (uint8_t)rd;
+            return CI_DEC_OP;
+        case 0x04:                                          /* MOVW */
+            op->kind = CI_DP_KIND(13u, CI_F_IMM, 0u);
+            op->rd = (uint8_t)rd;
+            op->imm = ((uint32_t)(hw1 & 0xfu) << 12) | imm12;
+            return CI_DEC_OP;
+        case 0x0c:                                          /* MOVT */
+            op->kind = CI_K_MOVT;
+            op->rd = (uint8_t)rd;
+            op->imm = (((uint32_t)(hw1 & 0xfu) << 12) | imm12) << 16;
+            return CI_DEC_OP;
+        default:
+            return ref(op, false);
+    }
+}
+
+static ci_dec_t t2_branch_misc(uint32_t pc, ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const unsigned op1 = (hw2 >> 12) & 7u, op7 = (hw1 >> 4) & 0x7fu;
+    const uint32_t S = (hw1 >> 10) & 1u;
+    const uint32_t J1 = (hw2 >> 13) & 1u, J2 = (hw2 >> 11) & 1u;
+    if (op1 & 5u) {                                         /* B.W, BL, BLX */
+        const uint32_t I1 = (J1 ^ S) ^ 1u, I2 = (J2 ^ S) ^ 1u;
+        const uint32_t imm = (S << 24) | (I1 << 23) | (I2 << 22) |
+                             ((uint32_t)(hw1 & 0x3ffu) << 12) |
+                             ((uint32_t)(hw2 & 0x7ffu) << 1);
+        const uint32_t off = (imm ^ 0x01000000u) - 0x01000000u;
+        switch (op1 & 5u) {
+            case 1:  op->kind = CI_K_B;   op->imm = pc + 4u + off; break;
+            case 5:  op->kind = CI_K_TBL; op->imm = pc + 4u + off; break;
+            default:
+                if (hw2 & 1u) return ref(op, true);
+                op->kind = CI_K_TBLX;
+                op->imm = ((pc + 4u) & ~3u) + off;
+                break;
+        }
+        return CI_DEC_END;
+    }
+    if ((op7 & 0x38u) != 0x38u) {                           /* B<c>.W */
+        const uint32_t imm = (S << 20) | (J2 << 19) | (J1 << 18) |
+                             ((uint32_t)(hw1 & 0x3fu) << 12) |
+                             ((uint32_t)(hw2 & 0x7ffu) << 1);
+        op->kind = CI_K_B;
+        op->cond = (uint8_t)((hw1 >> 6) & 0xfu);
+        op->imm = pc + 4u + ((imm ^ 0x00100000u) - 0x00100000u);
+        return CI_DEC_END;
+    }
+    /* Exactly the encodings the reference accepts as a hint, CLREX or a
+     * barrier; every other system form is the reference's. */
+    if (hw1 == 0xf3afu && hw2 <= 0x8004u) {                /* NOP YIELD WFE SEV */
+        op->kind = CI_K_NOP;                                /* (WFI stopped above) */
+        return CI_DEC_OP;
+    }
+    if (hw1 == 0xf3bfu && (hw2 & 0xff00u) == 0x8f00u) {
+        const unsigned sel = (hw2 >> 4) & 0xfu;
+        if (sel == 2u && (hw2 & 0xfu) == 0xfu) { op->kind = CI_K_CLREX; return CI_DEC_OP; }
+        if (sel >= 4u && sel <= 6u) { op->kind = CI_K_NOP; return CI_DEC_OP; }
+    }
+    return ref(op, false);
+}
+
+static ci_dec_t t2_load_store(uint32_t pc, ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const bool load = (hw1 >> 4) & 1u, sgn = (hw1 >> 8) & 1u;
+    const unsigned size = (hw1 >> 5) & 3u, rn = hw1 & 0xfu, rt = hw2 >> 12;
+    unsigned acc, src = CI_S_IMM, mode = CI_M_OFF;
+    bool hint_ok;
+
+    if (size == 3u || (sgn && size == 2u) || (!load && sgn)) return ref(op, false);
+    if (load) {
+        static const uint8_t u[3] = { CI_A_LDRB, CI_A_LDRH, CI_A_LDR };
+        static const uint8_t s[2] = { CI_A_LDRSB, CI_A_LDRSH };
+        acc = sgn ? s[size] : u[size];
+    } else {
+        static const uint8_t st[3] = { CI_A_STRB, CI_A_STRH, CI_A_STR };
+        acc = st[size];
+    }
+    if (rn == 15u) {                                        /* literal */
+        const uint32_t base = (pc + 4u) & ~3u, imm = hw2 & 0xfffu;
+        if (!load) return ref(op, false);
+        if (rt == 15u) {
+            if (size == 2u) return ref(op, true);            /* LDR pc: interworks */
+            op->kind = CI_K_NOP;                             /* PLD / PLI literal */
+            return CI_DEC_OP;
+        }
+        if (acc != CI_A_LDR) return ref(op, false);
+        op->kind = CI_K_LDR_LIT;
+        op->rd = (uint8_t)rt;
+        op->imm = (hw1 & 0x80u) ? base + imm : base - imm;
+        return CI_DEC_OP;
+    }
+    if (hw1 & 0x80u) {                                      /* [Rn, #imm12] */
+        op->imm = hw2 & 0xfffu;
+        hint_ok = true;
+    } else if (hw2 & 0x800u) {                              /* the imm8 forms */
+        const bool P = (hw2 >> 10) & 1u, U = (hw2 >> 9) & 1u, W = (hw2 >> 8) & 1u;
+        const uint32_t imm8 = hw2 & 0xffu;
+        if ((!P && !W) || (P && U && !W)) return ref(op, false);  /* T forms too */
+        if (W && rn == rt) return ref(op, false);
+        mode = P ? (W ? CI_M_PRE : CI_M_OFF) : CI_M_POST;
+        op->imm = U ? imm8 : 0u - imm8;
+        hint_ok = P && !U && !W;
+    } else if ((hw2 & 0xfc0u) == 0u) {                      /* [Rn, Rm, LSL #n] */
+        const unsigned rm = hw2 & 0xfu;
+        if (rm == 13u || rm == 15u) return ref(op, false);
+        src = CI_S_REG;
+        op->rm = (uint8_t)rm;
+        op->sh = CI_SH_LSL;
+        op->sa = (uint8_t)((hw2 >> 4) & 3u);
+        hint_ok = true;
+    } else {
+        return ref(op, false);
+    }
+    if (rt == 15u) {
+        if (load && size != 2u && hint_ok) {                 /* PLD, PLDW, PLI */
+            op->kind = CI_K_NOP;
+            op->imm = 0u; op->rm = 0u; op->sh = 0u; op->sa = 0u;
+            return CI_DEC_OP;
+        }
+        return ref(op, load);
+    }
+    op->kind = CI_MEM_KIND(acc, src, mode);
+    op->rd = (uint8_t)rt;
+    op->rn = (uint8_t)rn;
+    return CI_DEC_OP;
+}
+
+static ci_dec_t t2_block(ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const unsigned opx = (hw1 >> 7) & 3u, rn = hw1 & 0xfu;
+    const bool W = (hw1 >> 5) & 1u, load = (hw1 >> 4) & 1u;
+    const uint32_t list = hw2;
+    int n = 0;
+    for (uint32_t l = list; l; l &= l - 1u) n++;
+    /* SRS/RFE, and every form the reference refuses. */
+    if (opx == 0u || opx == 3u || rn == 15u || (list & 0x2000u) || n < 2 ||
+        (!load && (list & 0x8000u)) || (load && (list & 0xc000u) == 0xc000u) ||
+        (W && ((list >> rn) & 1u)))
+        return ref(op, load && (list & 0x8000u));
+    if (opx == 1u)                                          /* IA */
+        return block_transfer(op, load, rn, list, 0, W ? 4 * n : 0);
+    return block_transfer(op, load, rn, list, -4 * n, W ? -4 * n : 0);   /* DB */
+}
+
+static ci_dec_t t2_dp_register(ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const unsigned op1 = (hw1 >> 4) & 0xfu, op2 = (hw2 >> 4) & 0xfu;
+    const unsigned rn = hw1 & 0xfu, rd = (hw2 >> 8) & 0xfu, rm = hw2 & 0xfu;
+    if ((hw2 & 0xf000u) != 0xf000u || rd == 15u || rm == 15u) return ref(op, false);
+    if (op1 < 8u && op2 == 0u) {                            /* LSL/LSR/ASR/ROR Rs */
+        if (rn == 15u) return ref(op, false);
+        op->sh = (uint8_t)(op1 >> 1);
+        op->rs = (uint8_t)rm;
+        return thumb_dp(op, 13u, CI_F_SHR, op1 & 1u, rd, 0u, rn, 0u);
+    }
+    if (rn == 15u && (op2 & 0xcu) == 0x8u &&
+        (op1 == 0u || op1 == 1u || op1 == 4u || op1 == 5u)) {  /* extends */
+        static const uint8_t k[6] = { CI_K_SXTH, CI_K_UXTH, 0, 0, CI_K_SXTB, CI_K_UXTB };
+        op->kind = k[op1];
+        op->rd = (uint8_t)rd; op->rm = (uint8_t)rm;
+        op->sa = (uint8_t)((op2 & 3u) * 8u);
+        return CI_DEC_OP;
+    }
+    if ((op1 & 0xcu) == 0x8u && (op2 & 0xcu) == 0x8u && rn == rm) {
+        const unsigned a = op1 & 3u, b = op2 & 3u;
+        static const uint8_t rev[4] = { CI_K_REV, CI_K_REV16, 0, CI_K_REVSH };
+        if (a == 1u && b != 2u) op->kind = rev[b];
+        else if (a == 3u && b == 0u) op->kind = CI_K_CLZ;
+        else return ref(op, false);
+        op->rd = (uint8_t)rd; op->rm = (uint8_t)rm;
+        return CI_DEC_OP;
+    }
+    return ref(op, false);
+}
+
+static ci_dec_t t2_multiply(ci_op_t *op, uint16_t hw1, uint16_t hw2) {
+    const unsigned rn = hw1 & 0xfu, rm = hw2 & 0xfu;
+    if (!(hw1 & 0x80u)) {                                   /* 32-bit results */
+        const unsigned ra = hw2 >> 12, rd = (hw2 >> 8) & 0xfu;
+        if ((hw1 & 0x70u) || (hw2 & 0xf0u) || rd == 15u || rn == 15u || rm == 15u)
+            return ref(op, false);
+        op->kind = ra == 15u ? CI_K_MUL : CI_K_MLA;         /* MUL / MLA */
+        op->rd = (uint8_t)rd; op->rm = (uint8_t)rn; op->rs = (uint8_t)rm;
+        op->rn = (uint8_t)(ra == 15u ? 0u : ra);
+        return CI_DEC_OP;
+    }
+    const unsigned op1 = (hw1 >> 4) & 7u, lo = hw2 >> 12, hi = (hw2 >> 8) & 0xfu;
+    static const uint8_t k[8] = { CI_K_SMULL, 0, CI_K_UMULL, 0, CI_K_SMLAL, 0, CI_K_UMLAL, 0 };
+    if ((hw2 & 0xf0u) || !k[op1] || lo == 15u || hi == 15u || lo == hi ||
+        rn == 15u || rm == 15u)
+        return ref(op, false);
+    op->kind = k[op1];
+    op->rd = (uint8_t)hi; op->rn = (uint8_t)lo;
+    op->rm = (uint8_t)rn; op->rs = (uint8_t)rm;
+    return CI_DEC_OP;
+}
+
+ci_dec_t ci_decode_thumb2(uint32_t pc, uint16_t hw1, uint16_t hw2, bool in_it,
+                          unsigned *it_covers, ci_op_t *op) {
+    if (!ci_thumb_is_wide(hw1)) {
+        if ((hw1 & 0xff00u) == 0xbf00u) {                   /* IT and the hints */
+            memset(op, 0, sizeof *op);
+            op->raw = hw1;
+            op->cond = CI_COND_AL;
+            const unsigned mask = hw1 & 0xfu, sel = (hw1 >> 4) & 0xfu;
+            if (mask == 0u) {
+                if (sel == 3u) return CI_DEC_STOP;           /* WFI */
+                if (!in_it) { op->kind = CI_K_NOP; return CI_DEC_OP; }
+            } else if (!in_it) {
+                unsigned n = 4u;                             /* 4 - ctz(mask) */
+                for (unsigned m = mask; !(m & 1u); m >>= 1) n--;
+                *it_covers = n;
+            }
+            op->rd = 1u;
+            return ref(op, false);
+        }
+        if ((hw1 & 0xff00u) == 0x4700u && (hw1 & 7u)) return CI_DEC_STOP;  /* (0) bits */
+        if (!in_it && (hw1 & 0xf500u) == 0xb100u) {          /* CBZ / CBNZ */
+            memset(op, 0, sizeof *op);
+            op->raw = hw1;
+            op->cond = CI_COND_AL;
+            op->kind = CI_K_CBZ;
+            op->rn = (uint8_t)(hw1 & 7u);
+            op->sa = (uint8_t)((hw1 >> 11) & 1u);
+            op->imm = pc + 4u + (((uint32_t)hw1 >> 3) & 0x40u) + (((uint32_t)hw1 >> 2) & 0x3eu);
+            return CI_DEC_END;
+        }
+        const ci_dec_t d = ci_decode_thumb(pc, hw1, op);
+        if (d == CI_DEC_STOP || !in_it) return d;
+        memset(op, 0, sizeof *op);                           /* covered: reference */
+        op->raw = hw1;
+        op->cond = CI_COND_AL;
+        op->rd = 1u;
+        return ref(op, false);
+    }
+
+    memset(op, 0, sizeof *op);
+    op->raw = t2_raw(hw1, hw2);
+    op->cond = CI_COND_AL;
+    if (t2_must_stop(hw1, hw2)) return CI_DEC_STOP;
+    if (in_it) { op->rd = 1u; return ref(op, false); }
+
+    switch ((hw1 >> 11) & 3u) {
+    case 1:                                                  /* 11101 */
+        if ((hw1 & 0x0600u) == 0u)
+            return (hw1 & 0x40u) ? ref(op, false) : t2_block(op, hw1, hw2);
+        if ((hw1 & 0x0600u) == 0x0200u) {
+            if (hw2 & 0x8000u) return ref(op, false);
+            return t2_dp(op, hw1, hw2, false, 0u, false);
+        }
+        return ref(op, false);                               /* coprocessor */
+    case 2: {                                                /* 11110 */
+        if (hw2 & 0x8000u) return t2_branch_misc(pc, op, hw1, hw2);
+        if (hw1 & 0x0200u) return t2_plain_imm(pc, op, hw1, hw2);
+        uint32_t imm;
+        bool rotated;
+        const uint32_t imm12 = ((uint32_t)(hw1 & 0x400u) << 1) |
+                               ((uint32_t)(hw2 >> 4) & 0x700u) | (hw2 & 0xffu);
+        if (!t2_expand_imm(imm12, &imm, &rotated)) return ref(op, false);
+        return t2_dp(op, hw1, hw2, true, imm, rotated);
+    }
+    default:                                                 /* 11111 */
+        if (hw1 & 0x0400u) return ref(op, false);            /* coprocessor */
+        if ((hw1 & 0x0600u) == 0u) return t2_load_store(pc, op, hw1, hw2);
+        if ((hw1 & 0x0700u) == 0x0200u) return t2_dp_register(op, hw1, hw2);
+        if ((hw1 & 0x0700u) == 0x0300u) return t2_multiply(op, hw1, hw2);
+        return ref(op, false);
+    }
+}
+
 /* ------------------------------------------------------- diagnostics --- */
 
 unsigned ci_stop_cause(uint32_t insn, bool thumb) {
@@ -697,6 +1091,53 @@ unsigned ci_stop_cause(uint32_t insn, bool thumb) {
         if (cp == 14u) return ARM_CI_STEP_CP14;
     }
     return ARM_CI_STEP_OTHER;
+}
+
+unsigned ci_stop_cause_v7_arm(uint32_t insn) {
+    if ((insn >> 28) != 0xfu && (insn & 0x0fffffffu) == 0x0320f003u)
+        return ARM_CI_STEP_WFI;                              /* the WFI hint */
+    return ci_stop_cause(insn, false);
+}
+
+unsigned ci_stop_cause_t2(uint32_t raw) {
+    const uint16_t hw1 = (uint16_t)raw, hw2 = (uint16_t)(raw >> 16);
+    if (!ci_thumb_is_wide(hw1)) {
+        if (hw1 == 0xbf30u) return ARM_CI_STEP_WFI;
+        return ci_stop_cause(hw1, true);
+    }
+    if (hw1 == 0xf3afu && hw2 == 0x8003u) return ARM_CI_STEP_WFI;
+    if ((hw1 & 0xec00u) == 0xec00u && (hw1 & 0xef00u) != 0xef00u) {
+        const unsigned cp = (hw2 >> 8) & 0xfu;
+        /* The T == 0 coprocessor encodings are the ARM AL word hw1:hw2. */
+        if (cp == 15u || cp == 14u)
+            return ci_stop_cause(((uint32_t)hw1 << 16) | hw2, false);
+    }
+    return ARM_CI_STEP_OTHER;
+}
+
+unsigned ci_ref_class_t2(uint32_t raw) {
+    const uint16_t hw1 = (uint16_t)raw, hw2 = (uint16_t)(raw >> 16);
+    if (!ci_thumb_is_wide(hw1)) return ci_ref_class(hw1, true);
+    if ((hw1 & 0xec00u) == 0xec00u || (hw1 & 0xff10u) == 0xf900u) {
+        const unsigned cp = (hw2 >> 8) & 0xfu;
+        return (cp == 10u || cp == 11u || (hw1 & 0xef00u) == 0xef00u ||
+                (hw1 & 0xff10u) == 0xf900u) ? ARM_CI_REF_VFP : ARM_CI_REF_OTHER;
+    }
+    switch ((hw1 >> 11) & 3u) {
+    case 1:
+        if ((hw1 & 0x0640u) == 0u) return ARM_CI_REF_BLOCK;        /* LDM/STM   */
+        if ((hw1 & 0x0640u) == 0x0040u)                             /* TBB/TBH   */
+            return (hw1 & 0xfff0u) == 0xe8d0u && (hw2 & 0xffe0u) == 0xf000u
+                 ? ARM_CI_REF_PC : ARM_CI_REF_MEM;                  /* else dual/excl */
+        return ARM_CI_REF_OTHER;                                    /* ORN, PKH  */
+    case 2:
+        if (hw2 & 0x8000u) return ARM_CI_REF_STATUS;               /* system    */
+        return (hw1 & 0x0200u) ? ARM_CI_REF_MEDIA : ARM_CI_REF_OTHER;  /* bit-field, sat */
+    default:
+        if ((hw1 & 0x0600u) == 0u)
+            return (hw2 >> 12) == 15u ? ARM_CI_REF_PC : ARM_CI_REF_MEM;
+        return ARM_CI_REF_MEDIA;                                    /* DSP, mul  */
+    }
 }
 
 unsigned ci_ref_class(uint32_t insn, bool thumb) {

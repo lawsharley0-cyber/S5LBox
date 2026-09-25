@@ -4467,7 +4467,13 @@ arm_status_t arm_exec_arm_insn(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 }
 
 arm_status_t arm_exec_thumb_insn(arm_cpu_t *c, uint32_t pc, uint16_t insn) {
+    if (arm_arch_is_v7(c->arch)) return thumb_v7_exec(c, pc, insn, 0u, false);
     return thumb_exec_fetched(c, pc, insn);
+}
+
+arm_status_t arm_exec_thumb32_insn(arm_cpu_t *c, uint32_t pc, uint16_t hw1,
+                                   uint16_t hw2) {
+    return thumb_v7_exec(c, pc, hw1, hw2, true);
 }
 
 /* arm_exec_fetched's path for a VFP encoding, condition passed: the decode
