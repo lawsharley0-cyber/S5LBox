@@ -1431,6 +1431,8 @@ static void test_unimplemented_encodings_still_halt(void) {
         /* VFP system registers we do not implement. */
         { VMRS(0, 7),                        "VMRS r0, MVFR0" },
         { VMRS(0, 9),                        "VMRS r0, FPINST" },
+        /* VMOV r0, r1, d0 needs bit 4 set; clear, it is UNDEFINED. */
+        { 0xec510b00u,                       "VMOV (two core registers) with bit 4 clear" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         uint32_t p[1]; p[0] = cases[i].insn;
@@ -1574,8 +1576,7 @@ static void test_flush_to_zero(void) {
           c.vfp_fpscr & 0x9fu);
 }
 
-/* Default-NaN mode replaces every NaN result with the one default quiet NaN,
- * which also makes the NaN-payload deviation documented in vfp.c unobservable. */
+/* Default-NaN mode replaces every NaN result with the one default quiet NaN. */
 static void test_default_nan(void) {
     arm_cpu_t c = {0};
     uint32_t add[] = { DP_S(0,1,1,0, 2,0,1) };   /* VADD.F32 s2, s0, s1 */
@@ -1605,6 +1606,89 @@ static void test_default_nan(void) {
         CHECK(vfp_get_d(&c, 2) == 0x7ff8000000000000ull, "DN.F64 = 0x%016llx",
               (unsigned long long)vfp_get_d(&c, 2));
     }
+}
+
+/*
+ * NaN propagation is ARM's FPProcessNaNs, not the host's: a signalling NaN
+ * wins whatever its position and is quieted, otherwise the first operand's NaN
+ * wins; and a NaN the operation itself creates is the POSITIVE default NaN.
+ * x86 and arm64 both prefer the first operand and x86 creates 0xffc00000, so
+ * every case below failed before vfp.c chose the NaN itself. Found by
+ * tools/unicorn_neon_diff.py; the expected values are Unicorn's Cortex-A8.
+ */
+static void test_nan_propagation_is_arms(void) {
+    arm_cpu_t c = {0};
+    uint32_t add[]  = { DP_S(0,1,1,0, 2,0,1) };    /* VADD.F32 s2, s0, s1  */
+    uint32_t div[]  = { DP_S(1,0,0,0, 2,0,1) };    /* VDIV.F32 s2, s0, s1  */
+    uint32_t nmul[] = { DP_S(0,1,0,1, 2,0,1) };    /* VNMUL.F32 s2, s0, s1 */
+    uint32_t sq[]   = { UN_S(1,1, 2,0) };          /* VSQRT.F32 s2, s0     */
+    uint32_t muld[] = { DP_D(0,1,0,0, 2,0,1) };    /* VMUL.F64 d2, d0, d1  */
+
+    vfp_reset(&c);                          /* quiet first, signalling second */
+    vfp_set_s(&c, 0, 0x7fc11111u); vfp_set_s(&c, 1, 0x7f822222u);
+    CHECK(run(&c, add, 1, 1) == ARM_OK && vfp_get_s(&c, 2) == 0x7fc22222u &&
+          (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN + sNaN = %08x fpscr %08x, want the quieted sNaN 7fc22222 and IOC",
+          vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* signalling first */
+    vfp_set_s(&c, 0, 0xff811111u); vfp_set_s(&c, 1, 0x7fc22222u);
+    run(&c, add, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc11111u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sNaN + qNaN = %08x, want ffc11111 and IOC", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* two quiet NaNs: the first, no IOC */
+    vfp_set_s(&c, 0, 0x7fc11111u); vfp_set_s(&c, 1, 0xffc22222u);
+    run(&c, add, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc11111u && !(c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN + qNaN = %08x fpscr %08x", vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* 0/0 creates the default NaN */
+    vfp_set_s(&c, 0, 0u); vfp_set_s(&c, 1, 0u);
+    run(&c, div, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc00000u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "0/0 = %08x, want 7fc00000", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* VNMUL negates the created NaN */
+    vfp_set_s(&c, 0, 0u); vfp_set_s(&c, 1, 0x7f800000u);
+    run(&c, nmul, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc00000u,
+          "-(0 * inf) = %08x, want ffc00000", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* sqrt(qNaN): propagated, NO IOC */
+    vfp_set_s(&c, 0, 0xffc33333u);
+    run(&c, sq, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc33333u && !(c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sqrt(qNaN) = %08x fpscr %08x; a signalling compare used to raise IOC",
+          vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* sqrt(-1): created, IOC */
+    set_f32(&c, 0, -1.0f);
+    run(&c, sq, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc00000u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sqrt(-1) = %08x fpscr %08x", vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* double precision, same rule */
+    vfp_set_d(&c, 0, 0x7ff8000000011111ull); vfp_set_d(&c, 1, 0xfff0000000022222ull);
+    run(&c, muld, 1, 1);
+    CHECK(vfp_get_d(&c, 2) == 0xfff8000000022222ull && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN * sNaN (f64) = %016llx", (unsigned long long)vfp_get_d(&c, 2));
+}
+
+/* Flush-to-zero sees the result before rounding; a product the host rounds
+ * all the way to zero was still a tiny nonzero result, so FZ flushes it: UFC
+ * alone, not the IXC the host reports. Also found by the Unicorn test. */
+static void test_flush_to_zero_of_a_result_the_host_rounded_to_zero(void) {
+    arm_cpu_t c = {0};
+    uint32_t mul[] = { DP_S(0,1,0,0, 2,0,1) };   /* VMUL.F32 s2, s0, s1 */
+    vfp_reset(&c); c.vfp_fpscr = ARM_FPSCR_FZ;
+    vfp_set_s(&c, 0, 0x0d800000u);               /* 2^-100 */
+    vfp_set_s(&c, 1, 0x8d800000u);               /* -2^-100 */
+    CHECK(run(&c, mul, 1, 1) == ARM_OK, "VMUL refused");
+    CHECK(vfp_get_s(&c, 2) == 0x80000000u, "2^-100 * -2^-100 = %08x, want -0",
+          vfp_get_s(&c, 2));
+    CHECK((c.vfp_fpscr & 0x9fu) == ARM_FPSCR_UFC,
+          "flags %02x, want UFC alone", c.vfp_fpscr & 0x9fu);
 }
 
 /* A VLDM whose list crosses into unmapped memory must abort like an LDM. The
@@ -1727,6 +1811,8 @@ int main(void) {
     test_fpscr_mode_handling();
     test_flush_to_zero();
     test_default_nan();
+    test_nan_propagation_is_arms();
+    test_flush_to_zero_of_a_result_the_host_rounded_to_zero();
     test_ldm_uses_the_translating_bus();
     test_double_transfers_stop_after_the_first_abort();
     test_condition_codes_apply();

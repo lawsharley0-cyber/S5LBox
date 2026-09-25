@@ -941,7 +941,7 @@ void arm_reset(arm_cpu_t *cpu, const arm_bus_t *bus) {
     cpu->excl_addr = 0;
     cpu->vfp_fpexc = 0;
     cpu->vfp_fpscr = 0;
-    for (int i = 0; i < 32; i++) cpu->vfp_s[i] = 0;
+    for (int i = 0; i < 64; i++) cpu->vfp_s[i] = 0;
     /* On reset the ARM1176 enters SVC mode with IRQ, FIQ and imprecise aborts
      * disabled and begins execution from the reset vector (0x0, or 0xffff0000
      * with high vectors). We start at 0x0; the machine layer relocates PC as

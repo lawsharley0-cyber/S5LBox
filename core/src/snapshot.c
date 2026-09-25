@@ -116,7 +116,13 @@ SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
  * guard and confirmed by the successful guard below, not assumed from source
  * arithmetic; the padding is exactly why. reset_epoch (host-only, not
  * serialised) now occupies four bytes of that padding, so the size holds. */
-SNAP_SIZE_GUARD(arm_cpu_t,         68112,   "snap_cpu");
+/* 68240 = 68112 + d16-d31 (vfp_s grew from 32 words to 64). Those registers
+ * exist only on the ARMv7 profiles and the S5L8900 is an ARM1176, so
+ * snap_cpu() still stores 32 words and zeroes the rest on read, and
+ * snap_machine_valid() refuses a machine whose CPU is not the ARM1176. The
+ * bytes on disk do not change and SNAPSHOT_VERSION does not move. Measured
+ * with sizeof, not inferred. */
+SNAP_SIZE_GUARD(arm_cpu_t,         68240,   "snap_cpu");
 SNAP_SIZE_GUARD(s5l_uart_t,        8280,  "snap_uart");
 SNAP_SIZE_GUARD(s5l_vic_t,         16,    "snap_vic");
 SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
@@ -230,8 +236,10 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * this one is v33. The host-only dma_bus_active flag sits in the tail
  * padding after ci_horizon_idle and does not change the size. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
- * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         129840, "snap_mach");
+ * padding.
+ * 129968 is the CPU's d16-d31 (128 bytes, see the arm_cpu_t guard): not
+ * stored, since the ARM1176 has no such registers, so v33 stands. */
+SNAP_SIZE_GUARD(s5l8900_t,         129968, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -446,8 +454,13 @@ static void snap_cpu(sn_io_t *io, arm_cpu_t *c) {
     F32(c->vfp_fpexc);
     F32(c->vfp_fpscr);
     /* s0-s31. d0-d15 alias these and so need no separate entry — that is the
-     * point of storing the file once (see arm_cpu_t.vfp_s). */
+     * point of storing the file once (see arm_cpu_t.vfp_s). Words 32-63 are
+     * d16-d31, which only an ARMv7 CPU has; this machine's ARM1176 does not
+     * (snap_machine_valid insists), so they are not stored and read as zero,
+     * which is what arm_reset leaves in them. */
     FA32(c->vfp_s, 32);
+    if (sn_reading(io))
+        memset(&c->vfp_s[32], 0, sizeof c->vfp_s - 32u * sizeof c->vfp_s[0]);
     /*
      * THE TLB IS DELIBERATELY NOT STORED, and the size guard above is what
      * forces anyone adding to arm_cpu_t to read this rather than assume it.
@@ -1374,6 +1387,9 @@ static bool snap_machine_valid(const s5l8900_t *m) {
         m->nor.image_count > S5L_NOR_MAX_IMAGES ||
         m->unmapped_addr_count > S5L_UNMAPPED_LOG || m->dev_count > S5L_DEVLOG)
         return false;
+    /* The format has no field for the CPU profile and none for d16-d31: it
+     * describes an ARM1176, the S5L8900's CPU, and nothing else. */
+    if (m->cpu.arch != ARM_ARCH_V6_ARM1176) return false;
     for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
         if (!i2c_state_valid(&m->i2c[i])) return false;
     if (!pmu_state_valid(&m->pmu)) return false;

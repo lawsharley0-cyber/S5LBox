@@ -23,6 +23,12 @@
  * a final token: the FNV-1a hash of the first PATTERN_BYTES of RAM, so
  * stores are compared too.
  *
+ * VFP form (tools/unicorn_neon_diff.py): the line starts with "v", and the
+ * extended form's tokens are followed, BEFORE any further code words, by
+ *   fpscr d0lo d0hi d1lo d1hi ... d31lo d31hi
+ * (65 tokens). CPACR grants CP10/CP11 full access and FPEXC.EN is set before
+ * the step. The output gains fpscr and the same 64 words after the hash.
+ *
  * A malformed input line prints "ERR" and is skipped.
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
@@ -60,14 +66,18 @@ static uint8_t pattern_byte(uint32_t i) {
     return (uint8_t)((i * 167u + 13u) ^ (i >> 8));
 }
 
-#define MAX_TOKENS 40
+#define MAX_TOKENS 160
+#define VFP_TOKENS 65
 
 int main(void) {
-    char line[1024];
+    static char line[4096];
     while (fgets(line, sizeof line, stdin)) {
         uint32_t v[MAX_TOKENS];
         int n = 0;
-        for (char *p = line; n < MAX_TOKENS; ) {
+        char *p = line;
+        const bool vfp = *p == 'v';
+        if (vfp) p++;
+        for (; n < MAX_TOKENS; ) {
             char *end;
             while (*p == ' ' || *p == '\t') p++;
             if (*p == '\n' || *p == '\0') break;
@@ -77,6 +87,14 @@ int main(void) {
             p = end;
         }
         const bool extended = n >= 20;
+        uint32_t vfp_in[VFP_TOKENS];
+        if (vfp) {
+            if (n < 20 + VFP_TOKENS) { printf("ERR\n"); continue; }
+            memcpy(vfp_in, &v[20], sizeof vfp_in);
+            memmove(&v[20], &v[20 + VFP_TOKENS],
+                    (size_t)(n - 20 - VFP_TOKENS) * sizeof v[0]);
+            n -= VFP_TOKENS;
+        }
         if (n != 18 && !extended) {
             if (line[0] != '\n' && line[0] != '\0') printf("ERR\n");
             continue;
@@ -98,6 +116,12 @@ int main(void) {
         for (int i = 0; i < 15; i++) c.r[i] = v[i];
         uint32_t pc = v[16];
         c.r[15] = pc;
+        if (vfp) {
+            c.cp15.cpacr = 0x00f00000u;
+            c.vfp_fpexc  = ARM_FPEXC_EN;
+            c.vfp_fpscr  = vfp_in[0];
+            memcpy(c.vfp_s, &vfp_in[1], sizeof c.vfp_s);
+        }
         m_w32(NULL, pc, v[17]);
         unsigned steps = 1u;
         if (extended) {
@@ -121,6 +145,10 @@ int main(void) {
             for (uint32_t i = 0; i < PATTERN_BYTES; i++)
                 h = (h ^ g_ram[i]) * 16777619u;
             printf(" %08x", h);
+        }
+        if (vfp) {
+            printf(" %08x", c.vfp_fpscr);
+            for (int i = 0; i < 64; i++) printf(" %08x", c.vfp_s[i]);
         }
         printf("\n");
         fflush(stdout);

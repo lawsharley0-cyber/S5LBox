@@ -33,7 +33,7 @@ first step below.
 |---|---|---|
 | ARMv7 profile switch | `arm_arch_t` in `core/include/arm.h`: `ARM_ARCH_V6_ARM1176` (default), `ARM_ARCH_V7_SWIFT`, and `ARM_ARCH_V7_A8` (the 3GS). Code asks `arm_arch_is_v7()` / `arm_arch_has_divide()`, never the enum's order: the A8 is ARMv7 without the divider | The engine decodes for the core it runs: ARMv7 ARM state differs in an interworking `MOV pc` and the WFI hint, both handled (step 3). |
 | Thumb-2 (32-bit Thumb) | **Yes, in the reference interpreter** (2026-09-25; see step 2). On the ARM1176 `0xE800..0xFFFF` still decode as the two BL/BLX halves | **Done (step 3, first slice).** ARMv7 Thumb blocks carry a halfword-offset table for their mixed 16/32-bit records; a 32-bit instruction that straddles a 1 KiB block ends the block before it; `IT` and the instructions it covers are REF records, and a block is never entered with ITSTATE live. |
-| NEON / VFPv3-D32 (VFPv4 on A6) | **No** (VFPv2 only) | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
+| NEON / VFPv3-D32 (VFPv4 on A6) | **VFPv3-D32 yes** on the A8 profile, and the NEON scalar transfers and VDUP (2026-09-25; step 2, second slice). NEON data processing and element loads/stores: **not yet** | REF first; later specialise the few ops the shared cache's `memcpy`/string routines use (`vld1`/`vst1`, `vmov`), measured. `ROADMAP.md`'s census puts NEON at ~0.37 % of the iOS 8 kernel. |
 | ARMv7 system: DMB/DSB/ISB, VMSAv7 (TEX remap, PXN, ASIDs), CP15 layout | Barriers, CLREX and the hints (WFI waits) in both states; SCTLR.U/XP read as one, SCTLR.TE, ITSTATE across exceptions, MSR/MRS execution-state rules. **No** VMSAv7 or v7 CP15 identification | Barriers are no-ops single-core but ISB/`MCR` cache maintenance must keep ending blocks (they already STOP). ASID-tagged translation would let the engine stop purging on every TTBR write: `tlb_gen` flushes today. |
 | Unaligned access always permitted (SCTLR.U fixed) | Handled by the reference through SCTLR | Engine fast paths already fall back on any misalignment. |
 | SMP (A6 only) | **No** | Per-core CPU state and engine instance; the code bitmap and region generations must be shared so a store on one core invalidates blocks the other runs; exclusive monitor becomes global; deterministic interleaving quanta. XNU can boot single-core by boot-arg, which defers it. |
@@ -85,9 +85,38 @@ first step below.
      interpreter +0.54 %, ARM on it -0.36 %, the cached engine (the app's
      default) unchanged in both.
 
+   **Second slice, VFPv3 (2026-09-25).** The register file is d0-d31 (the
+   ARM1176 still refuses every encoding that names d16-d31), and the A8
+   profile adds VMOV (immediate), VCVT between floating and fixed point,
+   FPSID/MVFR0/MVFR1 with Unicorn's Cortex-A8 values, the A8's FPSCR and
+   FPEXC write masks, and the Advanced SIMD 8/16-bit scalar transfers and
+   VDUP from a core register. Snapshots are unchanged on disk: d16-d31 are
+   not stored, and a machine whose CPU is not the ARM1176 is refused.
+
+   Checked with a new driver, `tools/unicorn_neon_diff.py`, which compares
+   r0-r15, CPSR, RAM, FPSCR and d0-d31 against Unicorn's Cortex-A8 in ARM
+   and Thumb state: `--count 2000 --seed 7` gave 23,021 cases where both
+   executed, **0** differences and **0** encodings accepted that Unicorn
+   refused. Getting there found five bugs that the ARM1176 shares, all fixed:
+   NaN propagation took the host's operand order (ARM's signalling-first
+   rule is now explicit); an Invalid Operation made the host's negative NaN
+   instead of ARM's positive default NaN; VSQRT of a quiet NaN raised IOC (a
+   signalling `<` compare); flush-to-zero missed a tiny result the host had
+   already rounded to zero (UFC alone, not IXC); and VMOV between two core
+   registers and a double accepted bit 4 clear, which is UNDEFINED. Six cases
+   sit in a `qemu-bug` bucket: QEMU 5.0's double-precision VMOV/VABS/VNEG/
+   VSQRT short vectors write element 1 into the source register (isolated
+   with directed cases; its single-precision and three-operand forms agree).
+   Short vectors with stride 2 are not generated, because QEMU 5.0 steps
+   FPSCR.Stride + 1 registers. `test_vfp` (620 checks) and `test_armv7`
+   (131) pin one answer for each fix and each new instruction. Cost in host
+   instructions (cachegrind, `cpubench --workload vfp --isa arm --div 8`):
+   interpreter +0.56 %, engine +0.84 %, the engine's all in `f32_do`'s test
+   for a NaN result.
+
    Not yet: SRS/RFE in Thumb state, VMSAv7 (TEX remap, access flag, ASIDs),
-   the A8's CP15 identification and cache registers, VFPv3 (d16-d31,
-   VMOV immediate) and NEON, ThumbEE, and saving `arch` in snapshots (no
+   the A8's CP15 identification and cache registers, NEON data processing
+   and element loads/stores, ThumbEE, and saving `arch` in snapshots (no
    ARMv7 machine exists yet to save).
 3. **Cached interpreter for v7**: Thumb-2 variable-length records and the
    straddle rule, IT handling, then specialisations in order of a kernel

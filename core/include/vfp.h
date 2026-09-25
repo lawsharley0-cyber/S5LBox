@@ -25,6 +25,8 @@
 #define ARM_FPSCR_C      (1u << 29)  /* comparison: >=, or unordered         */
 #define ARM_FPSCR_V      (1u << 28)  /* comparison: unordered                */
 #define ARM_FPSCR_NZCV   0xf0000000u
+#define ARM_FPSCR_QC     (1u << 27)  /* ARMv7: Advanced SIMD saturation     */
+#define ARM_FPSCR_AHP    (1u << 26)  /* ARMv7: alternative half precision   */
 #define ARM_FPSCR_DN     (1u << 25)  /* default NaN mode                     */
 #define ARM_FPSCR_FZ     (1u << 24)  /* flush-to-zero mode                   */
 #define ARM_FPSCR_RMODE  (3u << 22)  /* 00 RN, 01 RP, 10 RM, 11 RZ           */
@@ -54,6 +56,18 @@
  * that writes 0xffffffff and reads it back must see hardware's answer.
  */
 #define ARM_FPSCR_WMASK  0xf3f79f9fu
+/*
+ * The Cortex-A8's FPSCR, as Unicorn 2.1.4's Cortex-A8 model reads it back
+ * after "VMSR FPSCR, 0xffffffff": QC and AHP join, the trap enables are gone
+ * (MVFR0 advertises no exception trapping, so they read as zero and no mode
+ * check here can ever see one set) and bits 6:5 and 19 stay reserved. AHP is
+ * stored though the A8 has no half-precision conversions to consult it.
+ */
+#define ARM_FPSCR_WMASK_V7 0xfff7009fu
+
+static inline uint32_t vfp_fpscr_wmask(const arm_cpu_t *c) {
+    return arm_arch_is_v7(c->arch) ? ARM_FPSCR_WMASK_V7 : ARM_FPSCR_WMASK;
+}
 
 /* ------------------------------------------------------- register file --- */
 /*
@@ -68,12 +82,14 @@ static inline uint32_t vfp_get_s(const arm_cpu_t *c, unsigned n) {
 static inline void vfp_set_s(arm_cpu_t *c, unsigned n, uint32_t v) {
     c->vfp_s[n & 31u] = v;
 }
+/* d0-d31. d16-d31 exist only on ARMv7; the decoders refuse them on the
+ * ARM1176 before a register number ever reaches here. */
 static inline uint64_t vfp_get_d(const arm_cpu_t *c, unsigned n) {
-    n = (n & 15u) * 2u;
+    n = (n & 31u) * 2u;
     return (uint64_t)c->vfp_s[n] | ((uint64_t)c->vfp_s[n + 1u] << 32);
 }
 static inline void vfp_set_d(arm_cpu_t *c, unsigned n, uint64_t v) {
-    n = (n & 15u) * 2u;
+    n = (n & 31u) * 2u;
     c->vfp_s[n]      = (uint32_t)v;
     c->vfp_s[n + 1u] = (uint32_t)(v >> 32);
 }

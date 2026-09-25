@@ -80,6 +80,17 @@
 #define ARM1176_CACHE_TYPE 0x1d152152u
 /* VFP11 identity register as reported by the ARM1176JZF-S. */
 #define ARM1176_FPSID      0x410120b4u
+/*
+ * The Cortex-A8's VFPv3/Advanced SIMD identity registers. Read from Unicorn
+ * 2.1.4's Cortex-A8 model with VMRS (its values are QEMU's, taken from ARM's
+ * Cortex-A8 TRM); they are not a reading from an iPhone 3GS. MVFR0 advertises
+ * 32 D registers, VFPv3 single and double, divide, square root, short vectors
+ * and all rounding modes, and NO exception trapping; MVFR1 advertises Advanced
+ * SIMD integer, single-precision float and load/store, and no half precision.
+ */
+#define CORTEX_A8_FPSID    0x410330c0u
+#define CORTEX_A8_MVFR0    0x11110222u
+#define CORTEX_A8_MVFR1    0x00011111u
 
 /*
  * FPEXC, the VFP exception register. Only EN matters here: it is the switch
@@ -438,9 +449,14 @@ typedef struct arm_cpu {
      * onto these, not a separate bank: dN is the pair (vfp_s[2N], vfp_s[2N+1])
      * with the LOW-order word first. Keeping one array and deriving dN from it
      * is what makes the aliasing impossible to get wrong — there is no second
-     * copy that could drift. There is no d16-d31 on this part; see vfp.c.
+     * copy that could drift.
+     *
+     * Words 32-63 are d16-d31, which exist only on the ARMv7 profiles (VFPv3
+     * D32 with Advanced SIMD, where qN is the pair d2N, d2N+1). They have no
+     * single-precision names. The ARM1176 has no d16-d31, so vfp.c refuses
+     * every encoding that would name one there and these words stay zero.
      */
-    uint32_t vfp_s[32];
+    uint32_t vfp_s[64];
 
     /*
      * THE TRANSLATION CACHE, and why the model went without one for so long.

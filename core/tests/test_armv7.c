@@ -16,6 +16,7 @@
  */
 #include "arm.h"
 #include "arm_ci.h"
+#include "vfp.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -624,6 +625,117 @@ static void test_engine_leaves_a_block_when_itstate_turns_live(void) {
           ref.cpsr, (unsigned long long)ref.cycles);
 }
 
+/* Run one ARM-state word at 0x100 on a fresh core of the given profile. */
+static arm_status_t arm_one(arm_cpu_t *c, arm_arch_t arch, uint32_t insn,
+                            bool keep) {
+    if (!keep) {
+        boot(c, &g_bus, arch, 0x100, false);
+        enable_vfp(c);
+    }
+    c->r[15] = 0x100;
+    m_w32(NULL, 0x100, insn);
+    return arm_step(c);
+}
+
+static uint64_t dreg(const arm_cpu_t *c, unsigned n) {
+    return (uint64_t)c->vfp_s[2 * n] | ((uint64_t)c->vfp_s[2 * n + 1] << 32);
+}
+static void set_dreg(arm_cpu_t *c, unsigned n, uint64_t v) {
+    c->vfp_s[2 * n] = (uint32_t)v;
+    c->vfp_s[2 * n + 1] = (uint32_t)(v >> 32);
+}
+
+/*
+ * VFPv3 on the Cortex-A8 profile: d16-d31, VMOV (immediate), VCVT between
+ * floating and fixed point, the ID registers, and the Advanced SIMD scalar
+ * transfers. tools/unicorn_neon_diff.py compares all of these against
+ * Unicorn's Cortex-A8 at random; these pin one known answer each, and that
+ * the ARM1176 still refuses every one. Encodings from llvm-mc -mattr=+neon.
+ */
+static void test_vfpv3_on_the_cortex_a8(void) {
+    arm_cpu_t c;
+
+    /* vldr d17, [r0] (0xedd01b00): d16-d31 exist. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    c.r[0] = 0x2000;
+    m_w32(NULL, 0x2000, 0x44332211u); m_w32(NULL, 0x2004, 0x88776655u);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xedd01b00u, true) == ARM_OK &&
+          dreg(&c, 17) == 0x8877665544332211ull,
+          "vldr d17: %016llx", (unsigned long long)dreg(&c, 17));
+    CHECK(arm_one(&c, ARM_ARCH_V6_ARM1176, 0xedd01b00u, false) == ARM_UNDEFINED,
+          "vldr d17 must stay refused on the ARM1176");
+
+    /* vmov.f64 d20, #1.0 (0xeef74b00) and vmov.f32 s1, #-2.0 (0xeef80a00). */
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef74b00u, false) == ARM_OK &&
+          dreg(&c, 20) == 0x3ff0000000000000ull,
+          "vmov.f64 d20, #1.0: %016llx", (unsigned long long)dreg(&c, 20));
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef80a00u, false) == ARM_OK &&
+          c.vfp_s[1] == 0xc0000000u, "vmov.f32 s1, #-2.0: %08x", c.vfp_s[1]);
+    CHECK(arm_one(&c, ARM_ARCH_V6_ARM1176, 0xeef80a00u, false) == ARM_UNDEFINED,
+          "VMOV (immediate) must stay refused on the ARM1176");
+
+    /* vcvt.s32.f32 s2, s2, #16 (0xeebe1ac8): 1.5 is 0x18000 in 16.16. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    c.vfp_s[2] = 0x3fc00000u;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeebe1ac8u, true) == ARM_OK &&
+          c.vfp_s[2] == 0x00018000u, "vcvt.s32.f32 #16: %08x", c.vfp_s[2]);
+    /* vcvt.f32.u16 s3, s3, #8 (0xeefb1a44): only the low 16 bits count,
+     * 0x0180 / 256 = 1.5. */
+    c.vfp_s[3] = 0xffff0180u;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeefb1a44u, true) == ARM_OK &&
+          c.vfp_s[3] == 0x3fc00000u, "vcvt.f32.u16 #8: %08x", c.vfp_s[3]);
+
+    /* The ID registers, privileged, and readable with VFP disabled. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    c.cp15.cpacr |= 0xfu << ARM_CPACR_CP10_SHIFT;           /* FPEXC.EN clear */
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef70a10u, true) == ARM_OK &&
+          c.r[0] == CORTEX_A8_MVFR0, "vmrs r0, mvfr0: %08x", c.r[0]);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef61a10u, true) == ARM_OK &&
+          c.r[1] == CORTEX_A8_MVFR1, "vmrs r1, mvfr1: %08x", c.r[1]);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef02a10u, true) == ARM_OK &&
+          c.r[2] == CORTEX_A8_FPSID, "vmrs r2, fpsid: %08x", c.r[2]);
+    c.cpsr = (c.cpsr & ~ARM_CPSR_MODE_MASK) | ARM_MODE_USR;
+    enable_vfp(&c);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef70a10u, true) == ARM_OK &&
+          (c.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_UND,
+          "vmrs mvfr0 from User mode is the guest's Undefined exception");
+
+    /* FPEXC keeps EN alone; FPSCR keeps the A8's bits. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    c.r[3] = 0xffffffffu;
+    arm_one(&c, ARM_ARCH_V7_A8, 0xeee83a10u, true);         /* vmsr fpexc, r3 */
+    CHECK(c.vfp_fpexc == ARM_FPEXC_EN, "FPEXC after writing all ones: %08x", c.vfp_fpexc);
+    arm_one(&c, ARM_ARCH_V7_A8, 0xeee13a10u, true);         /* vmsr fpscr, r3 */
+    CHECK(c.vfp_fpscr == 0xfff7009fu, "FPSCR after writing all ones: %08x", c.vfp_fpscr);
+
+    /* Scalar transfers and VDUP. */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
+    enable_vfp(&c);
+    set_dreg(&c, 17, 0x8877665544332211ull);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeef10bb0u, true) == ARM_OK &&
+          c.r[0] == 0x66u, "vmov.u8 r0, d17[5]: %08x", c.r[0]);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xee711bf0u, true) == ARM_OK &&
+          c.r[1] == 0xffffff88u, "vmov.s8 r1, d17[7]: %08x", c.r[1]);
+    c.r[3] = 0xdeadbeefu;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xee213bb0u, true) == ARM_OK &&
+          dreg(&c, 17) == 0x8877beef44332211ull,
+          "vmov.16 d17[2], r3: %016llx", (unsigned long long)dreg(&c, 17));
+    c.r[4] = 0x01020304u;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xee214b90u, true) == ARM_OK &&
+          dreg(&c, 17) == 0x0102030444332211ull,
+          "vmov.32 d17[1], r4: %016llx", (unsigned long long)dreg(&c, 17));
+    c.r[2] = 0x1234abcdu;
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xeea22bb0u, true) == ARM_OK &&
+          dreg(&c, 18) == 0xabcdabcdabcdabcdull && dreg(&c, 19) == 0xabcdabcdabcdabcdull,
+          "vdup.16 q9, r2: %016llx %016llx",
+          (unsigned long long)dreg(&c, 18), (unsigned long long)dreg(&c, 19));
+    CHECK(arm_one(&c, ARM_ARCH_V6_ARM1176, 0xeea22bb0u, false) == ARM_UNDEFINED,
+          "VDUP must stay refused on the ARM1176");
+}
+
 int main(void) {
     printf("S5LBox ARMv7 profile tests\n");
     test_profile_predicates();
@@ -644,6 +756,7 @@ int main(void) {
     test_wfi_hint_waits_when_privileged();
     test_cached_interpreter_runs_armv7();
     test_engine_leaves_a_block_when_itstate_turns_live();
+    test_vfpv3_on_the_cortex_a8();
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -925,7 +925,7 @@ top:
             CI_NEXT();
         CI_HK(VFP_SYS)
             if (!vfp_usable(c)) goto ref;
-            if (!op->sh) c->vfp_fpscr = R[op->rd] & ARM_FPSCR_WMASK;
+            if (!op->sh) c->vfp_fpscr = R[op->rd] & vfp_fpscr_wmask(c);
             else if (op->rd == 15u)
                 c->cpsr = (c->cpsr & 0x0fffffffu) | (c->vfp_fpscr & ARM_FPSCR_NZCV);
             else R[op->rd] = c->vfp_fpscr;
