@@ -767,6 +767,15 @@ static void test_neon_on_the_cortex_a8(void) {
           dreg(&c, 0) == 0x000000000000027full && (c.vfp_fpscr & ARM_FPSCR_QC),
           "vqadd.s8: %016llx fpscr %08x", (unsigned long long)dreg(&c, 0), c.vfp_fpscr);
 
+    /* vmovl.s8 q0, d2 (0xf2880a12): VSHLL with a zero shift, which random
+     * encodings almost never reach. Bytes 01 80 fe 02 01 7f ff 80 widen,
+     * sign-extended, to halfwords. */
+    set_dreg(&c, 2, 0x80ff7f0102fe8001ull);
+    CHECK(arm_one(&c, ARM_ARCH_V7_A8, 0xf2880a12u, true) == ARM_OK &&
+          dreg(&c, 0) == 0x0002fffeff800001ull && dreg(&c, 1) == 0xff80ffff007f0001ull,
+          "vmovl.s8: %016llx %016llx", (unsigned long long)dreg(&c, 0),
+          (unsigned long long)dreg(&c, 1));
+
     /* vld1.32 {d16, d17}, [r0]! (0xf4600a8d): writeback by the transfer size. */
     boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x100, false);
     enable_vfp(&c);

@@ -124,13 +124,13 @@ first step below.
    step; FPSCR.QC records saturation. The ARM1176 still refuses all of it.
 
    Checked with `tools/unicorn_neon_diff.py` against Unicorn's Cortex-A8 in
-   ARM and Thumb state: data processing, `--count 2500 --seed 3`, 24,849
-   cases where both executed, every NEON mnemonic among them (`--coverage`
-   counts agreeing cases per mnemonic; the thinnest in a targeted run of
-   the 3-same, miscellaneous and shift groups, `--count 5000 --seed 21`,
-   were VMOVL 3, VRECPS 27 and VRSQRTS 29); loads and stores,
-   `--count 2000`, 6,607 cases. All with **0** differences and **0** encodings accepted that
-   Unicorn refused. S5LBox refuses what the ARMv7 ARM calls UNDEFINED even
+   ARM and Thumb state, every NEON group, `--count 3000 --seed 21
+   --coverage`: 43,338 cases where both executed, **0** differences and
+   **0** encodings accepted that Unicorn refused. Every NEON mnemonic
+   agreed at least 50 times except VMOVL (2: it is VSHLL with a zero
+   shift, which random encodings rarely hit), VSHRN (21), VQSHRUN (28) and
+   VREV16 (37); those four were also run as directed cases against Unicorn
+   in both states, and `test_armv7` pins a VMOVL answer. S5LBox refuses what the ARMv7 ARM calls UNDEFINED even
    where QEMU 5 runs it (VMUL.F32 with bit 21 set, VQDMULL/VQDMLAL with
    U=1), and the UNPREDICTABLE forms (a register list past d31, VZIP/VUZP/
    VTRN of one register with itself, a zero modified immediate). Its extra
