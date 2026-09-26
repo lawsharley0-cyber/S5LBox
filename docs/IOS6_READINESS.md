@@ -502,6 +502,35 @@ first step below.
    0x3a48) is a 30 s event-wait for the kernel to publish a keybag, so the
    gate is entirely kernel-side in that ladder, not in keybagd's own file I/O.
 
+   **Step 2: the clock tree, and spi0 comes alive (2026-09-26).** spi0 was
+   idle for a reason other than GPIO or the PMGR registers. Traced
+   instruction by instruction, `AppleSamsungSPIController::start` runs and
+   returns false at its first real step: it asks its provider for the
+   frequency of its `pclk` clock and gets 0. `AppleS5L8920XIO` answers that
+   from `/arm-io:clock-frequencies`, one word per PMGR clock (a device's
+   `clock-ids` entry 0x100 + n selects word n; spi0-2 and uart0-4 take word
+   4), and the image carries it as zeros because iBoot fills it. iBoot
+   computes it from the PLLs and 25 clock dividers that LLB programs (read
+   from this firmware's own LLB and iBoot; the derivation is in
+   `core/include/n88.h` and `n88_clock_frequencies`), so `n88` now writes
+   those 28 words, plus `/arm-io:usbphy-frequency` and
+   `/arm-io/audio-complex:ncoref-frequency` from the same iBoot pass. The
+   derivation reproduces every cpu0 frequency that was already known or
+   guessed (CPU 600 MHz, bus 100, memory 200, fixed and timebase 24) except
+   one: the provisional 50 MHz peripheral clock is really 100 MHz, and is
+   corrected. The display's pixel clock is LLB's default; iBoot's display
+   driver retunes it for the panel, which only matters once there is a
+   display. Result on 10B500: both SPI controllers start
+   (`_spiVersion = 1`) and program spi0's registers, the audio complex
+   reports `ncoRef: 162000000` instead of 0, `AppleSamsungLP65USBPhy::start
+   : failed` is gone, and the boot still reaches launchd and the keybag
+   reboot at the same speed. The PMGR suspicion was wrong and is dropped:
+   a caller census shows every PMGR register the kernel touches is either
+   written once at init or rewritten by the CPU performance-state routine,
+   and none is polled, so no status wait was failing. Next in the chain:
+   spi0 so far sees only its configuration writes, no transfers, so the NOR
+   under it has not probed yet.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 

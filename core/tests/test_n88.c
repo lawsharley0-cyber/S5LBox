@@ -363,7 +363,11 @@ static void b_str(buf_t *b, const char *name, const char *s) {
 }
 static void b_node(buf_t *b, uint32_t props, uint32_t children) { b_u32(b, props); b_u32(b, children); }
 
-typedef struct { const char *compat; uint32_t compat_len; bool with_pram; } tree_opts_t;
+/* clock_bytes: the size of /arm-io:clock-frequencies (the template's is 128);
+ * 0 leaves it out, with /arm-io:usbphy-frequency and /arm-io/audio-complex. */
+typedef struct {
+    const char *compat; uint32_t compat_len; bool with_pram; uint32_t clock_bytes;
+} tree_opts_t;
 
 /* The nodes bring-up touches, with the template's zeros. */
 static void build_tree(buf_t *t, tree_opts_t o) {
@@ -391,7 +395,16 @@ static void build_tree(buf_t *t, tree_opts_t o) {
         b_prop(t, "InUse", "\x01\x00\x00\x40\x00\x10\x00\x00", 8);     /* taken */
         b_prop(t, "MemoryMapReserved-1", zero8, 8);
         b_prop(t, "MemoryMapReserved-2", zero8, 8);
-      b_node(t, 1, 1); b_str(t, "name", "arm-io");
+      if (o.clock_bytes) {
+        static const uint8_t zero128[128];
+        b_node(t, 3, 2); b_str(t, "name", "arm-io");
+        b_prop(t, "clock-frequencies", zero128, o.clock_bytes);
+        b_prop(t, "usbphy-frequency", zero4, 4);
+          b_node(t, 2, 0); b_str(t, "name", "audio-complex");
+          b_prop(t, "ncoref-frequency", zero4, 4);
+      } else {
+        b_node(t, 1, 1); b_str(t, "name", "arm-io");
+      }
         b_node(t, 2, 0); b_str(t, "name", "iop"); b_str(t, "compatible", "iop-s5l8920x");
 }
 
@@ -470,7 +483,7 @@ static const uint8_t *tree_prop(const uint8_t *b, size_t len, const char *path,
 static void test_boot_layout_and_tree(void) {
     static buf_t tree;
     static uint8_t kernel[0x400];
-    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true });
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
     /* The "kernel": print "OK\n" on UART0 with the MMU off, then stop. */
     const uint32_t code[] = {
         movw(4, (N88_UART0_PA + 0x20u) & 0xffffu), movt(4, (N88_UART0_PA + 0x20u) >> 16),
@@ -536,6 +549,15 @@ static void test_boot_layout_and_tree(void) {
             p = tree_prop(dt, tree.n, "cpus/cpu0", cpu0[i].prop, &l);
             CHECK(p && get32(p) == cpu0[i].v, "cpu0 %s", cpu0[i].prop);
         }
+        p = tree_prop(dt, tree.n, "arm-io", "clock-frequencies", &l);
+        bool table = p && l == 128u;
+        for (uint32_t i = 0; table && i < 32u; i++)
+            table = get32(p + 4u * i) == (i < N88_CLOCK_COUNT ? n88_clock_frequencies[i] : 0u);
+        CHECK(table, "/arm-io:clock-frequencies: the 28 clocks, the last 4 words untouched");
+        p = tree_prop(dt, tree.n, "arm-io", "usbphy-frequency", &l);
+        CHECK(p && get32(p) == N88_USBPHY_HZ, "/arm-io:usbphy-frequency");
+        p = tree_prop(dt, tree.n, "arm-io/audio-complex", "ncoref-frequency", &l);
+        CHECK(p && get32(p) == N88_NCOREF_HZ, "/arm-io/audio-complex:ncoref-frequency");
         p = tree_prop(dt, tree.n, "chosen", "nvram-proxy-data", &l);
         CHECK(p && l == 0x2000 && p[0] == 0x70 && p[0x800] == 0x7f, "the NVRAM image");
         p = tree_prop(dt, tree.n, "arm-io/iop", "compatible", &l);
@@ -581,8 +603,8 @@ static void test_boot_layout_and_tree(void) {
 static void test_boot_refusals(void) {
     static buf_t tree, nopram, n88tree;
     static uint8_t kernel[0x400];
-    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true });
-    build_tree(&nopram, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, false });
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    build_tree(&nopram, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, false, 128 });
     const uint32_t code[] = { B_SELF };
     const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
     (void)n88tree;
@@ -635,6 +657,48 @@ static void test_boot_refusals(void) {
     free(m);
 }
 
+/* The clock table: what the cpu0 frequencies and the drivers read from it,
+ * and iBoot's handling of a short or missing property. */
+static void test_clock_table(void) {
+    const uint32_t *f = n88_clock_frequencies;
+    /* iBoot fills cpu0 from these entries (its clock getter, 0x4ff13e80). */
+    CHECK(f[15] == N88_CPU_HZ && f[25] == N88_MEM_HZ && f[1] == N88_BUS_HZ &&
+          f[2] == N88_PRF_HZ && f[19] == N88_FIX_HZ && f[26] == N88_TB_HZ &&
+          f[27] == N88_USBPHY_HZ, "cpu0's frequencies are the table's");
+    CHECK(N88_CPU_HZ % N88_TB_HZ == 0 && N88_CYCLES_PER_TICK == 25u,
+          "the CPU runs a whole number of cycles per timer tick");
+    CHECK(f[4] == 100000000u, "clock 0x104, the SPI and UART pclk, is PLL2 / 2");
+    CHECK(f[11] == 0 && f[13] == 0 && f[21] == 0,
+          "the clocks LLB leaves disabled read 0");
+
+    static buf_t shorter, none;
+    static uint8_t kernel[0x400];
+    build_tree(&shorter, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 64 });
+    build_tree(&none, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 0 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                     .devicetree = shorter.b, .devicetree_size = shorter.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "a 64-byte clock-frequencies boots: %s", d);
+    uint32_t l = 0;
+    const uint8_t *p = tree_prop(ram_at(m, m->devicetree_pa), shorter.n, "arm-io",
+                                 "clock-frequencies", &l);
+    bool fits = p && l == 64u;
+    for (uint32_t i = 0; fits && i < 16u; i++) fits = get32(p + 4u * i) == f[i];
+    CHECK(fits, "and gets the first 16 words, as iBoot copies them");
+    p = tree_prop(ram_at(m, m->devicetree_pa), shorter.n, "arm-io", "usbphy-frequency", &l);
+    CHECK(p && l == 4u && get32(p) == N88_USBPHY_HZ, "without running into the next property");
+    r.devicetree = none.b; r.devicetree_size = none.n;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK,
+          "a tree without the clock properties boots, as iBoot passes them over: %s", d);
+    n88_free(m);
+    free(m);
+}
+
 /* -------------------------------------------------------- root disk */
 
 typedef struct { uint8_t data[16384]; } memdisk_t;
@@ -672,7 +736,7 @@ static void test_boot_with_root(void) {
     static buf_t tree;
     static uint8_t kernel[0x400];
     static memdisk_t disk;
-    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true });
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
     for (size_t i = 0; i < sizeof disk.data; i++) disk.data[i] = (uint8_t)(i * 7u + 3u);
     const vm_block_t block = { &disk, sizeof disk.data, 0, 0, md_read, md_write, NULL };
 
@@ -781,16 +845,16 @@ static void test_console_ring(void) {
 
 static void test_devicetree_identity(void) {
     static buf_t t;
-    build_tree(&t, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true });
+    build_tree(&t, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
     CHECK(n88_devicetree_is_3gs(t.b, t.n), "N88AP first");
     static const char later[] = "iPhone2,1\0N88AP\0AppleARM";
-    build_tree(&t, (tree_opts_t){ later, sizeof later, true });
+    build_tree(&t, (tree_opts_t){ later, sizeof later, true, 128 });
     CHECK(n88_devicetree_is_3gs(t.b, t.n), "N88AP anywhere in the list");
     static const char m68[] = "M68AP\0iPhone1,1\0AppleARM";
-    build_tree(&t, (tree_opts_t){ m68, sizeof m68, true });
+    build_tree(&t, (tree_opts_t){ m68, sizeof m68, true, 128 });
     CHECK(!n88_devicetree_is_3gs(t.b, t.n), "an iPhone (original) tree is not a 3GS");
     static const char prefix[] = "N88APX\0N88A";
-    build_tree(&t, (tree_opts_t){ prefix, sizeof prefix - 1, true });
+    build_tree(&t, (tree_opts_t){ prefix, sizeof prefix - 1, true, 128 });
     CHECK(!n88_devicetree_is_3gs(t.b, t.n), "only a whole string matches");
     uint8_t junk[16] = {0xff, 0xff, 0xff, 0xff};
     CHECK(!n88_devicetree_is_3gs(junk, sizeof junk), "garbage");
@@ -804,6 +868,7 @@ int main(void) {
     test_nvram_image();
     test_boot_layout_and_tree();
     test_boot_refusals();
+    test_clock_table();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

@@ -68,18 +68,29 @@
 #define N88_PRAM_SIZE   UINT32_C(0x00010000)
 
 /*
- * Clock frequencies the device tree carries as zero and iBoot fills in. CPU is
- * the iPhone 3GS's documented 600 MHz. The rest are PROVISIONAL: the timebase
- * only has to agree with the timer model below, and the others only have to be
- * non-zero and in sane ratios. Replace them if an iPhone2,1 IORegistry dump
- * turns up.
+ * The clock frequencies the device tree carries as zero and iBoot fills in,
+ * as this firmware's boot loaders leave them (iPhone2,1 10B500). LLB programs
+ * the PMGR PLLs and the 25 per-clock source/divider registers from constants
+ * (LLB 0x840086a8); iBoot's platform init recomputes every clock from those
+ * registers (iBoot 0x4ff13b40, PLLs at 0x4ff13c48) and its device-tree pass
+ * writes the results (0x4ff13618). From the 24 MHz reference:
+ *   PLL0  24 MHz x 150 / 6       = 600 MHz   the CPU
+ *   PLL1  24 MHz x  81 / 6 / 2   = 162 MHz
+ *   PLL2  24 MHz x 100 / 6 / 2   = 200 MHz
+ * The CPU agrees with the iPhone 3GS's documented 600 MHz. The per-clock
+ * table, /arm-io's clock-frequencies, is n88_clock_frequencies (n88.c); the
+ * cpu0 values below are entries of it, as iBoot reads them. The timer model
+ * ticks at the timebase.
  */
-#define N88_CPU_HZ  600000000u
-#define N88_BUS_HZ  100000000u
-#define N88_MEM_HZ  200000000u
-#define N88_PRF_HZ   50000000u
-#define N88_FIX_HZ   24000000u
-#define N88_TB_HZ    24000000u
+#define N88_CPU_HZ    600000000u    /* clock 15: PLL0 / 1                    */
+#define N88_BUS_HZ    100000000u    /* clock 1:  PLL2 / 2                    */
+#define N88_MEM_HZ    200000000u    /* clock 25: the CPU clock / 3           */
+#define N88_PRF_HZ    100000000u    /* clock 2:  PLL2 / 2                    */
+#define N88_FIX_HZ     24000000u    /* clock 19: the reference / 1           */
+#define N88_TB_HZ      24000000u    /* clock 26: the reference               */
+#define N88_USBPHY_HZ  24000000u    /* clock 27, /arm-io:usbphy-frequency    */
+#define N88_NCOREF_HZ 162000000u    /* PLL1, audio-complex:ncoref-frequency  */
+#define N88_CLOCK_COUNT 28u         /* clock-frequencies words iBoot writes  */
 #define N88_CYCLES_PER_TICK (N88_CPU_HZ / N88_TB_HZ)
 
 #define N88_UART0_PA    UINT32_C(0x82500000)
@@ -224,6 +235,9 @@ bool n88_devicetree_is_3gs(const uint8_t *dt, size_t len);
 
 /* The smallest NVRAM image IODTNVRAM parses (see n88.c); exposed for tests. */
 void n88_nvram_image(uint8_t *img, uint32_t len);
+
+/* /arm-io's clock-frequencies as iBoot writes it (see n88.c); for tests. */
+extern const uint32_t n88_clock_frequencies[N88_CLOCK_COUNT];
 
 /* The bus, for tests and the harness: the same routing the CPU sees. */
 uint32_t n88_read32(n88_t *m, uint32_t pa);

@@ -485,6 +485,35 @@ static void n88_ram_written(void *ctx, uint64_t pa, uint64_t len) {
                               len > UINT32_MAX ? UINT32_MAX : (uint32_t)len);
 }
 
+/*
+ * /arm-io's clock-frequencies: one frequency per PMGR clock, which the
+ * kernel's AppleS5L8920XIO reads (it refuses a property shorter than these 28
+ * words, 0x80787ab8 in 10B500) and hands to every driver that asks for a
+ * clock by name: a device's clock-ids entry 0x100 + n selects entry n, and
+ * the entry answers the names listed for it (spi0-2 and uart0-4 take "pclk"
+ * from entry 4). A driver that gets 0 back gives up; the SPI controller did.
+ *
+ * Entries 0-24 are LLB's clock registers as iBoot recomputes them (see
+ * n88.h): each divides one source -- PLL1, PLL2, the 24 MHz reference, or
+ * source 0, which is PLL0 for clock 0 and clock 0's output for the others --
+ * and a clock whose divider LLB leaves disabled reads 0 (11, 13, 21), as it
+ * does on the phone.
+ * Entry 10 divides the reference by a product of two fields. Entry 15 is the
+ * CPU (PLL0 undivided), 25 the memory clock (the CPU / 3), 26 the timebase
+ * and 27 the USB PHY. Entry 22 is the display's pixel clock at LLB's
+ * default; iBoot's display driver retunes it for the panel (0x4ff06760),
+ * which runs only with a display, not modelled here.
+ */
+const uint32_t n88_clock_frequencies[N88_CLOCK_COUNT] = {
+    150000000u, 100000000u, 100000000u,  81000000u,     /*  0 -  3 */
+    100000000u, 100000000u,  54000000u, 200000000u,     /*  4 -  7 */
+    150000000u, 100000000u,     50000u,         0u,     /*  8 - 11 */
+    150000000u,         0u,  40500000u, 600000000u,     /* 12 - 15 */
+      1000000u,   1000000u,   1000000u,  24000000u,     /* 16 - 19 */
+     40500000u,         0u,  10800000u,  54000000u,     /* 20 - 23 */
+    162000000u, 200000000u,  24000000u,  24000000u,     /* 24 - 27 */
+};
+
 n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap) {
     if (detail && cap) detail[0] = 0;
     if (!m || !m->ram || !req || !req->kernel || !req->devicetree)
@@ -575,6 +604,19 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         if (!dt_set_words(tree, &dt, &root, clocks[i].path, clocks[i].prop, &clocks[i].v, 1))
             return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: no 4-byte /%s:%s",
                         clocks[i].path, clocks[i].prop);
+    {
+        /* The per-clock table and the two single clocks iBoot writes beside
+         * it. Like iBoot, copy as many of the 28 words as the property holds
+         * and pass over a property the tree does not have. */
+        uint32_t cl = 0;
+        uint8_t *cf = dt_prop_rw(tree, &dt, &root, "arm-io", "clock-frequencies", &cl);
+        const uint32_t words = cf ? (cl / 4u < N88_CLOCK_COUNT ? cl / 4u : N88_CLOCK_COUNT) : 0u;
+        for (uint32_t i = 0; i < words; i++) st32(cf + 4u * i, n88_clock_frequencies[i]);
+        const uint32_t usbphy = N88_USBPHY_HZ, ncoref = N88_NCOREF_HZ;
+        (void)dt_set_words(tree, &dt, &root, "arm-io", "usbphy-frequency", &usbphy, 1);
+        (void)dt_set_words(tree, &dt, &root, "arm-io/audio-complex", "ncoref-frequency",
+                           &ncoref, 1);
+    }
     {
         uint32_t nl = 0;
         uint8_t *nv = dt_prop_rw(tree, &dt, &root, "chosen", "nvram-proxy-data", &nl);
