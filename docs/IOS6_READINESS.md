@@ -562,6 +562,29 @@ first step below.
    The keybag still fails, as expected: what remains is the AES engine
    (`IOAESAccelerator`) and a writable data volume at `/private/var`.
 
+   **Why kb_load fails, exactly (2026-09-26).** Traced at the AppleKeyStore
+   user client (10B500; its __TEXT is 0x80afa000-0x80b04000, dispatch at
+   0x80afce4c): keybagd calls selector 0 (OK), 17 (blocks about 4.7 s, OK),
+   0 (OK), then 14, which looks up the keybag with handle -1 (the system
+   bag, 0x80afd67e) and returns kIOReturnNotFound; keybagd then prints
+   `FATAL KEYBAG ERROR: kb_load`. It never calls a create selector. Its own
+   code confirms it: it reads `systembag` from `/private/var//keybags`
+   (0x3102-0x3106) and goes straight to "Can't load the keybag. tears in
+   rain... Time to die" when that fails (0x310e); creating a system keybag
+   is MobileKeyBag's `MKBKeyBagCreateSystem`, which keybagd does not call.
+   On a phone the system keybag is written when the data partition is set
+   up -- a restore, or Erase All Content and Settings, whose on-device tool
+   (`mobile_obliterator`, launchd job `com.apple.mobile.obliteration`) is on
+   this root filesystem. (The restore ramdisk's daemon is stored compressed
+   and was not read.) So modelling the AES engine is necessary -- loading a
+   keybag unwraps its class keys with the device's UID key -- but not
+   sufficient: this machine also needs a data volume and a system keybag
+   provisioned the way a restore or erase would, created by this machine's
+   own kernel against its own (stand-in) UID and its effaceable lockbox.
+   The only AES operation the boot makes today is one early CDMA request
+   (0x87800000 and channels 1-2 at 0x87001000/0x87002000) that nothing
+   completes.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 
