@@ -472,6 +472,23 @@ first step below.
    SPI/NOR/effaceable chain -- the same shape as the iPhone OS 3 audio and
    graphics bring-up, and not verifiable without on-device testing.
 
+   The effaceable lockbox chain is now traced to a structural blocker. The
+   IOKit provider ladder is spi0 (`spi-1,samsung`) -> `AppleSamsungSPI` ->
+   `AppleARMNORFlashDevice` -> `AppleEffaceableNOR` (`IONameMatch
+   effaceable,nor`) -> `AppleEffaceableStorage`. A SPI NOR flash is a command
+   state machine (RDID, READ, RDSR, WREN, PP, SE...) that is framed by the
+   chip-select edge: the machine of one command ends when CS deasserts. On
+   this board the SPI chip selects are GPIO platform functions
+   (`function-spi_cs0`), not the controller's internal CS, and the core's SPI
+   model says so outright -- its `s5l_spi_slave_t` has no chip-select
+   callback because the controller cannot observe a GPIO select edge. So a
+   correct SPI NOR cannot even be framed until the GPIO block is modelled;
+   the order is GPIO chip-selects, then the SPI NOR + effaceable lockbox,
+   then the AES engine, then the keybag-creation semantics, and only the
+   last of those is checkable without hardware. kb_load's worker (keybagd
+   0x3a48) is a 30 s event-wait for the kernel to publish a keybag, so the
+   gate is entirely kernel-side in that ladder, not in keybagd's own file I/O.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 
