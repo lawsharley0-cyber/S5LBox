@@ -618,3 +618,34 @@ first step below.
   workload suite, and the differential fuzzer stay green at every step.
 - No JIT: the engine design (predecoded records, reference fallback) carries
   to ARMv7 without executable memory.
+
+### Speed of the 3GS path vs the real device (#37)
+
+Measured, not estimated. All host figures are on the Linux x86-64 dev
+container; the on-phone ceiling is separate and cited below.
+
+- **The iOS 6 boot, host.** `boot3gs -e` retires the first 300M
+  instructions of the 10B500 boot at ~122 M guest instr/s, 99.9% through
+  the cached interpreter. `boot3gs` now prints the engine's own accounting
+  (`arm_ci_describe_stats`), so the levers are visible: 8.6% of the boot
+  drops to the slower reference path, dominated by the catch-all "other"
+  class (14.1M ops), memory corners (6.8M), PC-writing forms (2.0M), media
+  (1.5M) and block transfers (1.2M). Bringing those classes onto fast paths
+  is the concrete lever for this workload.
+- **CPU-bound host throughput** (`cpubench --backend cached`) ranges by
+  workload: Thumb user 85–305 M instr/s, ARM user 57–223, with MMU-heavy
+  (57–85) and syscall-heavy (81) code the floors and straight-line ALU the
+  ceiling.
+- **The real device, for reference.** The guest is an in-order dual-issue
+  600 MHz Cortex-A8; sustained real throughput is on the order of a few
+  hundred million instr/s and varies with IPC, so on this dev host the
+  emulator runs CPU-bound guest code within a small factor of the real
+  chip's rate. That is NOT the on-phone story: the product target is a
+  modern iPhone running the same no-JIT core, where a firmware-backed replay
+  measured ~7 M instr/s on an A9 (docs/device-benchmark.md). The iOS 6 path
+  has not been separately timed on a phone, but it shares that core, so its
+  on-phone rate is the same order — well below the guest's real-time rate,
+  which is why closing the gap needs the reference-path work above and,
+  ultimately, the techniques iCube uses (docs/ICUBE_DOLPHIN_RESEARCH.md).
+  This project keeps the no-JIT constraint, so the cached interpreter is the
+  ceiling here.

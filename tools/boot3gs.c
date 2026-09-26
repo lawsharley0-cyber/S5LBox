@@ -507,6 +507,17 @@ int main(int argc, char **argv) {
                interrupts, undefs);
     printf("%" PRIu64 " timer expiries, guest time %.3f s\n", g_m.timer.fired,
            n88_guest_seconds(&g_m));
+    if (engine && g_m.ci) {
+        /* The cached interpreter's own accounting: how much of the boot the
+         * engine retired, and which instruction classes drop to the slower
+         * reference path -- the levers for real-device speed (#37). */
+        arm_ci_stats_t cs;
+        arm_ci_get_stats(g_m.ci, &cs);
+        char desc[1024];
+        arm_ci_describe_stats(&cs, n, desc, sizeof desc);
+        printf("engine:\n%s", desc);
+        if (desc[0] && desc[strlen(desc) - 1] != '\n') printf("\n");
+    }
     printf("console: %" PRIu64 " bytes (%" PRIu64 " dropped from the ring)\n",
            g_m.console_total, g_m.console_dropped);
     if (g_m.has_root) {
