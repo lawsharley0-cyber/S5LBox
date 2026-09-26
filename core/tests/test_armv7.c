@@ -357,6 +357,44 @@ static void test_wide_instruction_across_a_fetch_block(void) {
           c.r[0], c.r[15]);
 }
 
+static void test_thumb2_exclusives_allow_lr(void) {
+    /* The 10B500 kernel's atomics use LR as the exclusive data register.
+     * LR (14) is not BadReg -- only SP (13) and PC (15) are -- so these must
+     * execute, as Unicorn's Cortex-A8 does. A word LDREX is
+     * 1110 1000 0101 Rn : Rt 1111 imm8, so LDREX lr,[r2] is 0xe852 0xef00. */
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    m_w32(NULL, 0x8000u, 0xdeadbeefu);
+    c.r[2] = 0x8000u;
+    put16(0x1000u, 0xe852u); put16(0x1002u, 0xef00u);   /* LDREX lr, [r2] */
+    CHECK(arm_step(&c) == ARM_OK && c.r[14] == 0xdeadbeefu && c.r[15] == 0x1004u,
+          "LDREX lr: st/lr=%08x pc=%08x", c.r[14], c.r[15]);
+
+    /* STREX r0, lr, [r2]: 1110 1000 0100 Rn : Rt Rd imm8 -> 0xe842 0xe000, so
+     * lr is the data register. The LDREX above arms the monitor and loads the
+     * seeded value into lr, which the STREX then stores back: mem is
+     * unchanged and the status register reads 0 (stored). */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    m_w32(NULL, 0x8000u, 0x12345678u);
+    c.r[2] = 0x8000u;
+    put16(0x1000u, 0xe852u); put16(0x1002u, 0xef00u);   /* LDREX lr, [r2] */
+    put16(0x1004u, 0xe842u); put16(0x1006u, 0xe000u);   /* STREX r0, lr, [r2] */
+    CHECK(arm_step(&c) == ARM_OK && c.r[14] == 0x12345678u, "LDREX lr before STREX");
+    CHECK(arm_step(&c) == ARM_OK && c.r[0] == 0u &&
+          m_r32(NULL, 0x8000u) == 0x12345678u,
+          "STREX r0,lr: status=%08x mem=%08x", c.r[0], m_r32(NULL, 0x8000u));
+
+    /* SP and PC as the data register stay UNDEFINED (BadReg). */
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    c.r[2] = 0x8000u;
+    put16(0x1000u, 0xe852u); put16(0x1002u, 0xdf00u);   /* LDREX sp, [r2] */
+    CHECK(arm_step(&c) == ARM_UNDEFINED, "LDREX sp is UNDEFINED");
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    c.r[2] = 0x8000u;
+    put16(0x1000u, 0xe852u); put16(0x1002u, 0xff00u);   /* LDREX pc, [r2] */
+    CHECK(arm_step(&c) == ARM_UNDEFINED, "LDREX pc is UNDEFINED");
+}
+
 static void test_msr_mrs_and_the_execution_state_bits(void) {
     /* MSR CPSR_fsxc, r0 (0xf380 0x8f00) cannot clear T or set IT or J; the
      * SPSR, a saved copy, takes them. */
@@ -1064,6 +1102,7 @@ int main(void) {
     test_vldr_literal_uses_the_thumb_pc();
     test_wide_instruction_across_a_page();
     test_wide_instruction_across_a_fetch_block();
+    test_thumb2_exclusives_allow_lr();
     test_msr_mrs_and_the_execution_state_bits();
     test_sctlr_te_selects_thumb_handlers();
     test_arm_state_armv7_additions();

@@ -3580,13 +3580,16 @@ static arm_status_t t2_load_store_multiple(arm_cpu_t *c, uint32_t hw1,
  * and they follow the ARM decoder's per-size rules exactly: alignment through
  * prepare_sync_address except for bytes, and the word STREX translates its
  * store before it consults the monitor. Unlike most of this decoder they
- * refuse SP as a data or status register too, which ARMv7 calls
- * UNPREDICTABLE for these (BadReg) and no compiler emits. */
+ * refuse SP and PC as a data or status register too, which ARMv7 calls
+ * UNPREDICTABLE for these (BadReg is {13,15}) and no compiler emits. LR (14)
+ * is NOT BadReg: the 10B500 kernel's atomics use `LDREX lr, [Rn]`, so an
+ * earlier `rt >= 13u` here wrongly refused a legal instruction. */
 static arm_status_t t2_load_exclusive(arm_cpu_t *c, uint32_t addr,
                                       unsigned size, unsigned rt,
                                       unsigned rt2) {
     arm_status_t st = ARM_OK;
-    if (rt >= 13u || (size == 8u && (rt2 >= 13u || rt == rt2)))
+    if (rt == 13u || rt == 15u ||
+        (size == 8u && (rt2 == 13u || rt2 == 15u || rt == rt2)))
         return ARM_UNDEFINED;
     if (size != 1u && !prepare_sync_address(c, addr, size, false, &st))
         return st;
@@ -3613,8 +3616,8 @@ static arm_status_t t2_store_exclusive(arm_cpu_t *c, uint32_t addr,
                                        unsigned rt, unsigned rt2,
                                        unsigned rn) {
     arm_status_t st = ARM_OK;
-    if (rd >= 13u || rt >= 13u || rd == rn || rd == rt ||
-        (size == 8u && (rt2 >= 13u || rd == rt2)))
+    if (rd == 13u || rd == 15u || rt == 13u || rt == 15u || rd == rn || rd == rt ||
+        (size == 8u && (rt2 == 13u || rt2 == 15u || rd == rt2)))
         return ARM_UNDEFINED;
     if (size != 1u && !prepare_sync_address(c, addr, size, true, &st))
         return st;
