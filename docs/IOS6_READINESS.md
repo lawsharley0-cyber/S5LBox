@@ -437,23 +437,38 @@ first step below.
    -r work.img` provisions and boots in one step; `-w` records where each
    kernel thread last blocked.
 
-   **The keybag, scoped (2026-09-26).** Getting here first needed one
+   **The keybag, mapped (2026-09-26).** Getting here first needed one
    interpreter fix: the Thumb-2 exclusives refused LR as the data register
    (they checked `>= 13` where the architecture forbids only SP and PC), so
    the 10B500 atomics' `LDREX lr, [Rn]`, on the reboot path, stopped the
    harness dead; fixed and Unicorn-verified (commit b07df0a). The keybag
-   itself is a missing device, not a CPU bug: `keybagd` (extracted with
-   tools/hfsx_extract.py) runs its kb_load worker, which fails and reboots,
-   because AppleKeyStore is not in the IORegistry -- its dependency
-   IOAESAccelerator (the hardware AES engine, a fixed MMIO block on the
-   S5L8920, not a device-tree node) is not modelled, and the SPI0 NOR that
-   backs AppleEffaceableStorage (`effaceable,nor` at NOR offsets 0xfa000/
-   0xfb000) is never even probed (spi0 at 0x82000000 sees no access). The
-   system keybag in the image is wrapped with the real device's UID key,
-   which is not knowable here, so loading it can never succeed; the
-   "give device keybag access to everyone" secure-root path must instead
-   create a fresh keybag under an emulator UID key. So this stage is its own
-   multi-device arc -- AES engine, AppleKeyStore keybag semantics, and the
+   itself is a missing DATA PARTITION plus two crypto devices, all confirmed:
+
+   - `AppleKeyStore` **is** registered (an IOResources software service, seen
+     with boot-arg `io=0xffffff`), so it is not the blocker.
+   - `keybagd` (extracted with tools/hfsx_extract.py) reads and writes
+     `/private/var/keybags/systembag.kb`; its kb_load worker (Thumb at
+     0x3a48, fatal path at 0x249e) fails and the process calls its fatality
+     thunk, which the kernel turns into "REBOOTING INTO RECOVERY MODE".
+   - `/private/var` is the DATA partition (disk0s2 on the phone), a separate
+     volume that is NOT in the system-only root image: the image has no
+     `keybags` directory and no `systembag.kb`. So there is no keybag to load
+     and nowhere writable and durable to create one. A writable data volume
+     at /private/var (a second md device, or a data partition) is the first
+     requirement.
+   - Creating a keybag then needs the hardware AES engine (`IOAESAccelerator`,
+     a prelinked kext present in the cache; on the S5L8920 it is a fixed MMIO
+     block, not a device-tree node) for the device UID key, and the effaceable
+     lockbox for BAG1. That lockbox is the SPI0 NOR (`effaceable,nor` at NOR
+     offsets 0xfa000/0xfb000): spi0's nub registers but its MMIO (0x82000000)
+     is never driven, so the NOR and effaceable children never enumerate and
+     AppleEffaceableStorage never matches.
+
+   The system keybag a real device stores is wrapped with that device's UID
+   key, unknowable here, so loading it could never work regardless; the
+   "give device keybag access to everyone" secure-root path is the one that
+   must create a fresh keybag under an emulator UID key. So this stage is its
+   own multi-device arc -- a data volume, the AES engine, and the
    SPI/NOR/effaceable chain -- the same shape as the iPhone OS 3 audio and
    graphics bring-up, and not verifiable without on-device testing.
 
