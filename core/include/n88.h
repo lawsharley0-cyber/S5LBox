@@ -20,8 +20,9 @@
  *   - The Cortex-A8 CPU profile (ARM_ARCH_V7_A8), optionally on the cached
  *     interpreter.
  *   - Bring-up as iBoot would do it: segments mapped, the device tree filled
- *     in (memory, clocks, /pram, the NVRAM image, the memory map), boot_args,
- *     and the IOP un-matched, because nothing emulates that coprocessor.
+ *     in (memory, clocks, /pram, /vram, the NVRAM image, the memory map),
+ *     boot_args with iBoot's framebuffer, and the IOP un-matched, because
+ *     nothing emulates that coprocessor.
  *
  *   - Optionally a root filesystem: a block device the kernel sees as the
  *     memory disk /dev/md0, published as the RAMDisk memory-map entry at a
@@ -62,13 +63,29 @@
 #define N88_DRAM_SIZE   UINT32_C(0x10000000)    /* 256 MB */
 #define N88_VIRT_BASE   UINT32_C(0x80000000)
 /*
- * The top of DRAM is boot-owned, as iBoot leaves it: boot_args.memSize stops
- * below it. It holds /pram, where the kernel keeps its panic log; the
- * platform expert refuses anything under 16 KB (0x8027baac in 10B500). The
- * size is PROVISIONAL, the 3GS's own is not known here.
+ * The top of DRAM is boot-owned, laid out as this firmware's iBoot leaves it
+ * (iPhone2,1 10B500), and boot_args.memSize stops below it:
+ *
+ *   - /pram, the last 16 KiB, where the kernel keeps its panic log
+ *     (iBoot 0x4ff0fed0; the platform expert refuses less, 0x8027baac).
+ *   - /vram below it: the display's framebuffers. iBoot's panel entry "n88"
+ *     is 320 x 480 (0x4ff2b244), its colour space defaults to RGB888, which
+ *     it lays out as 32 bits per pixel, 1280-octet rows, and it reserves
+ *     three page-rounded buffers directly below /pram (0x4ff09348). /vram is
+ *     that whole pool and Boot_Video describes the first buffer, at its base
+ *     (0x4ff11f6c, 0x4ff0ff0e).
  */
-#define N88_TOP_RESERVE UINT32_C(0x00100000)
-#define N88_PRAM_SIZE   UINT32_C(0x00010000)
+#define N88_PRAM_SIZE   UINT32_C(0x00004000)
+#define N88_PRAM_PA     (N88_DRAM_BASE + N88_DRAM_SIZE - N88_PRAM_SIZE)
+#define N88_FB_WIDTH    320u
+#define N88_FB_HEIGHT   480u
+#define N88_FB_DEPTH    32u                       /* bits per pixel          */
+#define N88_FB_STRIDE   (N88_FB_WIDTH * N88_FB_DEPTH / 8u)
+#define N88_FB_BYTES    ((N88_FB_STRIDE * N88_FB_HEIGHT + 0xfffu) & ~0xfffu)
+#define N88_FB_COUNT    3u
+#define N88_VRAM_SIZE   (N88_FB_COUNT * N88_FB_BYTES)
+#define N88_VRAM_PA     (N88_PRAM_PA - N88_VRAM_SIZE)
+#define N88_TOP_RESERVE (N88_VRAM_SIZE + N88_PRAM_SIZE)
 
 /*
  * The clock frequencies the device tree carries as zero and iBoot fills in,
@@ -270,6 +287,10 @@ extern const uint32_t n88_clock_frequencies[N88_CLOCK_COUNT];
 /* The NOR flash's array (N88_NOR_SIZE octets), to load before a boot or save
  * after one. NULL if the machine has none. */
 uint8_t *n88_nor(n88_t *m);
+
+/* The framebuffer Boot_Video describes: N88_FB_HEIGHT rows of N88_FB_STRIDE
+ * octets at N88_VRAM_PA, 32 bits per pixel. NULL before a boot. */
+const uint8_t *n88_framebuffer(const n88_t *m);
 
 /* The bus, for tests and the harness: the same routing the CPU sees. */
 uint32_t n88_read32(n88_t *m, uint32_t pa);

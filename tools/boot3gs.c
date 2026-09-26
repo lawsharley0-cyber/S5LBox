@@ -24,7 +24,7 @@
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
- *           [-r root.img [-P pristine.img]] [-w]
+ *           [-r root.img [-P pristine.img]] [-w] [-F screen.ppm]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default, "arm-io/iop"); -e runs on the
@@ -36,7 +36,9 @@
  * image is first made from the pristine one (see make_work_image). -w (single-step mode)
  * records, for every kernel thread, the call chain of the last time it
  * blocked (entry to thread_block / thread_block_parameter), and prints each
- * thread's last wait at the end: where a stalled boot is waiting.
+ * thread's last wait at the end: where a stalled boot is waiting. -F writes
+ * the framebuffer Boot_Video describes (n88_framebuffer) as a PPM image at
+ * the end, reading each 32-bit pixel's low three octets as blue, green, red.
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -328,7 +330,7 @@ int main(int argc, char **argv) {
     }
     uint64_t budget = 200000000u;
     const char *cmdline = NULL;
-    const char *ram_out = NULL;
+    const char *ram_out = NULL, *screen_out = NULL;
     const char *root_path = NULL, *pristine_path = NULL;
     const char *unmatch[16];
     unsigned nunmatch = 0;
@@ -340,6 +342,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-e")) engine = true;
         else if (!strcmp(argv[i], "-w")) waits = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) ram_out = argv[++i];
+        else if (!strcmp(argv[i], "-F") && i + 1 < argc) screen_out = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
         else if (!strcmp(argv[i], "-u") && i + 1 < argc && nunmatch < 16u)
@@ -555,6 +558,23 @@ int main(int argc, char **argv) {
         printf("  %s%-2u %08x x%-7u first %08x at %08x %s\n", g_stats[i].write ? "W" : "R",
                g_stats[i].size * 8u, g_stats[i].pa, g_stats[i].count, g_stats[i].first_value,
                g_stats[i].first_pc, sym(g_stats[i].first_pc));
+    if (screen_out) {                   /* -F: the framebuffer as a PPM image */
+        const uint8_t *fb = n88_framebuffer(&g_m);
+        FILE *f = fb ? fopen(screen_out, "wb") : NULL;
+        if (!f) die("cannot write %s", screen_out);
+        fprintf(f, "P6\n%u %u\n255\n", N88_FB_WIDTH, N88_FB_HEIGHT);
+        uint64_t lit = 0;
+        for (unsigned y = 0; y < N88_FB_HEIGHT; y++)
+            for (unsigned x = 0; x < N88_FB_WIDTH; x++) {
+                const uint8_t *px = fb + y * N88_FB_STRIDE + x * 4u;
+                const uint8_t rgb[3] = { px[2], px[1], px[0] };
+                lit += (px[0] | px[1] | px[2]) != 0;
+                fwrite(rgb, 1, 3, f);
+            }
+        fclose(f);
+        printf("framebuffer written to %s (%" PRIu64 " of %u pixels not black)\n",
+               screen_out, lit, N88_FB_WIDTH * N88_FB_HEIGHT);
+    }
     if (ram_out) {                      /* -m: all of DRAM, for offline reading */
         FILE *f = fopen(ram_out, "wb");
         if (!f || fwrite(g_m.ram, 1, N88_DRAM_SIZE, f) != N88_DRAM_SIZE)

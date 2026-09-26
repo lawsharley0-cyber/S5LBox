@@ -374,13 +374,14 @@ static void build_tree(buf_t *t, tree_opts_t o) {
     static const uint8_t zero8[8];
     static const uint8_t zero4[4];
     t->n = 0;
-    b_node(t, 4, o.with_pram ? 5 : 4);
+    b_node(t, 4, o.with_pram ? 6 : 5);
     b_str(t, "name", "device-tree");
     b_str(t, "secure-root-prefix", "md");
     b_prop(t, "compatible", o.compat, o.compat_len);
     b_prop(t, "clock-frequency", zero4, 4);
       b_node(t, 2, 0); b_str(t, "name", "memory"); b_prop(t, "reg", zero8, 8);
       if (o.with_pram) { b_node(t, 2, 0); b_str(t, "name", "pram"); b_prop(t, "reg", zero8, 8); }
+      b_node(t, 2, 0); b_str(t, "name", "vram"); b_prop(t, "reg", zero8, 8);
       b_node(t, 1, 1); b_str(t, "name", "cpus");
         b_node(t, 7, 0); b_str(t, "name", "cpu0");
         b_prop(t, "timebase-frequency", zero4, 4);
@@ -527,17 +528,26 @@ static void test_boot_layout_and_tree(void) {
         CHECK(get32(ba + 0x30) == tree_pa - N88_DRAM_BASE + N88_VIRT_BASE &&
               get32(ba + 0x34) == tree.n, "boot_args device tree VA and size");
         CHECK(strcmp((const char *)ba + 0x38, N88_DEFAULT_CMDLINE) == 0, "the default boot-args");
-        bool video_zero = true;
-        for (unsigned i = 0x14; i < 0x30; i++) video_zero &= ba[i] == 0;
-        CHECK(video_zero, "no framebuffer in Boot_Video");
+        CHECK(get32(ba + 0x14) == N88_VRAM_PA && get32(ba + 0x18) == 0u &&
+              get32(ba + 0x1c) == 1280u && get32(ba + 0x20) == 320u &&
+              get32(ba + 0x24) == 480u && get32(ba + 0x28) == 32u,
+              "Boot_Video: iBoot's 320x480x32 framebuffer, text console mode");
+        CHECK(N88_VRAM_PA == 0x4fe3a000u && N88_PRAM_PA == 0x4fffc000u &&
+              N88_DRAM_SIZE - N88_TOP_RESERVE == 0x0fe3a000u &&
+              N88_VRAM_PA + N88_VRAM_SIZE == N88_PRAM_PA,
+              "the top of DRAM as iBoot lays it out: three buffers, then /pram");
+        CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "n88_framebuffer");
 
         const uint8_t *dt = ram_at(m, tree_pa);
         uint32_t l = 0;
         const uint8_t *p = tree_prop(dt, tree.n, "memory", "reg", &l);
         CHECK(p && get32(p) == N88_DRAM_BASE && get32(p + 4) == N88_DRAM_SIZE, "/memory:reg");
         p = tree_prop(dt, tree.n, "pram", "reg", &l);
-        CHECK(p && get32(p) == N88_DRAM_BASE + N88_DRAM_SIZE - N88_TOP_RESERVE &&
-              get32(p + 4) == N88_PRAM_SIZE, "/pram:reg at the top of DRAM");
+        CHECK(p && get32(p) == N88_PRAM_PA && get32(p + 4) == 0x4000u,
+              "/pram:reg: the last 16 KiB of DRAM");
+        p = tree_prop(dt, tree.n, "vram", "reg", &l);
+        CHECK(p && get32(p) == N88_VRAM_PA && get32(p + 4) == N88_VRAM_SIZE,
+              "/vram:reg: the framebuffer pool");
         p = tree_prop(dt, tree.n, "", "clock-frequency", &l);
         CHECK(p && get32(p) == N88_BUS_HZ, "root clock-frequency");
         static const struct { const char *prop; uint32_t v; } cpu0[] = {

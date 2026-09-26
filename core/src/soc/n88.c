@@ -349,6 +349,10 @@ uint8_t *n88_nor(n88_t *m) {
     return m ? m->nor_mem : NULL;
 }
 
+const uint8_t *n88_framebuffer(const n88_t *m) {
+    return m && m->ram && m->booted ? m->ram + (N88_VRAM_PA - N88_DRAM_BASE) : NULL;
+}
+
 /* ---------------------------------------------------------------- run */
 
 unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status) {
@@ -623,7 +627,8 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     if (ds != DT_OK)
         return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: %s", dt_strerror(ds));
     const uint32_t mem[2] = { N88_DRAM_BASE, N88_DRAM_SIZE };
-    const uint32_t pram[2] = { N88_DRAM_BASE + N88_DRAM_SIZE - N88_TOP_RESERVE, N88_PRAM_SIZE };
+    const uint32_t pram[2] = { N88_PRAM_PA, N88_PRAM_SIZE };
+    const uint32_t vram[2] = { N88_VRAM_PA, N88_VRAM_SIZE };
     static const struct { const char *path, *prop; uint32_t v; } clocks[] = {
         { "",          "clock-frequency",      N88_BUS_HZ },
         { "cpus/cpu0", "timebase-frequency",   N88_TB_HZ  },
@@ -637,6 +642,8 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: no 8-byte /memory:reg");
     if (!dt_set_words(tree, &dt, &root, "pram", "reg", pram, 2))
         return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: no 8-byte /pram:reg");
+    /* The framebuffer pool; like iBoot, pass over a tree without /vram. */
+    (void)dt_set_words(tree, &dt, &root, "vram", "reg", vram, 2);
     for (size_t i = 0; i < sizeof clocks / sizeof clocks[0]; i++)
         if (!dt_set_words(tree, &dt, &root, clocks[i].path, clocks[i].prop, &clocks[i].v, 1))
             return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: no 4-byte /%s:%s",
@@ -737,7 +744,18 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     st32(ba + 0x08, N88_DRAM_BASE);
     st32(ba + 0x0c, N88_DRAM_SIZE - N88_TOP_RESERVE);   /* the top is boot-owned */
     st32(ba + 0x10, (uint32_t)tokd_pa);
-    /* Boot_Video at 0x14..0x2f stays zero: no framebuffer yet. */
+    /* Boot_Video: iBoot's first framebuffer (n88.h). v_display selects the
+     * console mode, not whether a display exists: the iPhone OS 3 machine
+     * measured that non-zero picks graphics mode, in which the kernel never
+     * attaches its text console, and zero makes it paint the boot log onto
+     * the framebuffer (core/src/boot/bringup.c). This machine has no boot
+     * logo to show, so it asks for the log. */
+    st32(ba + 0x14, N88_VRAM_PA);
+    st32(ba + 0x18, 0u);
+    st32(ba + 0x1c, N88_FB_STRIDE);
+    st32(ba + 0x20, N88_FB_WIDTH);
+    st32(ba + 0x24, N88_FB_HEIGHT);
+    st32(ba + 0x28, N88_FB_DEPTH);
     st32(ba + 0x30, (uint32_t)tree_pa - N88_DRAM_BASE + N88_VIRT_BASE);
     st32(ba + 0x34, (uint32_t)req->devicetree_size);
     memcpy(ba + 0x38, cmdline, strlen(cmdline));

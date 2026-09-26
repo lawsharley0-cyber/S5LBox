@@ -585,6 +585,24 @@ first step below.
    (0x87800000 and channels 1-2 at 0x87001000/0x87002000) that nothing
    completes.
 
+   **The display, first slice: iBoot's framebuffer (2026-09-26).** The top of
+   DRAM is now laid out as this firmware's iBoot leaves it: `/pram` is the
+   last 16 KiB (0x4fffc000), and `/vram` is the three page-rounded 320x480
+   buffers below it (0x4fe3a000-0x4fffbfff) that iBoot reserves for its
+   panel entry "n88" (320x480, 163 ppi, 10.8 MHz pixel clock -- the same
+   pixel clock n88's clock table already carries), in its default RGB888
+   colour space laid out as 32 bits per pixel. Boot_Video describes the
+   first buffer and `memSize` stops below the pool. `v_display` is 0 (text
+   mode), so the kernel's own console paints the boot log onto it; with
+   `serial=3` on the command line the log goes to the UART instead and the
+   screen shows only the cursor, which is why the harness keeps it and the
+   app can choose. `boot3gs -F screen.ppm` writes the framebuffer at the end
+   of a run; with `-c "rd=md0 debug=0x8 -v"` on 10B500 it shows the verbose
+   log through the root mount, launchd and the FIPS self-test. The display
+   controller itself (`clcd,s5l8920x` at 0x85400000, whose window 0 iBoot
+   programs at +0x20..+0x34) is not modelled yet: that is what AppleM2CLCD
+   and, later, SpringBoard's surfaces will need.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 
