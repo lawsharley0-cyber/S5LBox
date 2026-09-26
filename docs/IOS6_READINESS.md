@@ -649,3 +649,17 @@ container; the on-phone ceiling is separate and cited below.
   ultimately, the techniques iCube uses (docs/ICUBE_DOLPHIN_RESEARCH.md).
   This project keeps the no-JIT constraint, so the cached interpreter is the
   ceiling here.
+
+### Why display and touch stop at the framebuffer (#44)
+
+The scanout controller (AppleM2CLCD) and the touch controller
+(`multi-touch,n88` on spi1, the Z2 the iPhone OS 3 machine already models)
+are driven by SpringBoard and the window server, which never start: the
+system reboots at the keybag (kb_load) first. During the boot the only
+display-side hardware touched is the M2 scaler at 0x85500000, and it
+no-ops harmlessly -- the driver reads HW version 0, warns, and continues.
+So a CLCD or Z2 model added now could not be exercised or validated on a
+booting system. The verifiable slice of #44 -- iBoot's framebuffer with
+the kernel's own boot log on it, and the spi-version 1 controller the
+touch device would sit on -- is done; the rest is gated behind the keybag,
+which this session stopped short of (see above).
