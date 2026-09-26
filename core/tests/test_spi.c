@@ -1290,6 +1290,140 @@ static void test_snapshot_rejects_impossible_spi_state(void) {
     s5l8900_free(&m);
 }
 
+/* ------------------------------------------------------ spi-version 1 --- */
+
+static uint32_t v1_tx_level(s5l_spi_t *bus) {
+    return (s5l_spi_read(bus, SPI_STATUS) >> SPI_STATUS_TX_SHIFT_V1) & SPI_STATUS_LEVEL_V1;
+}
+static uint32_t v1_rx_level(s5l_spi_t *bus) {
+    return (s5l_spi_read(bus, SPI_STATUS) >> SPI_STATUS_RX_SHIFT_V1) & SPI_STATUS_LEVEL_V1;
+}
+
+static void test_version_one_register_layout(void) {
+    s5l_spi_t bus;
+    echo_t e;
+    s5l_spi_slave_t slave;
+    s5l_spi_reset(&bus);
+    CHECK(bus.version == 0u, "reset is not version 0");
+    CHECK(!s5l_spi_set_version(&bus, 2u) && !s5l_spi_set_version(NULL, 1u) &&
+          bus.version == 0u, "an impossible version was accepted");
+    CHECK(s5l_spi_set_version(&bus, 1u) && bus.version == 1u, "version 1 refused");
+    bind_echo(&slave, &e);
+    CHECK(s5l_spi_attach(&bus, 0u, &slave), "attach failed");
+
+    /* Five-bit levels in their version 1 places, sixteen deep. */
+    for (unsigned i = 0; i < S5L_SPI_FIFO_DEPTH_V1; i++)
+        s5l_spi_write(&bus, SPI_TXDATA, 0x40u + i);
+    CHECK(v1_rx_level(&bus) == 16u && v1_tx_level(&bus) == 0u && e.words == 16u,
+          "16 words did not all shift into a 16-deep receive FIFO: rx %u tx %u words %u",
+          v1_rx_level(&bus), v1_tx_level(&bus), e.words);
+    s5l_spi_write(&bus, SPI_TXDATA, 0x99u);
+    CHECK(v1_tx_level(&bus) == 1u && e.words == 16u,
+          "a full receive FIFO did not hold the 17th word in the transmit FIFO");
+    CHECK(s5l_spi_read(&bus, SPI_RXDATA) == (0x40u ^ 0xa5u) && e.words == 17u &&
+          v1_rx_level(&bus) == 16u && v1_tx_level(&bus) == 0u,
+          "reading one answer did not make room for the held word");
+    for (unsigned i = 0; i < S5L_SPI_FIFO_DEPTH_V1; i++)
+        s5l_spi_write(&bus, SPI_TXDATA, 0u);
+    CHECK(v1_tx_level(&bus) == 16u && bus.tx_drops == 0u, "16 transmit slots");
+    s5l_spi_write(&bus, SPI_TXDATA, 0u);
+    CHECK(bus.tx_drops == 1u, "a 17th queued word was not dropped and counted");
+
+    /* The event latches are the version 1 mask, cleared by writing them back. */
+    uint32_t s = s5l_spi_read(&bus, SPI_STATUS);
+    CHECK((s & SPI_STATUS_EVENTS_V1) == SPI_STATUS_EVENTS_V1 &&
+          (s & ~(SPI_STATUS_EVENTS_V1 | (0x1fu << 6) | (0x1fu << 11))) == 0u,
+          "STATUS %08x is not the version 1 layout", s);
+    s5l_spi_write(&bus, SPI_STATUS, s);
+    CHECK((s5l_spi_read(&bus, SPI_STATUS) & SPI_STATUS_EVENTS_V1) == 0u &&
+          v1_rx_level(&bus) == 16u, "the raw write-back did not clear only the latches");
+
+    /* 0x4c is a register on version 1 and nothing on version 0. */
+    s5l_spi_write(&bus, SPI_CNT_V1, 0x123u);
+    CHECK(s5l_spi_read(&bus, SPI_CNT_V1) == 0x123u && bus.unknown_writes == 0u &&
+          bus.unknown_reads == 0u, "0x4c not stored on version 1");
+    s5l_spi_t v0;
+    s5l_spi_reset(&v0);
+    s5l_spi_write(&v0, SPI_CNT_V1, 0x123u);
+    CHECK(s5l_spi_read(&v0, SPI_CNT_V1) == 0u && v0.unknown_writes == 1u &&
+          v0.unknown_reads == 1u && v0.unknown_off[0] == SPI_CNT_V1,
+          "a version 0 part answered 0x4c");
+}
+
+/*
+ * iOS 6's AppleSamsungSPI on a version 1 part, step for step: the PIO path of
+ * its transfer routine (0x8061c554) and its interrupt filter (0x8061c894),
+ * for a read shaped like a NOR one -- four command octets out, twenty in, so
+ * the driver pads the transmit side with 0xff (0x8061c946) -- and then
+ * finishTransfer (0x8061c9c0). It must complete, carry every octet, and drop
+ * the line.
+ */
+static void test_version_one_stock_transfer_completes(void) {
+    s5l_spi_t bus;
+    echo_t e;
+    s5l_spi_slave_t slave;
+    s5l_spi_reset(&bus);
+    CHECK(s5l_spi_set_version(&bus, 1u), "version 1 refused");
+    bind_echo(&slave, &e);
+    CHECK(s5l_spi_attach(&bus, 0u, &slave), "attach failed");
+
+    const uint8_t cmd[4] = { 0x03u, 0x0fu, 0xa0u, 0x00u };
+    uint8_t rx[20];
+    memset(rx, 0xcc, sizeof rx);
+    unsigned tx_left = 4u, rx_left = 20u, pad_left = 16u, discard_left = 0u;
+    unsigned tx_at = 0u, rx_at = 0u;
+    const uint32_t base = 0x4018u;          /* SETUP 0x4000 | 0x18, 8-bit words */
+
+    s5l_spi_write(&bus, SPI_CLKDIV, 2u);
+    s5l_spi_write(&bus, SPI_IDD, 0u);
+    s5l_spi_write(&bus, SPI_STATUS, SPI_STATUS_EVENTS_V1);
+    s5l_spi_write(&bus, SPI_SETUP, base);
+    s5l_spi_write(&bus, SPI_CONTROL, SPI_CONTROL_START);
+    s5l_spi_write(&bus, SPI_CNT, 20u);
+    s5l_spi_write(&bus, SPI_CNT_V1, 20u);
+    s5l_spi_write(&bus, SPI_SETUP, base | SPI_SETUP_ARM);
+    for (unsigned n = 0; n < S5L_SPI_FIFO_DEPTH_V1 && tx_left; n++, tx_left--)
+        s5l_spi_write(&bus, SPI_TXDATA, cmd[tx_at++]);
+    uint32_t go = SPI_SETUP_ARM | SPI_SETUP_GO | 0x200000u;
+    s5l_spi_write(&bus, SPI_SETUP, base | go);
+    CHECK(s5l_spi_irq(&bus), "the go store did not raise the line");
+
+    unsigned passes = 0;
+    bool done = false;
+    while (!done && passes++ < 32u) {
+        const uint32_t s = s5l_spi_read(&bus, SPI_STATUS);
+        const unsigned tx_free = 16u - ((s >> 6) & 0x1fu);
+        unsigned have = (s >> 11) & 0x1fu;
+        if (!have) break;                       /* the filter's bail-out */
+        while (have--) {
+            const uint8_t b = (uint8_t)s5l_spi_read(&bus, SPI_RXDATA);
+            if (rx_left) { rx[rx_at++] = b; rx_left--; }
+            else if (discard_left) discard_left--;
+        }
+        for (unsigned n = 0; n < tx_free; n++) {
+            if (tx_left) { s5l_spi_write(&bus, SPI_TXDATA, cmd[tx_at++]); tx_left--; }
+            else if (pad_left) { s5l_spi_write(&bus, SPI_TXDATA, 0xffu); pad_left--; }
+            else break;
+        }
+        s5l_spi_write(&bus, SPI_STATUS, s);
+        if (!tx_left && !rx_left && !discard_left) {
+            go &= 0x200000u;
+            s5l_spi_write(&bus, SPI_SETUP, base | go);
+            done = true;
+        }
+    }
+    CHECK(done && passes <= 3u, "the version 1 filter did not finish (%u passes)", passes);
+    bool carried = rx_at == 20u;
+    for (unsigned i = 0; carried && i < 20u; i++)
+        carried = rx[i] == (uint8_t)((i < 4u ? cmd[i] : 0xffu) ^ 0xa5u);
+    CHECK(carried && e.words == 20u, "the 20 answers are not the 20 words sent");
+
+    s5l_spi_write(&bus, SPI_SETUP, base);                 /* finishTransfer */
+    s5l_spi_write(&bus, SPI_STATUS, SPI_STATUS_EVENTS_V1);
+    CHECK(!s5l_spi_irq(&bus) && bus.tx_level == 0u && bus.rx_level == 0u,
+          "the finished transfer left the line up or a FIFO occupied");
+}
+
 int main(void) {
     printf("S5LBox S5L8900 SPI controller tests\n");
     test_reset_and_attachment_are_bounded();
@@ -1309,6 +1443,8 @@ int main(void) {
     test_wake_sources_declare_lines_nine_and_ten();
     test_snapshot_carries_an_in_flight_transfer();
     test_snapshot_rejects_impossible_spi_state();
+    test_version_one_register_layout();
+    test_version_one_stock_transfer_completes();
     printf("  %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

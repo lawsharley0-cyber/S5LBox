@@ -148,7 +148,11 @@ SNAP_SIZE_GUARD(s5l_wm8991_t,      496,   "snap_codec");
  * underrun, overrun; serialised) and tx_credit (zero outside a refresh, not
  * serialised). */
 SNAP_SIZE_GUARD(s5l_i2s_t,         192,   "snap_i2s");
-SNAP_SIZE_GUARD(s5l_spi_t,         240,   "snap_spi");
+/* 256 = 240 + cnt_v1 (4), the FIFOs widened from 8 to 16 octets each (16),
+ * and `version` (1, in padding), less padding. None of it enters the file:
+ * this format carries the S5L8900 machine, whose controllers are version 0 --
+ * see snap_spi(). */
+SNAP_SIZE_GUARD(s5l_spi_t,         256,   "snap_spi");
 /* Four register banks, plus what the board is driving and which lines it
  * drives at all -- see the `driven` note in soc.h. */
 SNAP_SIZE_GUARD(s5l_gpioic_t,      224,   "snap_gpioic");
@@ -246,8 +250,11 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 129968 is the CPU's d16-d31 (128 bytes, see the arm_cpu_t guard): not
  * stored, since the ARM1176 has no such registers, so v33 stands.
  * 129984 is the CPU's ARMv7 CP15 registers (16 bytes with padding, see the
- * arm_cpu_t guard): not stored either, v33 stands. Measured with sizeof. */
-SNAP_SIZE_GUARD(s5l8900_t,         129984, "snap_mach");
+ * arm_cpu_t guard): not stored either, v33 stands. Measured with sizeof.
+ * 130016 is the two SPI controllers' version 1 fields (16 bytes each, see the
+ * s5l_spi_t guard): a version 0 part never uses them, so not stored and v33
+ * stands. Measured with sizeof. */
+SNAP_SIZE_GUARD(s5l8900_t,         130016, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -912,7 +919,8 @@ static bool spi_state_valid(const s5l_spi_t *s) {
                    S5L_SPI_LCD_READ_PENDING)) != 0u ||
         (s->cs & S5L_SPI_CS_ROUTE_MASK) >= S5L_SPI_SLAVES ||
         (s->status & ~(uint32_t)SPI_STATUS_EVENTS) != 0u ||
-        s->unknown_off_count > S5L_SPI_UNKNOWN_OFF)
+        s->unknown_off_count > S5L_SPI_UNKNOWN_OFF ||
+        s->version != 0u || s->cnt_v1 != 0u)
         return false;
     if ((s->cs & S5L_SPI_LCD_READ_PENDING) != 0u &&
         ((s->cs & S5L_SPI_CS_ROUTE_MASK) != S5L_SPI0_LCD_CS ||
@@ -930,6 +938,14 @@ static bool spi_state_valid(const s5l_spi_t *s) {
  * value as corrupt, while a new reader interprets an old clear bit as no
  * pending read. snap_apply() reasserts spi0's current low board route so
  * checkpoints made before the lcd0 endpoint existed can resume.
+ */
+/*
+ * Version 1 state is not in the file. The S5L8900 machine this format carries
+ * has only version 0 controllers: `version` is board wiring like the slave
+ * table, `cnt_v1` is a register such parts do not have, and a version 0 FIFO
+ * never holds more than its first S5L_SPI_FIFO_DEPTH octets (fifo_pop zeroes
+ * the rest), so those are all the octets written. spi_state_valid() refuses a
+ * controller that is not version 0.
  */
 static void snap_spi(sn_io_t *io, s5l_spi_t *s) {
     F32(s->control); F32(s->setup); F32(s->pin);

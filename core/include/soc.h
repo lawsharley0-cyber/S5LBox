@@ -2645,16 +2645,50 @@ uint32_t s5l_i2s_fifo_pa(unsigned index, s5l_i2s_fifo_t which);
  * raw status word it read (0xc05a67d0, `mov r2, r8`), not the event mask, so a
  * model that stored the levels would zero them on the first acknowledge.
  *
- * Version 1 parts move both fields (`(s >> 6) & 0x1F` and `(s >> 11) & 0x1F`),
- * use a depth of 16, a SETUP base of 0x4000 and an event mask of 0x0040000F,
- * and add a register at 0x4c the driver writes only when _spiVersion is
- * non-zero. None of that is defined here: this SoC has no such controller, and
- * a constant that looks wired but is not is a landmine.
+ * Version 1 parts, below, move both fields.
  */
 #define SPI_STATUS_EVENTS   0x000fu
 #define SPI_STATUS_TX_SHIFT 4u
 #define SPI_STATUS_RX_SHIFT 8u
 #define SPI_STATUS_LEVEL    0x000fu
+
+/*
+ * SPI-VERSION 1: the iPhone 3GS's controllers (S5L8920, `spi-version {1}`,
+ * "_spiVersion = 1" in the guest's start message). The same block, driven by
+ * the same driver family; iOS 6's AppleSamsungSPI (10B500, loaded at
+ * 0x8061b000) switches on the version in exactly these places and nowhere
+ * else:
+ *
+ *   - STATUS levels are five bits wide, transmit at [10:6] and receive at
+ *     [15:11] (the level decoders at 0x8061ca3c and 0x8061ca6c); the depth
+ *     they are subtracted from is 16 (0x8061ca5c, 0x8061ca8c), and 16 is the
+ *     prefill limit start() stores (0x8061c176).
+ *   - The event mask the driver writes to STATUS at power-on, before each
+ *     transfer and in finishTransfer is 0x0040000F (0x8061c178). As on
+ *     version 0 it never tests a single latch: the filter decides from the
+ *     receive level and acknowledges with the raw word (0x8061c960).
+ *   - SETUP's base is 0x4000 (0x8061c16e) with the word size at bit 15
+ *     (0x8061c16c) instead of 13; 0x18, 0x20, 0x40, 0x180 and the 0x100
+ *     completion enable are unchanged (0x8061c444, 0x8061c766, 0x8061c7b6,
+ *     and the filter's clear at 0x8061c98a). Going also ORs 0x200000
+ *     (0x8061c7c6), which the filter keeps when it drops the rest
+ *     (0x8061c99a); what it does is not established, so it is stored.
+ *   - 0x4c is a second count. A PIO transfer writes it with the same
+ *     max(txLen, rxLen) as CNT (0x8061c6ca); the DMA path writes
+ *     CNT = 0 and 0x4c = txLen (0x8061c640-0x8061c664). Stored; it gates
+ *     nothing, for the same reason CNT does not.
+ *
+ * The interrupt rule is unchanged: the version 1 filter also returns false
+ * without acknowledging when the receive level is zero (0x8061c8cc).
+ */
+#define SPI_CNT_V1              0x4cu
+#define SPI_STATUS_EVENTS_V1    0x0040000fu
+#define SPI_STATUS_TX_SHIFT_V1  6u
+#define SPI_STATUS_RX_SHIFT_V1  11u
+#define SPI_STATUS_LEVEL_V1     0x001fu
+#define S5L_SPI_FIFO_DEPTH_V1   16u
+/* The FIFO arrays hold the larger depth; a version 0 part uses the first 8. */
+#define S5L_SPI_FIFO_CAP        16u
 
 /* Eight, from start()'s spi-version 0 arm at 0xc05a6fec — and the same 8 the
  * driver uses as its prefill limit, which is why run59's 19 writes decompose
@@ -2701,8 +2735,10 @@ typedef struct {
     uint32_t words_left;    /* latched from CNT. Visibility, not a gate — see
                              * s5l_spi_write() for why it must not be one.    */
 
-    uint8_t  tx[S5L_SPI_FIFO_DEPTH];
-    uint8_t  rx[S5L_SPI_FIFO_DEPTH];
+    uint32_t cnt_v1;        /* SPI_CNT_V1; version 1 parts only               */
+
+    uint8_t  tx[S5L_SPI_FIFO_CAP];
+    uint8_t  rx[S5L_SPI_FIFO_CAP];
     uint8_t  tx_level, rx_level;
     /*
      * Which chip select words are routed to, in the low two bits. The real
@@ -2715,6 +2751,9 @@ typedef struct {
      * routing is modelled, it drives only the low route bits.
      */
     uint8_t  cs;
+    /* 0 or 1, the device tree's `spi-version`: board wiring, set after reset
+     * (s5l_spi_set_version), never changed by the guest. */
+    uint8_t  version;
 
     /* Bounded diagnostics, as on I2C: unknown or refused traffic must be
      * visible without letting a guest grow host allocations. */
@@ -2783,6 +2822,9 @@ void     s5l_spi_reset(s5l_spi_t *bus);
  * a device would be worse than refusing. */
 bool     s5l_spi_attach(s5l_spi_t *bus, unsigned cs,
                         const s5l_spi_slave_t *slave);
+/* Which register layout the part has: 0 (S5L8900) or 1 (S5L8920). Refuses
+ * anything else. Reset makes it 0; set it with the rest of the board wiring. */
+bool     s5l_spi_set_version(s5l_spi_t *bus, unsigned version);
 /* Not const: reading SPI_RXDATA pops the receive FIFO, which is what makes room
  * for the rest of a backed-up transfer. */
 uint32_t s5l_spi_read(s5l_spi_t *bus, uint32_t off);

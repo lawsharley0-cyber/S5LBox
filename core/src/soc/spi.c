@@ -35,6 +35,20 @@ static void note_unknown(s5l_spi_t *bus, uint32_t off) {
         bus->unknown_off[bus->unknown_off_count++] = off;
 }
 
+bool s5l_spi_set_version(s5l_spi_t *bus, unsigned version) {
+    if (!bus || version > 1u) return false;
+    bus->version = (uint8_t)version;
+    return true;
+}
+
+/* The per-version facts soc.h lists: FIFO depth and the event latches. */
+static unsigned fifo_depth(const s5l_spi_t *bus) {
+    return bus->version ? S5L_SPI_FIFO_DEPTH_V1 : S5L_SPI_FIFO_DEPTH;
+}
+static uint32_t event_mask(const s5l_spi_t *bus) {
+    return bus->version ? SPI_STATUS_EVENTS_V1 : SPI_STATUS_EVENTS;
+}
+
 /* Depth eight, so shifting the array down on a pop costs seven bytes and buys a
  * representation with no head/tail to wrap — one a snapshot validator can check
  * with `level <= depth` and nothing else. */
@@ -102,7 +116,8 @@ static void spi_shift(s5l_spi_t *bus) {
      * counted rather than pretended away.
      */
     const bool dma = (bus->setup & SPI_SETUP_DMA) != 0u;
-    while (bus->tx_level && (dma || bus->rx_level < S5L_SPI_FIFO_DEPTH)) {
+    const unsigned depth = fifo_depth(bus);
+    while (bus->tx_level && (dma || bus->rx_level < depth)) {
         uint8_t out = fifo_pop(bus->tx, &bus->tx_level);
         uint8_t in  = slave->transfer(slave->ctx, out);
         /*
@@ -134,7 +149,7 @@ static void spi_shift(s5l_spi_t *bus) {
          * -- 91 reads against 54,351 writes on spi1 across the whole run.
          */
         if (dma)                                     bus->rx_overruns++;
-        else if (bus->rx_level < S5L_SPI_FIFO_DEPTH) bus->rx[bus->rx_level++] = in;
+        else if (bus->rx_level < depth)              bus->rx[bus->rx_level++] = in;
         else                                         bus->rx_overruns++;
         bus->words++;
         if (bus->words_left) bus->words_left--;
@@ -149,11 +164,15 @@ static void spi_shift(s5l_spi_t *bus) {
          * consequence is that one W1C clears them all — which is exactly what
          * the driver does anyway.
          */
-        bus->status |= SPI_STATUS_EVENTS;
+        bus->status |= event_mask(bus);
     }
 }
 
 static uint32_t spi_status(const s5l_spi_t *bus) {
+    if (bus->version)
+        return (bus->status & SPI_STATUS_EVENTS_V1) |
+               ((uint32_t)bus->tx_level << SPI_STATUS_TX_SHIFT_V1) |
+               ((uint32_t)bus->rx_level << SPI_STATUS_RX_SHIFT_V1);
     return (bus->status & SPI_STATUS_EVENTS) |
            ((uint32_t)bus->tx_level << SPI_STATUS_TX_SHIFT) |
            ((uint32_t)bus->rx_level << SPI_STATUS_RX_SHIFT);
@@ -177,6 +196,11 @@ uint32_t s5l_spi_read(s5l_spi_t *bus, uint32_t off) {
         case SPI_CLKDIV:  return bus->clkdiv;
         case SPI_CNT:     return bus->cnt;
         case SPI_IDD:     return bus->idd;
+        case SPI_CNT_V1:
+            if (bus->version) return bus->cnt_v1;
+            bus->unknown_reads++;      /* a version 0 part has no such register */
+            note_unknown(bus, off);
+            return 0u;
         default:
             bus->unknown_reads++;
             note_unknown(bus, off);
@@ -220,7 +244,7 @@ void s5l_spi_write(s5l_spi_t *bus, uint32_t off, uint32_t val) {
              * the whole raw word it just read (0xc05a67d0), levels included, so
              * anything that treated those bits as writable would zero them on
              * the first acknowledge. They are computed in spi_status(). */
-            bus->status &= ~(val & SPI_STATUS_EVENTS);
+            bus->status &= ~(val & event_mask(bus));
             break;
         case SPI_PIN:
             /* The internal chip select, active low in bit 1 — the driver bics
@@ -233,7 +257,7 @@ void s5l_spi_write(s5l_spi_t *bus, uint32_t off, uint32_t val) {
             bus->pin = val;
             break;
         case SPI_TXDATA:
-            if (bus->tx_level >= S5L_SPI_FIFO_DEPTH) { bus->tx_drops++; break; }
+            if (bus->tx_level >= fifo_depth(bus)) { bus->tx_drops++; break; }
             bus->tx[bus->tx_level++] = (uint8_t)val;
             spi_shift(bus);
             break;
@@ -308,6 +332,13 @@ void s5l_spi_write(s5l_spi_t *bus, uint32_t off, uint32_t val) {
         case SPI_IDD:
             bus->idd = val;
             break;
+        case SPI_CNT_V1:
+            /* Stored, and like CNT it gates nothing: see soc.h. A version 0
+             * part has no such register. */
+            if (bus->version) { bus->cnt_v1 = val; break; }
+            bus->unknown_writes++;
+            note_unknown(bus, off);
+            break;
         default:
             bus->unknown_writes++;
             note_unknown(bus, off);
@@ -336,7 +367,7 @@ bool s5l_spi_irq(const s5l_spi_t *bus) {
      * of the bare base word.
      */
     return bus && (bus->setup & SPI_SETUP_IRQ) != 0u &&
-           (bus->status & SPI_STATUS_EVENTS) != 0u && bus->rx_level != 0u;
+           (bus->status & event_mask(bus)) != 0u && bus->rx_level != 0u;
 }
 
 void s5l_spi_irq_note(s5l_spi_t *bus) {
