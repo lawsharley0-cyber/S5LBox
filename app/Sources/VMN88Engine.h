@@ -4,10 +4,11 @@
 //  A deliberately small sibling of VMEngine. VMEngine is the S5L8900 machine's
 //  engine and everything in it -- the framebuffer, touch, buttons, audio,
 //  checkpoints, the root-filesystem work image -- belongs to that machine.
-//  The iPhone 3GS machine (core/include/n88.h) has none of those yet: it boots
-//  the iOS 6 kernel as far as a machine with no storage, display or input
-//  allows, and prints what the kernel prints. So this runs it on a thread of
-//  its own and hands the console text to the screen, and nothing else.
+//  The iPhone 3GS machine (core/include/n88.h) has few of those yet: it boots
+//  the iOS 6 kernel as far as a machine with no storage or input allows, on
+//  the framebuffer iBoot would have set up, where the kernel paints its boot
+//  log. So this runs it on a thread of its own and publishes that framebuffer
+//  and any console text, and nothing else.
 //
 //  Time: the guest's clock is kept from running ahead of the wall clock.
 //  An idle kernel skips straight to its next timer interrupt, which on a fast
@@ -40,6 +41,18 @@ NS_ASSUME_NONNULL_BEGIN
 
 /* Console text produced since the last call, or nil. */
 - (nullable NSString *)takePendingConsoleText;
+
+/* The newest published frame, if there is one the caller has not taken:
+ * copies it into `dst` (at least `capacity` bytes) and reports its geometry.
+ * Pixels are 32 bits; present them in the B,G,R,X order the iPhone OS 3
+ * machine's framebuffer uses (the kernel's console draws only greys, so the
+ * order is not yet confirmed on this machine). Frames are copied out of guest
+ * memory on the machine's own thread, so the caller never reads guest RAM. */
+- (BOOL)copyFrameInto:(void *)dst
+             capacity:(size_t)capacity
+                width:(uint32_t *)width
+               height:(uint32_t *)height
+               stride:(uint32_t *)stride;
 
 /* One line: state, speed, guest time. */
 - (NSString *)statusLine;

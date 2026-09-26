@@ -601,7 +601,10 @@ first step below.
    log through the root mount, launchd and the FIPS self-test. The display
    controller itself (`clcd,s5l8920x` at 0x85400000, whose window 0 iBoot
    programs at +0x20..+0x34) is not modelled yet: that is what AppleM2CLCD
-   and, later, SpringBoard's surfaces will need.
+   and, later, SpringBoard's surfaces will need. In the app, the 3GS preview
+   now boots with `debug=0x8 -v` and presents this framebuffer on the phone's
+   screen (VMN88Engine publishes a copy about 30 times a second from the
+   machine's own thread), instead of overlaying console text.
 
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.

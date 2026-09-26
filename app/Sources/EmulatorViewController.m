@@ -454,10 +454,11 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 }
 
 /*
- * The iPhone 3GS preview: no framebuffer, touch or buttons yet, so the screen
- * area shows the kernel's console (see -viewDidLayoutSubviews), the way a
- * verbose boot does on a real phone. A refusal is printed there too, because
- * this runs before the screen is on a window and an alert would be lost.
+ * The iPhone 3GS preview: iBoot's framebuffer, on which the kernel paints its
+ * verbose boot log the way a verbose boot does on a real phone (published by
+ * VMN88Engine, presented in -tick:), and no touch or buttons yet. A refusal
+ * goes to the console, because this runs before the screen is on a window
+ * and an alert would be lost.
  */
 - (void)launchIPhone3GS {
     [_n88 stop];
@@ -1061,13 +1062,6 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _console.hidden = !inlineConsole;
     _console.frame = CGRectMake(safe.left, y + statsHeight,
         fmax(0, b.size.width - safe.left - safe.right), consoleHeight);
-    if (_isIPhone3GS) {
-        /* The preview has no display: its console IS the screen. */
-        _console.hidden = NO;
-        _console.frame = [_phoneShell.guestContainer
-            convertRect:_phoneShell.guestContainer.bounds toView:self.view];
-        [self.view bringSubviewToFront:_console];
-    }
     [self flushConsole];
 }
 
@@ -1437,6 +1431,17 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                         height:fbH
                         stride:fbStride
                           argb:argb];
+    /* The iPhone 3GS preview publishes iBoot's framebuffer (VMN88Engine.h). */
+    if (_frame && [_n88 copyFrameInto:_frame
+                             capacity:VM_FB_BYTES
+                                width:&fbW
+                               height:&fbH
+                               stride:&fbStride])
+        [_screen presentPixels:_frame
+                         width:fbW
+                        height:fbH
+                        stride:fbStride
+                          argb:NO];
 
     [self appendConsole:[_engine takePendingConsoleText]];
     [self appendConsole:[_n88 takePendingConsoleText]];

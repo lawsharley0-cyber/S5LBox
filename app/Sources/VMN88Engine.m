@@ -12,6 +12,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,6 +22,16 @@
 static const unsigned kVMN88Slice = 200000u;
 /* Console text held for the screen between drains. */
 static const NSUInteger kVMN88ConsoleLimit = 64u * 1024u;
+/* How often the framebuffer is published: often enough for scrolling text. */
+static const double kVMN88FrameInterval = 1.0 / 30.0;
+static const size_t kVMN88FrameBytes = (size_t)N88_FB_STRIDE * N88_FB_HEIGHT;
+/*
+ * The boot-args. The core's default carries serial=3, which sends the
+ * console to the UART, where the desktop harness reads it; the app has a
+ * screen instead, and without serial= the kernel paints its verbose log on
+ * the framebuffer (core/include/n88.h).
+ */
+static const char kVMN88Cmdline[] = "debug=0x8 -v";
 
 static double vm_n88_now(void) {
     struct timespec ts;
@@ -40,6 +51,9 @@ static double vm_n88_now(void) {
     double           _rate;            /* guest instructions per host second */
     double           _guestSeconds;
     uint64_t         _retired;
+    uint8_t         *_frame;           /* the published frame, under _lock */
+    uint64_t         _frameSerial;     /* bumped per publication           */
+    uint64_t         _frameTaken;      /* the serial last copied out       */
 }
 
 + (BOOL)firmwarePresent {
@@ -54,6 +68,8 @@ static double vm_n88_now(void) {
     self = [super init];
     if (!self) return nil;
     pthread_mutex_init(&_lock, NULL);
+    _frame = calloc(1, kVMN88FrameBytes);
+    if (!_frame) return nil;
     _pending = [NSMutableString string];
     _state = @"not started";
     return self;
@@ -61,6 +77,7 @@ static double vm_n88_now(void) {
 
 - (void)dealloc {
     [self stop];
+    free(_frame);
     pthread_mutex_destroy(&_lock);
 }
 
@@ -119,6 +136,7 @@ static double vm_n88_now(void) {
     const n88_boot_t req = {
         .kernel = kernel.bytes, .kernel_size = kernel.length,
         .devicetree = tree.bytes, .devicetree_size = tree.length,
+        .cmdline = kVMN88Cmdline,
     };
     const n88_status_t st = n88_boot(m, &req, detail, sizeof detail);
     if (st != N88_OK) {
@@ -136,9 +154,9 @@ static double vm_n88_now(void) {
          "cached interpreter, 256 MB DRAM\n"
          "[neon] kernel entry 0x%08x, device tree 0x%08x (%u bytes), "
          "boot-args \"%s\"\n"
-         "[neon] no storage, display or input yet: the kernel runs until it "
-         "waits for its root device\n\n",
-        m->entry_pa, m->devicetree_pa, m->devicetree_size, N88_DEFAULT_CMDLINE]];
+         "[neon] no storage or input yet: the kernel paints its log on the "
+         "screen until it waits for its root device\n\n",
+        m->entry_pa, m->devicetree_pa, m->devicetree_size, kVMN88Cmdline]];
 
     NSThread *thread = [[NSThread alloc] initWithTarget:self
                                                selector:@selector(threadMain:)
@@ -162,6 +180,7 @@ static double vm_n88_now(void) {
     _retired = 0;
     _rate = 0.0;
     _guestSeconds = 0.0;
+    _frameSerial = _frameTaken = 0;
     pthread_mutex_unlock(&_lock);
     [thread start];
     return YES;
@@ -172,7 +191,7 @@ static double vm_n88_now(void) {
     n88_t *m = _m;
     const double start = vm_n88_now();
     const double guestStart = n88_guest_seconds(m);
-    double pausedFor = 0.0, lastRateAt = start;
+    double pausedFor = 0.0, lastRateAt = start, lastFrameAt = 0.0;
     uint64_t retired = 0, retiredAtRate = 0;
     arm_status_t st = ARM_OK;
     NSString *finalState = @"stopped";
@@ -202,7 +221,14 @@ static double vm_n88_now(void) {
 
             const double now = vm_n88_now();
             const double guest = n88_guest_seconds(m) - guestStart;
+            const uint8_t *fb = n88_framebuffer(m);
             pthread_mutex_lock(&_lock);
+            if (fb && now - lastFrameAt >= kVMN88FrameInterval) {
+                /* The guest is not running while this copies. */
+                memcpy(_frame, fb, kVMN88FrameBytes);
+                _frameSerial++;
+                lastFrameAt = now;
+            }
             _retired = retired;
             _guestSeconds = guest;
             if (now - lastRateAt >= 1.0) {
@@ -227,10 +253,12 @@ static double vm_n88_now(void) {
         }
     }
 
+    pthread_mutex_lock(&_lock);
+    _m = NULL;
+    pthread_mutex_unlock(&_lock);
     n88_free(m);
     free(m);
     pthread_mutex_lock(&_lock);
-    _m = NULL;
     _running = NO;
     _state = finalState;
     dispatch_semaphore_t exited = _exited;
@@ -275,6 +303,26 @@ static double vm_n88_now(void) {
     [_pending setString:@""];
     pthread_mutex_unlock(&_lock);
     return text;
+}
+
+- (BOOL)copyFrameInto:(void *)dst
+             capacity:(size_t)capacity
+                width:(uint32_t *)width
+               height:(uint32_t *)height
+               stride:(uint32_t *)stride {
+    if (!dst || capacity < kVMN88FrameBytes) return NO;
+    pthread_mutex_lock(&_lock);
+    const BOOL fresh = _frameSerial != 0 && _frameSerial != _frameTaken;
+    if (fresh) {
+        memcpy(dst, _frame, kVMN88FrameBytes);
+        _frameTaken = _frameSerial;
+    }
+    pthread_mutex_unlock(&_lock);
+    if (!fresh) return NO;
+    if (width) *width = N88_FB_WIDTH;
+    if (height) *height = N88_FB_HEIGHT;
+    if (stride) *stride = N88_FB_STRIDE;
+    return YES;
 }
 
 - (NSString *)statusLine {
