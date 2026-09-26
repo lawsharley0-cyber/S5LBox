@@ -1710,6 +1710,180 @@ static void test_argument_and_growth_guards(void) {
     remove_if_present(source);
 }
 
+/*
+ * A partition that runs past the last allocation block, as the iOS 6.1.6
+ * (10B500, iPhone2,1) root filesystem does by 4 KiB: 16 blocks of 4 KiB plus
+ * a 2 KiB tail holding the alternate volume header in its last 1024 bytes.
+ * Block 0 (head), 1 (allocation file) and 15 (the last, marked used as
+ * Apple's image marks it) are allocated.
+ */
+#define TAIL_BS     4096u
+#define TAIL_BLOCKS 16u
+#define TAIL_EXTRA  2048u
+#define TAIL_SIZE   (TAIL_BS * TAIL_BLOCKS + TAIL_EXTRA)
+#define TAIL_FSTAB  (5u * TAIL_BS + 100u)
+
+static void make_tail_fixture(uint8_t *image, uint32_t extra) {
+    const size_t size = TAIL_BS * TAIL_BLOCKS + extra;
+    uint8_t *header = image + HFS_VH_OFF;
+    memset(image, 0, TAIL_SIZE + TAIL_BS);
+    put_be16(header, 0x4858u);
+    put_be16(header + 2, 5u);
+    put_be32(header + 4, 1u << 8);
+    put_be32(header + 40, TAIL_BS);
+    put_be32(header + 44, TAIL_BLOCKS);
+    put_be32(header + 48, TAIL_BLOCKS - 3u);
+    put_be32(header + 52, 2u);
+    put_be64(header + 112, 2u);               /* 16 bitmap bits */
+    put_be32(header + 124, 1u);
+    put_be32(header + 128, 1u);               /* allocation file: block 1 */
+    put_be32(header + 132, 1u);
+    image[TAIL_BS + 0] = 0xc0u;               /* blocks 0 and 1 */
+    image[TAIL_BS + 1] = 0x01u;               /* block 15 */
+    memcpy(image + TAIL_FSTAB, FSTAB_STOCK, sizeof(FSTAB_STOCK) - 1u);
+    memcpy(image + size - HFS_VH_OFF, header, HFS_VH_LEN);
+}
+
+static void test_partition_tail(void) {
+    static uint8_t image[TAIL_SIZE + TAIL_BS];
+    static uint8_t out[TAIL_SIZE + 8u * TAIL_BS];
+    char source[160], destination[160];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+    const uint64_t grown = (uint64_t)19u * TAIL_BS;
+
+    CHECK(make_path(source, sizeof(source), "tail_source") &&
+          make_path(destination, sizeof(destination), "tail_work"),
+          "could not form paths");
+    remove_if_present(source);
+    remove_if_present(destination);
+    make_tail_fixture(image, TAIL_EXTRA);
+    CHECK(write_file(source, image, TAIL_SIZE), "could not write the fixture");
+
+    /* Size-neutral edits keep the tail and the alternate header where they are. */
+    memset(&options, 0, sizeof(options));
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK, "a partition tail was refused: %s (%s)",
+          rootfs_work_status_name(status), result.detail);
+    CHECK(file_size(destination) == TAIL_SIZE, "size changed without growth");
+    CHECK(read_file(destination, out, TAIL_SIZE) &&
+          memcmp(out + TAIL_SIZE - HFS_VH_OFF, image + TAIL_SIZE - HFS_VH_OFF, 4) == 0 &&
+          memcmp(out + TAIL_FSTAB, "/dev/md0 / hfs rw,update 0 0\n", 29) == 0,
+          "fstab rewritten, alternate header kept at the partition's end");
+    remove_if_present(destination);
+
+    /* Growth: the image becomes exact, the last old block stays allocated,
+     * the stale alternate header is cleared, the new one is at the new end. */
+    memset(&options, 0, sizeof(options));
+    options.growth_bytes = 4u * TAIL_BS;
+    status = rootfs_work_create(source, destination, &options, &result);
+    CHECK(status == ROOTFS_WORK_OK, "growth refused: %s (%s)",
+          rootfs_work_status_name(status), result.detail);
+    CHECK(file_size(destination) == grown, "grown size was %llu",
+          (unsigned long long)file_size(destination));
+    if (read_file(destination, out, (size_t)grown)) {
+        const uint8_t *h = out + HFS_VH_OFF;
+        CHECK(get_be32(h + 44) == 19u, "totalBlocks %u", get_be32(h + 44));
+        CHECK(get_be32(h + 48) == 15u, "freeBlocks %u (0,1,15 and the new tail used)",
+              get_be32(h + 48));
+        CHECK(get_be32(h + 52) == 16u, "nextAllocation %u", get_be32(h + 52));
+        CHECK((out[TAIL_BS + 1] & 0x01u) != 0u, "the last old block stayed allocated");
+        CHECK((out[TAIL_BS + 2] & 0x20u) != 0u, "the new tail block is allocated");
+        CHECK(memcmp(out + grown - HFS_VH_OFF, h, HFS_VH_LEN) == 0,
+              "the alternate header is at the new end");
+        bool cleared = true;
+        for (size_t i = TAIL_BS * TAIL_BLOCKS; i < TAIL_SIZE; i++) cleared &= out[i] == 0u;
+        CHECK(cleared, "the old partition tail was cleared");
+    } else {
+        CHECK(false, "could not read the grown image");
+    }
+    remove_if_present(destination);
+    remove_if_present(source);
+
+    /* Tails that cannot hold the alternate header, or are a block or more. */
+    static const uint32_t bad[] = { 512u, 1000u, TAIL_BS };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        make_tail_fixture(image, bad[i]);
+        CHECK(write_file(source, image, TAIL_BS * TAIL_BLOCKS + bad[i]), "write");
+        memset(&options, 0, sizeof(options));
+        status = rootfs_work_create(source, destination, &options, &result);
+        CHECK(status == ROOTFS_WORK_HFS_INVALID, "a %u-byte tail was accepted (%s)",
+              bad[i], rootfs_work_status_name(status));
+        CHECK(!path_exists(destination), "a refused image was published");
+        remove_if_present(destination);
+        remove_if_present(source);
+    }
+}
+
+/* The tail fixture with a journal: info block in block 2, an 8 KiB journal
+ * in blocks 3-4, header little-endian (as an ARM device writes it) or
+ * big-endian, and `pending` making start != end. */
+static void make_journal_fixture(uint8_t *image, bool big_endian, bool pending,
+                                 uint32_t flags) {
+    uint8_t *header = image + HFS_VH_OFF;
+    uint8_t *jib = image + 2u * TAIL_BS;
+    uint8_t *jh = image + 3u * TAIL_BS;
+    const uint64_t start = 512u, end = pending ? 1024u : 512u;
+    make_tail_fixture(image, TAIL_EXTRA);
+    put_be32(header + 4, (1u << 8) | (1u << 13));      /* unmounted, journalled */
+    put_be32(header + 12, 2u);                           /* journal info block */
+    put_be32(header + 48, TAIL_BLOCKS - 6u);
+    image[TAIL_BS + 0] = 0xf8u;                          /* blocks 0-4 */
+    put_be32(jib, flags);
+    put_be64(jib + 36, 3u * TAIL_BS);
+    put_be64(jib + 44, 2u * TAIL_BS);
+    if (big_endian) {
+        put_be32(jh, 0x4a4e4c78u);
+        put_be32(jh + 4, 0x12345678u);
+        put_be64(jh + 8, start);
+        put_be64(jh + 16, end);
+    } else {
+        for (int b = 0; b < 4; b++) {
+            jh[b] = (uint8_t)(0x4a4e4c78u >> (8 * b));
+            jh[4 + b] = (uint8_t)(0x12345678u >> (8 * b));
+        }
+        for (int b = 0; b < 8; b++) {
+            jh[8 + b] = (uint8_t)(start >> (8 * b));
+            jh[16 + b] = (uint8_t)(end >> (8 * b));
+        }
+    }
+    memcpy(image + TAIL_SIZE - HFS_VH_OFF, header, HFS_VH_LEN);
+}
+
+static void test_empty_journal(void) {
+    static uint8_t image[TAIL_SIZE + TAIL_BS];
+    char source[160], destination[160];
+    rootfs_work_options_t options;
+    rootfs_work_result_t result;
+    static const struct { bool be, pending; uint32_t flags; bool ok; const char *what; } cases[] = {
+        { false, false, 1u, true,  "an empty little-endian journal" },
+        { true,  false, 1u, true,  "an empty big-endian journal" },
+        { false, true,  1u, false, "a journal with transactions" },
+        { false, false, 5u, false, "a journal needing initialisation" },
+        { false, false, 3u, false, "a journal on another device" },
+    };
+    CHECK(make_path(source, sizeof(source), "jnl_source") &&
+          make_path(destination, sizeof(destination), "jnl_work"), "paths");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        remove_if_present(source);
+        remove_if_present(destination);
+        make_journal_fixture(image, cases[i].be, cases[i].pending, cases[i].flags);
+        CHECK(write_file(source, image, TAIL_SIZE), "write");
+        memset(&options, 0, sizeof(options));
+        options.growth_bytes = 4u * TAIL_BS;
+        const rootfs_work_status_t st = rootfs_work_create(source, destination, &options, &result);
+        if (cases[i].ok)
+            CHECK(st == ROOTFS_WORK_OK, "%s was refused: %s (%s)", cases[i].what,
+                  rootfs_work_status_name(st), result.detail);
+        else
+            CHECK(st == ROOTFS_WORK_HFS_INVALID && !path_exists(destination),
+                  "%s was accepted (%s)", cases[i].what, rootfs_work_status_name(st));
+    }
+    remove_if_present(destination);
+    remove_if_present(source);
+}
+
 int main(void) {
     printf("rootfs work-image provisioner tests\n");
     test_sha256_known_answers_and_chunking();
@@ -1732,6 +1906,8 @@ int main(void) {
     test_symbolic_links_refused();
 #endif
     test_argument_and_growth_guards();
+    test_partition_tail();
+    test_empty_journal();
     printf("\nrootfs-work: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

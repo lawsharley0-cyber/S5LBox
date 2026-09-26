@@ -495,6 +495,14 @@ typedef struct hfs_volume {
     uint32_t ext_start[8];
     uint32_t ext_count[8];
     uint32_t nbits;
+    /*
+     * Bytes of the image past totalBlocks x blockSize: 0 for the iPhone OS 3
+     * images, 4096 for iOS 6.1.6 (10B500, iPhone2,1), whose partition is not
+     * a whole number of 8 KiB blocks. The alternate volume header is 1024
+     * bytes before the end of the partition either way, so with a tail it
+     * lies wholly outside the allocation blocks.
+     */
+    uint32_t partition_tail;
 } hfs_volume_t;
 
 static uint16_t read_be16(const uint8_t *bytes) {
@@ -2222,12 +2230,27 @@ static bool hfs_validate(host_file_t *file, uint64_t file_size,
                     volume->block_size);
         return false;
     }
-    if (volume->total_blocks == 0u ||
-        (uint64_t)volume->total_blocks * volume->block_size != file_size) {
-        result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
-                    "totalBlocks %u x blockSize %u does not equal image size %"
-                    PRIu64, volume->total_blocks, volume->block_size, file_size);
-        return false;
+    /*
+     * The image is the partition. It may run past the last allocation block
+     * by less than one block, provided that tail holds the whole alternate
+     * volume header (the last 1024 bytes) and is a whole number of sectors.
+     */
+    {
+        const uint64_t volume_bytes =
+            (uint64_t)volume->total_blocks * volume->block_size;
+        const uint64_t tail = file_size - volume_bytes;
+        if (volume->total_blocks == 0u || volume_bytes > file_size ||
+            tail >= volume->block_size ||
+            (tail != 0u && (tail < HFS_VH_OFF || tail % 512u != 0u))) {
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "totalBlocks %u x blockSize %u does not fit image size %"
+                        PRIu64 " (a partition may extend past the volume by "
+                        "whole sectors, at least 1024 bytes and less than a "
+                        "block)", volume->total_blocks, volume->block_size,
+                        file_size);
+            return false;
+        }
+        volume->partition_tail = (uint32_t)tail;
     }
     if (volume->free_blocks > volume->total_blocks) {
         result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
@@ -2241,11 +2264,76 @@ static bool hfs_validate(host_file_t *file, uint64_t file_size,
                     volume->next_alloc, volume->total_blocks);
         return false;
     }
+    /*
+     * A journalled volume is accepted only with nothing to replay: its
+     * journal inside this volume, initialised, and empty (start == end).
+     * Then the metadata edited here is the metadata the kernel will read,
+     * and no transaction in the journal can overwrite it at mount. The iOS
+     * 6.1.6 root filesystem is such a volume; iPhone OS 3's is not journalled.
+     */
     if ((volume->attributes & HFS_ATTR_JOURNALED) != 0u ||
         journal_info_block != 0u) {
-        result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
-                    "journalled volumes are not supported");
-        return false;
+        uint8_t jib[52], jh[44];
+        uint64_t joff, jsize, start, end;
+        uint32_t jflags, magic, endian;
+        const uint64_t volume_bytes =
+            (uint64_t)volume->total_blocks * volume->block_size;
+        if ((volume->attributes & HFS_ATTR_JOURNALED) == 0u ||
+            journal_info_block == 0u ||
+            journal_info_block >= volume->total_blocks) {
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "journal attribute and journal info block %u disagree",
+                        journal_info_block);
+            return false;
+        }
+        if (!checked_read(file, file_size,
+                          (uint64_t)journal_info_block * volume->block_size,
+                          jib, sizeof(jib), stage, result))
+            return false;
+        jflags = read_be32(jib);
+        joff = read_be64(jib + 36);
+        jsize = read_be64(jib + 44);
+        if (jflags != 1u) {         /* kJIJournalInFSMask, nothing else */
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "journal info flags 0x%x: only an initialised journal "
+                        "inside this volume is supported", jflags);
+            return false;
+        }
+        if (jsize < sizeof(jh) || joff % 512u != 0u || joff > volume_bytes ||
+            jsize > volume_bytes - joff) {
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "journal at %" PRIu64 "+%" PRIu64 " is outside the volume",
+                        joff, jsize);
+            return false;
+        }
+        if (!checked_read(file, file_size, joff, jh, sizeof(jh), stage, result))
+            return false;
+        /* The header is in the byte order of the machine that wrote it. */
+        magic = (uint32_t)jh[0] | (uint32_t)jh[1] << 8 | (uint32_t)jh[2] << 16 |
+                (uint32_t)jh[3] << 24;
+        endian = (uint32_t)jh[4] | (uint32_t)jh[5] << 8 | (uint32_t)jh[6] << 16 |
+                 (uint32_t)jh[7] << 24;
+        if (magic == 0x4a4e4c78u && endian == 0x12345678u) {
+            start = 0; end = 0;
+            for (int b = 7; b >= 0; b--) {
+                start = start << 8 | jh[8 + b];
+                end = end << 8 | jh[16 + b];
+            }
+        } else if (read_be32(jh) == 0x4a4e4c78u && read_be32(jh + 4) == 0x12345678u) {
+            start = read_be64(jh + 8);
+            end = read_be64(jh + 16);
+        } else {
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "journal header is not a valid journal header");
+            return false;
+        }
+        if (start != end) {
+            result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
+                        "journal holds transactions (start %" PRIu64 ", end %"
+                        PRIu64 "); only an empty journal is supported",
+                        start, end);
+            return false;
+        }
     }
     if ((volume->attributes & HFS_ATTR_SOFTWARE_LOCK) != 0u) {
         result_fail(result, ROOTFS_WORK_HFS_INVALID, stage, 0,
@@ -2746,7 +2834,16 @@ static bool grow_volume(host_file_t *file, uint64_t *file_size,
     }
     added_alloc_blocks = (uint32_t)physical_alloc_blocks -
                          before->alloc_fork_blocks;
-    old_tail = hfs_tail_first(before->total_blocks, before->block_size);
+    /*
+     * The old reserved tail: the allocation block(s) holding the old
+     * alternate header, released by growth. With a partition tail that
+     * header was never in an allocation block, so nothing is released; the
+     * last block stays exactly as allocated (on 10B500 it is marked used and
+     * the volume has no free blocks, so it may well hold file data).
+     */
+    old_tail = before->partition_tail != 0u
+             ? before->total_blocks
+             : hfs_tail_first(before->total_blocks, before->block_size);
     new_tail = hfs_tail_first(new_total, before->block_size);
     if (hfs_head_end(before->block_size) > old_tail ||
         hfs_head_end(before->block_size) > new_tail) {
@@ -2755,7 +2852,8 @@ static bool grow_volume(host_file_t *file, uint64_t *file_size,
                     "reserved head and tail allocation-block ranges overlap");
         return false;
     }
-    if (old_tail >= before->total_blocks || new_tail >= new_total) {
+    if ((before->partition_tail == 0u && old_tail >= before->total_blocks) ||
+        new_tail >= new_total) {
         result_fail(result, ROOTFS_WORK_HFS_INVALID,
                     ROOTFS_WORK_STAGE_GROW_PLAN, 0,
                     "reserved-tail block range is invalid");
@@ -2839,9 +2937,26 @@ static bool grow_volume(host_file_t *file, uint64_t *file_size,
                     new_size);
         return false;
     }
+    /* The old partition tail is now the start of a free allocation block;
+     * its stale alternate header is cleared rather than left for a repair
+     * tool to find. */
+    if (before->partition_tail != 0u) {
+        uint64_t at = (uint64_t)before->total_blocks * before->block_size;
+        uint32_t left = before->partition_tail;
+        memset(buffer, 0, buffer_size);
+        while (left != 0u) {
+            size_t amount = left < buffer_size ? left : buffer_size;
+            if (!checked_write(file, new_size, at, buffer, amount,
+                               ROOTFS_WORK_STAGE_GROW_WRITE, result))
+                return false;
+            at += amount;
+            left -= (uint32_t)amount;
+        }
+    }
     *file_size = new_size;
 
     after = *before;
+    after.partition_tail = 0u;
     after.total_blocks = new_total;
     after.alloc_bytes = needed_alloc_bytes;
     after.alloc_fork_blocks = (uint32_t)physical_alloc_blocks;

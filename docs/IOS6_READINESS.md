@@ -417,6 +417,26 @@ first step below.
    the next question; the raw-device path (`mdevrw` calling `uiomove64`,
    which iPhone OS 3 needed a second bridge for) is not yet patched.
 
+   **launchd, then a keybag reboot (2026-09-26).** Two more accommodations
+   get the root mounted and userland running. The root node's
+   `secure-root-prefix` ("md") makes AppleARMPlatform's SecureRootName
+   handler wait for a `SecureRoot` platform call from a storage stack this
+   machine does not have (10B500: 0x804b0596); `n88` strikes the property
+   out, as it un-matches the IOP, so the platform treats the root as
+   unchecked and answers at once. And the stock `/etc/fstab` names the NAND's
+   disk0s1/disk0s2, so the work image needs it rewritten to `/dev/md0`;
+   `rootfs_work_create` already does that (it now accepts the 3GS image's
+   4 KiB partition tail past the last allocation block and its empty
+   in-volume journal), and it grows the volume, because Apple ships the root
+   with zero free blocks (on the phone /private/var is a separate partition)
+   and the first file the system writes -- corecrypto's FIPS control file --
+   otherwise fails. With all that, the kernel mounts md0, FIPS passes, and
+   launchd runs, then hits `FATAL KEYBAG ERROR: kb_load` and reboots into
+   recovery: the data partition's keybag (Effaceable storage /
+   IOAESAccelerator) is the next thing to model. `boot3gs -P pristine.img
+   -r work.img` provisions and boots in one step; `-w` records where each
+   kernel thread last blocked.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 

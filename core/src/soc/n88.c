@@ -617,6 +617,18 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         if (!md_bridge_config_valid(&mc))
             return fail(N88_ERR_ROOT, detail, cap,
                         "the memory-disk bridge refused the geometry");
+        /* The root's "secure-root-prefix" ("md" on the 3GS) makes
+         * AppleARMPlatform's SecureRootName handler (IOSecureBSDRoot, once
+         * the root is chosen) wait for a SecureRoot call from the storage
+         * stack -- which this machine does not have, so the boot thread
+         * would sleep there for ever (10B500: 0x804b0596). Without the
+         * property the platform treats the root as unchecked and answers at
+         * once; strike the name out with an 'x' like an un-matched
+         * compatible. */
+        uint32_t spl = 0;
+        const uint8_t *spv = NULL;
+        if (dt_property(&dt, &root, "secure-root-prefix", &spv, &spl) == DT_OK && spv)
+            tree[(size_t)(spv - dt.blob) - 36u] = 'x';
         md_bridge_init(&m->md, &mc);
         arm_bus_set_privileged_svc_handler(&m->bus, md_bridge_handle_svc, &m->md);
         m->has_root = true;

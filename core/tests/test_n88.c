@@ -355,8 +355,9 @@ static void build_tree(buf_t *t, tree_opts_t o) {
     static const uint8_t zero8[8];
     static const uint8_t zero4[4];
     t->n = 0;
-    b_node(t, 3, o.with_pram ? 5 : 4);
+    b_node(t, 4, o.with_pram ? 5 : 4);
     b_str(t, "name", "device-tree");
+    b_str(t, "secure-root-prefix", "md");
     b_prop(t, "compatible", o.compat, o.compat_len);
     b_prop(t, "clock-frequency", zero4, 4);
       b_node(t, 2, 0); b_str(t, "name", "memory"); b_prop(t, "reg", zero8, 8);
@@ -535,6 +536,8 @@ static void test_boot_layout_and_tree(void) {
         CHECK(!tree_prop(dt, tree.n, "chosen/memory-map", "RAMDisk", &l),
               "no RAMDisk entry without a root filesystem");
         CHECK(!m->has_root && !m->bus.privileged_svc_handler, "and no bridge");
+        CHECK(tree_prop(dt, tree.n, "", "secure-root-prefix", &l) != NULL,
+              "secure-root-prefix is left alone without a root");
 
         /* And it runs. */
         arm_status_t rs = ARM_HALT;
@@ -715,6 +718,9 @@ static void test_boot_with_root(void) {
                                      "chosen/memory-map", "RAMDisk", &l);
         CHECK(p && l == 8 && get32(p) == N88_MD_TOKEN_PA && get32(p + 4) == sizeof disk.data,
               "the RAMDisk entry names the token and the size");
+        CHECK(!tree_prop(ram_at(m, m->devicetree_pa), tree.n, "", "secure-root-prefix", &l) &&
+              tree_prop(ram_at(m, m->devicetree_pa), tree.n, "", "xecure-root-prefix", &l),
+              "secure-root-prefix is struck out with a root");
 
         arm_status_t rs = ARM_HALT;
         n88_run(m, 200, &rs);

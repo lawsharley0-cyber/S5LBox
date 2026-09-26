@@ -24,7 +24,7 @@
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
- *           [-r root.img]
+ *           [-r root.img [-P pristine.img]] [-w]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default, "arm-io/iop"); -e runs on the
@@ -32,7 +32,11 @@
  * the backtraces, the console and the end state -- the speed of that mode is
  * the app's. -r serves a root filesystem image as /dev/md0 (the kernel must
  * be the 10B500 one tools/ios6_kernel_patch.c knows); the image is written
- * to, so pass a working copy, never the only one.
+ * to, so pass a working copy, never the only one; with -P, a missing -r
+ * image is first made from the pristine one (see make_work_image). -w (single-step mode)
+ * records, for every kernel thread, the call chain of the last time it
+ * blocked (entry to thread_block / thread_block_parameter), and prints each
+ * thread's last wait at the end: where a stalled boot is waiting.
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -44,6 +48,7 @@
 #include "ios6_kernel_patch.h"
 #include "ksyms.h"
 #include "n88.h"
+#include "rootfs_work.h"
 
 #include <inttypes.h>
 #include <stdarg.h>
@@ -121,6 +126,34 @@ log:
     }
 }
 
+/* --------------------------------------------------- the working image */
+/*
+ * -P: the working image, made from the pristine one by rootfs_work_create,
+ * the provisioner iPhone OS 3 machines use. Its default rewrites /etc/fstab
+ * to mount / from /dev/md0 (the stock one names the NAND's disk0s1 and
+ * disk0s2, which do not exist here). It also grows the volume: Apple ships
+ * the root filesystem with no free blocks, because on the phone /private/var
+ * is a separate partition, and without room the first file the system
+ * creates fails (on 10B500, corecrypto's FIPS self-test control file, and
+ * launchd reboots).
+ */
+#define WORK_GROWTH_BYTES (UINT64_C(256) << 20)
+
+static void make_work_image(const char *pristine, const char *work) {
+    rootfs_work_options_t ro;
+    rootfs_work_result_t rr;
+    memset(&ro, 0, sizeof ro);
+    memset(&rr, 0, sizeof rr);
+    ro.growth_bytes = WORK_GROWTH_BYTES;
+    printf("making %s from %s\n", work, pristine);
+    const rootfs_work_status_t rs = rootfs_work_create(pristine, work, &ro, &rr);
+    if (rs != ROOTFS_WORK_OK)
+        die("rootfs_work: %s at %s (%s)", rootfs_work_status_name(rs),
+            rootfs_work_stage_name(rr.stage), rr.detail);
+    printf("  fstab rewritten at offset %llu; volume grown to %llu bytes\n",
+           (unsigned long long)rr.fstab_offset, (unsigned long long)rr.final_size);
+}
+
 /* ------------------------------------------------------- root disk log */
 /* The root disk as the kernel uses it: every request the bridge makes,
  * forwarded to the file and logged (the first 200 in order, with the guest
@@ -132,21 +165,71 @@ static vm_block_io_status_t logged_read(void *ctx, uint64_t off, void *dst,
                                         size_t n, size_t *actual) {
     (void)ctx;
     if (g_root_logged++ < 200u)
-        printf("  disk R %10llx +%-6zu  pc %08x  guest %.3f s\n",
-               (unsigned long long)off, n, g_m.cpu.r[15], n88_guest_seconds(&g_m));
+        printf("  disk R %10llx +%-6zu  pc %08x  thread %08x  guest %.3f s\n",
+               (unsigned long long)off, n, g_m.cpu.r[15], g_m.cpu.cp15.tpidrprw,
+               n88_guest_seconds(&g_m));
     return g_root_inner->read_at(g_root_inner->context, off, dst, n, actual);
 }
 static vm_block_io_status_t logged_write(void *ctx, uint64_t off, const void *src,
                                          size_t n, size_t *actual) {
     (void)ctx;
     if (g_root_logged++ < 200u)
-        printf("  disk W %10llx +%-6zu  pc %08x  guest %.3f s\n",
-               (unsigned long long)off, n, g_m.cpu.r[15], n88_guest_seconds(&g_m));
+        printf("  disk W %10llx +%-6zu  pc %08x  thread %08x  guest %.3f s\n",
+               (unsigned long long)off, n, g_m.cpu.r[15], g_m.cpu.cp15.tpidrprw,
+               n88_guest_seconds(&g_m));
     return g_root_inner->write_at(g_root_inner->context, off, src, n, actual);
 }
 static vm_block_io_status_t logged_flush(void *ctx) {
     (void)ctx;
     return g_root_inner->flush ? g_root_inner->flush(g_root_inner->context) : VM_BLOCK_IO_OK;
+}
+
+/* ------------------------------------------------------ thread waits */
+/* -w: each kernel thread's most recent block, as a call chain. */
+#define WAIT_FRAMES 12u
+#define WAIT_THREADS 1024u
+typedef struct {
+    uint32_t thread;
+    uint32_t frames[WAIT_FRAMES];
+    unsigned nframes;
+    uint64_t blocks;
+    double   at;
+} waitrec_t;
+static waitrec_t g_waits[WAIT_THREADS];
+static unsigned g_nwaits;
+
+static bool guest_word(uint32_t va, uint32_t *out);
+
+/* At the entry of a blocking function: lr is the return into the caller,
+ * and the caller's r7 frame chain continues from there. */
+static void note_wait(void) {
+    const uint32_t th = g_m.cpu.cp15.tpidrprw;
+    waitrec_t *w = NULL;
+    for (unsigned i = 0; i < g_nwaits; i++)
+        if (g_waits[i].thread == th) { w = &g_waits[i]; break; }
+    if (!w) {
+        if (g_nwaits == WAIT_THREADS) return;
+        w = &g_waits[g_nwaits++];
+        memset(w, 0, sizeof *w);
+        w->thread = th;
+    }
+    w->blocks++;
+    w->at = n88_guest_seconds(&g_m);
+    w->nframes = 0;
+    w->frames[w->nframes++] = g_m.cpu.r[14];
+    uint32_t fp = g_m.cpu.r[7];
+    while (w->nframes < WAIT_FRAMES && fp) {
+        uint32_t next, lr;
+        if (!guest_word(fp, &next) || !guest_word(fp + 4u, &lr) || !lr) break;
+        w->frames[w->nframes++] = lr;
+        if (next <= fp) break;
+        fp = next;
+    }
+}
+
+static int wait_by_time(const void *a, const void *b) {
+    const double x = ((const waitrec_t *)a)->at, y = ((const waitrec_t *)b)->at;
+    return x < y ? 1 : x > y ? -1 : 0;
 }
 
 /* ------------------------------------------------------ guest reading */
@@ -246,17 +329,19 @@ int main(int argc, char **argv) {
     uint64_t budget = 200000000u;
     const char *cmdline = NULL;
     const char *ram_out = NULL;
-    const char *root_path = NULL;
+    const char *root_path = NULL, *pristine_path = NULL;
     const char *unmatch[16];
     unsigned nunmatch = 0;
-    bool engine = false;
+    bool engine = false, waits = false;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-n") && i + 1 < argc) budget = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cmdline = argv[++i];
         else if (!strcmp(argv[i], "-v")) g_verbose = true;
         else if (!strcmp(argv[i], "-e")) engine = true;
+        else if (!strcmp(argv[i], "-w")) waits = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) ram_out = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
+        else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
         else if (!strcmp(argv[i], "-u") && i + 1 < argc && nunmatch < 16u)
             unmatch[nunmatch++] = argv[++i];
         else die("unknown option %s", argv[i]);
@@ -277,6 +362,9 @@ int main(int argc, char **argv) {
     if (root_path) {
         if (!ios6_kernel_patch_identify(kernel, klen))
             die("-r needs the iOS 6.1.6 10B500 iPhone2,1 kernel (its UUID differs)");
+        FILE *existing = fopen(root_path, "rb");
+        if (existing) fclose(existing);
+        else if (pristine_path) make_work_image(pristine_path, root_path);
         root_file = file_block_create();
         FILE *f = fopen(root_path, "rb");
         if (!f || fseek(f, 0, SEEK_END) != 0) die("cannot open %s", root_path);
@@ -335,6 +423,12 @@ int main(int argc, char **argv) {
     arm_status_t st = ARM_OK;
     const char *why = "instruction budget";
     const uint32_t panic_va = g_have_syms ? ksyms_value(&g_syms, "_panic") & ~1u : 0u;
+    const uint32_t block_va = waits && g_have_syms
+                            ? ksyms_value(&g_syms, "_thread_block") & ~1u : 0u;
+    const uint32_t blockp_va = waits && g_have_syms
+                             ? ksyms_value(&g_syms, "_thread_block_parameter") & ~1u : 0u;
+    if (waits && (engine || !block_va || !blockp_va))
+        die("-w needs single-step mode and a kernel with thread_block symbols");
     const uint64_t every = 250000000u;
     const clock_t t0 = clock();
     if (engine) {
@@ -356,6 +450,7 @@ int main(int argc, char **argv) {
         for (; n < budget; n++) {
             const uint32_t pc = g_m.cpu.r[15], mode = g_m.cpu.cpsr & 0x1fu;
             if (panic_va && pc == panic_va) report_panic();
+            if (waits && (pc == block_va || pc == blockp_va)) note_wait();
             ring[ring_i++ & 63u] = pc;
             if (n88_run(&g_m, 1, &st) != 1u) { why = "the core refused an instruction"; break; }
             drain_console();
@@ -427,6 +522,17 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < 64u; i++) {
             uint32_t p = ring[(ring_i + i) & 63u];
             if (p) printf("  %08x %s\n", p, sym(p));
+        }
+    }
+    if (waits) {
+        qsort(g_waits, g_nwaits, sizeof g_waits[0], wait_by_time);
+        printf("\nthreads by last block, newest first (%u):\n", g_nwaits);
+        for (unsigned i = 0; i < g_nwaits; i++) {
+            const waitrec_t *w = &g_waits[i];
+            printf("  thread %08x  %" PRIu64 " blocks, last at %.3f s\n", w->thread,
+                   w->blocks, w->at);
+            for (unsigned f = 0; f < w->nframes; f++)
+                printf("      %08x %s\n", w->frames[f], sym(w->frames[f]));
         }
     }
     printf("\nunmodelled device registers touched (%u):\n", g_nstats);

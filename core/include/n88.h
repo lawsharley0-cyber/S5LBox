@@ -29,6 +29,8 @@
  *     memory-disk bridge (md_bridge.h). The kernel's strategy routine must
  *     have been patched to trap into the bridge; which bytes that takes is
  *     per kernel build and lives outside the core (tools/ios6_kernel_patch.c).
+ *     With a root attached, the root node's "secure-root-prefix" is struck
+ *     out, because nothing here answers the secure-root check it asks for.
  *
  * What is not: the display, touch, buttons, audio, the IOP, sleep. It boots
  * the kernel as far as that allows, and prints what the kernel prints.
