@@ -127,6 +127,10 @@ static bool in_vic(uint32_t pa) {
     return pa >= N88_VIC_PA && pa < N88_VIC_PA + N88_VIC_COUNT * 0x10000u;
 }
 
+static bool in_gpio(uint32_t pa) {
+    return pa >= N88_GPIO_PA && pa < N88_GPIO_PA + N88_GPIO_SIZE;
+}
+
 static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
     if (in_timer(pa)) {
         /* Reading the timer changes no level, so it does not stop the cached
@@ -145,6 +149,13 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         case 0x20: return m->timer.ctrl;
         default:   break;
         }
+    }
+    if (in_gpio(pa)) {
+        /* A pure register-file read: the value the CPU last wrote to this
+         * pin's config, reset 0. It drives no interrupt line here, so, like
+         * the timer count, it does not stop the cached interpreter. */
+        m->mmio++;
+        return m->gpio[(pa - N88_GPIO_PA) >> 2];
     }
     m->level_dirty = true;
     if (pa == N88_UART0_PA + 0x10u) {           /* UTRSTAT: transmitter empty */
@@ -182,6 +193,8 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         m->timer.ctrl = v & 1u;
     } else if (in_vic(pa)) {
         s5l_vic_write(&m->vic[(pa - N88_VIC_PA) >> 16], pa & 0xffffu, v);
+    } else if (in_gpio(pa)) {
+        m->gpio[(pa - N88_GPIO_PA) >> 2] = v;   /* stored, read back verbatim */
     } else {
         modelled = false;
     }
@@ -653,6 +666,7 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     /* The core: SVC mode, interrupts masked, MMU off, r0 = boot_args. */
     for (unsigned i = 0; i < N88_VIC_COUNT; i++) s5l_vic_reset(&m->vic[i]);
     memset(&m->timer, 0, sizeof m->timer);
+    memset(m->gpio, 0, sizeof m->gpio);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
     if (m->ci) arm_ci_flush(m->ci);

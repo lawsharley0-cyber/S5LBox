@@ -88,6 +88,28 @@
 #define N88_VIC_COUNT   3u
 #define N88_TIMER_LINE  6u
 
+/*
+ * The GPIO pad controller (/arm-io/gpio, `gpio,s5l8920x`, child 0x03000000 ->
+ * physical 0x83000000). One 32-bit register per pin, packing function,
+ * direction, pull and value; the driver reads a pin's register, ORs in its
+ * configuration, and writes it back (AppleS5L8920X+0x17ba/0x17c2). It is
+ * modelled as exactly that register file: a write is stored and a read
+ * returns what was written, reset zero. That is faithful for the pins the CPU
+ * DRIVES -- every access the 10B500 boot makes here is this config
+ * read-modify-write -- and it is why the always-zero stub was wrong: it made
+ * each read-modify-write read back 0 and lose the pin's own prior bits.
+ *
+ * It fabricates nothing: with no external device wired to an INPUT pin, a read
+ * returns the last value written (0 at reset), not an invented line level. A
+ * pin driven by a real peripheral (a chip-select observed by the SPI NOR, a
+ * sensor's data line) needs that peripheral wired to this block, which is a
+ * later step; until then such a pin reads back its own register, which is the
+ * honest "nothing is driving it" answer.
+ */
+#define N88_GPIO_PA     UINT32_C(0x83000000)
+#define N88_GPIO_SIZE   UINT32_C(0x1000)        /* backs offsets 0..0x818 */
+#define N88_GPIO_REGS   (N88_GPIO_SIZE / 4u)
+
 #define N88_CONSOLE_CAPACITY 65536u
 #define N88_DEFAULT_CMDLINE  "debug=0x8 serial=3 -v"
 #define N88_ROOT_CMDLINE     "rd=md0 debug=0x8 serial=3 -v"
@@ -114,6 +136,7 @@ typedef struct n88 {
     bool      level_dirty;          /* a device was touched (arm_ci stops)    */
 
     s5l_vic_t vic[N88_VIC_COUNT];
+    uint32_t  gpio[N88_GPIO_REGS];  /* the GPIO pad controller's register file */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;

@@ -120,6 +120,21 @@ static void test_bus_routing(void) {
           "UTXH bytes reach the console");
     CHECK(t.calls == 0 && m->unmodelled == 0, "the UART is modelled");
 
+    /* The GPIO pad controller is a faithful register file: a write is stored
+     * and read back, so the driver's read-modify-write of a pin's config
+     * keeps the pin's own bits (the always-zero stub lost them). */
+    CHECK(n88_read32(m, N88_GPIO_PA) == 0u, "GPIO resets to zero");
+    n88_write32(m, N88_GPIO_PA + 0x40u, 0x00000212u);
+    CHECK(n88_read32(m, N88_GPIO_PA + 0x40u) == 0x00000212u, "GPIO reads back a write");
+    {   /* read-modify-write a second bit keeps the first */
+        uint32_t v = n88_read32(m, N88_GPIO_PA + 0x40u);
+        n88_write32(m, N88_GPIO_PA + 0x40u, v | 0x10u);
+        CHECK(n88_read32(m, N88_GPIO_PA + 0x40u) == 0x00000212u, "RMW preserves prior bits");
+    }
+    n88_write32(m, N88_GPIO_PA + N88_GPIO_SIZE - 4u, 0xdeadbeefu);
+    CHECK(n88_read32(m, N88_GPIO_PA + N88_GPIO_SIZE - 4u) == 0xdeadbeefu, "last GPIO reg");
+    CHECK(m->unmodelled == 0 && t.calls == 0, "GPIO is modelled, not traced");
+
     CHECK(n88_read32(m, 0x81234560u) == 0u, "an unmodelled register answers zero");
     CHECK(m->unmodelled == 1 && t.calls == 1 && t.pa == 0x81234560u && !t.write &&
           t.size == 4, "and is counted and traced");

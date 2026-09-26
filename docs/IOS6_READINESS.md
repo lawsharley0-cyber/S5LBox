@@ -485,7 +485,20 @@ first step below.
    correct SPI NOR cannot even be framed until the GPIO block is modelled;
    the order is GPIO chip-selects, then the SPI NOR + effaceable lockbox,
    then the AES engine, then the keybag-creation semantics, and only the
-   last of those is checkable without hardware. kb_load's worker (keybagd
+   last of those is checkable without hardware.
+
+   **Step 1 done: the GPIO pad controller (2026-09-26).** `/arm-io/gpio`
+   (`gpio,s5l8920x`, 0x83000000) is now a faithful register file in `n88`
+   (core/include/n88.h), the single busiest unmodelled block in a boot (743
+   config accesses): the driver reads a pin's register, ORs in its config
+   and writes it back, and the old always-zero stub made every read-back
+   lose the pin's prior bits. A write is stored and read back verbatim,
+   reset zero; nothing is fabricated (an input pin with nothing wired reads
+   its own last value, the honest "undriven" answer). The boot still reaches
+   launchd and the keybag reboot -- no regression -- and GPIO no longer
+   appears in the unmodelled census. Still to wire: the specific chip-select
+   pins to the SPI NOR's command framing, which is the next step of the
+   chain. kb_load's worker (keybagd
    0x3a48) is a 30 s event-wait for the kernel to publish a keybag, so the
    gate is entirely kernel-side in that ladder, not in keybagd's own file I/O.
 
