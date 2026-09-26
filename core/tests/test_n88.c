@@ -699,6 +699,63 @@ static void test_clock_table(void) {
     free(m);
 }
 
+/* spi0 and its flash through the machine's own bus: the select is the GPIO
+ * pin's register, the answers come back through RXDATA, and the controller's
+ * line is VIC0 line 29. The flash's array is erased at first and survives a
+ * reboot. */
+static void test_spi0_flash(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    uint8_t *nor = n88_nor(m);
+    bool erased = nor != NULL;
+    for (uint32_t i = 0; erased && i < N88_NOR_SIZE; i++) erased = nor[i] == 0xffu;
+    CHECK(erased, "the flash is not erased when the machine is made");
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+
+    const uint32_t S = N88_SPI0_PA, CS = N88_GPIO_PA + N88_SPI0_CS_GPIO;
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, S + SPI_STATUS, SPI_STATUS_EVENTS_V1);
+    n88_write32(m, S + SPI_SETUP, 0x4018u);
+    n88_write32(m, S + SPI_CONTROL, SPI_CONTROL_START);
+    n88_write32(m, S + SPI_CNT, 4u);
+    n88_write32(m, S + SPI_CNT_V1, 4u);
+    n88_write32(m, CS, 0x12u);                      /* select: the pin low */
+    n88_write32(m, S + SPI_SETUP, 0x4038u);
+    const uint8_t tx[4] = { 0x9f, 0xff, 0xff, 0xff };
+    for (unsigned i = 0; i < 4u; i++) n88_write32(m, S + SPI_TXDATA, tx[i]);
+    CHECK(!(m->vic[0].raw & (1u << N88_SPI0_LINE)), "the line rose before go");
+    n88_write32(m, S + SPI_SETUP, 0x2041b8u);
+    CHECK(m->vic[0].raw & (1u << N88_SPI0_LINE), "go did not raise VIC0 line 29");
+    const uint32_t s = n88_read32(m, S + SPI_STATUS);
+    const unsigned have = (s >> SPI_STATUS_RX_SHIFT_V1) & SPI_STATUS_LEVEL_V1;
+    uint8_t id[4] = {0};
+    for (unsigned i = 0; i < have && i < 4u; i++) id[i] = (uint8_t)n88_read32(m, S + SPI_RXDATA);
+    n88_write32(m, S + SPI_STATUS, s);
+    n88_write32(m, S + SPI_SETUP, 0x4018u);
+    n88_write32(m, CS, 0x13u);                      /* release */
+    CHECK(have == 4u && id[1] == 0x20 && id[2] == 0x80 && id[3] == 0x14,
+          "the flash's ID through spi0: %u octets, %02x %02x %02x", have, id[1], id[2], id[3]);
+    CHECK(!(m->vic[0].raw & (1u << N88_SPI0_LINE)) && m->unmodelled == unmodelled &&
+          m->nor.selections == 1u && !m->nor.selected,
+          "after the transfer: line down, nothing unmodelled, one selection, released");
+
+    nor[0x1234] = 0x5a;                             /* as a program would leave it */
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK && n88_nor(m)[0x1234] == 0x5a &&
+          m->spi0.version == 1u && m->spi0.words == 0u,
+          "a reboot kept the flash and reset the controller");
+    n88_free(m);
+    free(m);
+}
+
 /* -------------------------------------------------------- root disk */
 
 typedef struct { uint8_t data[16384]; } memdisk_t;
@@ -869,6 +926,7 @@ int main(void) {
     test_boot_layout_and_tree();
     test_boot_refusals();
     test_clock_table();
+    test_spi0_flash();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

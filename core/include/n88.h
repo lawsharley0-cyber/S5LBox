@@ -32,6 +32,8 @@
  *     With a root attached, the root node's "secure-root-prefix" is struck
  *     out, because nothing here answers the secure-root check it asks for.
  *
+ *   - spi0 and the 1 MiB NOR flash on it, with the GPIO pin that selects it.
+ *
  * What is not: the display, touch, buttons, audio, the IOP, sleep. It boots
  * the kernel as far as that allows, and prints what the kernel prints.
  *
@@ -49,6 +51,7 @@
 #include "arm_ci.h"
 #include "md_bridge.h"
 #include "soc.h"
+#include "spi_nor.h"
 #include "vm_block.h"
 
 #include <stdbool.h>
@@ -121,6 +124,28 @@
 #define N88_GPIO_SIZE   UINT32_C(0x1000)        /* backs offsets 0..0x818 */
 #define N88_GPIO_REGS   (N88_GPIO_SIZE / 4u)
 
+/*
+ * spi0 and the NOR flash on it (/arm-io/spi0, `spi-1,samsung`, `spi-version
+ * 1`, child 0x02000000 -> physical 0x82000000; `interrupts` 29 on /arm-io/vic,
+ * which is VIC0 line 29). The controller is the core's Samsung SPI model at
+ * version 1 (soc.h); the flash is spi_nor.h's, at its only chip select.
+ *
+ * The select is not the controller's: spi0's `function-spi_cs0` names GPIO
+ * pin 0x1204 (group 0x12, pin 4), whose register is 0x250 in the pad block.
+ * AppleSamsungSPI writes 0x12 there before it fills the transmit FIFO and
+ * 0x13 after the transfer (10B500), so bit 0 is the pin's level and the
+ * select is active low. A store to that register is the flash's select edge.
+ *
+ * The flash is 1 MiB, erased (all 0xFF) when the machine is made, and it
+ * keeps its contents across n88_boot as a real one does across a reboot;
+ * n88_nor() gives the caller the array to load or save.
+ */
+#define N88_SPI0_PA       UINT32_C(0x82000000)
+#define N88_SPI0_SIZE     UINT32_C(0x1000)
+#define N88_SPI0_LINE     29u
+#define N88_SPI0_CS_GPIO  UINT32_C(0x250)      /* offset in the pad block  */
+#define N88_NOR_SIZE      UINT32_C(0x100000)
+
 #define N88_CONSOLE_CAPACITY 65536u
 #define N88_DEFAULT_CMDLINE  "debug=0x8 serial=3 -v"
 #define N88_ROOT_CMDLINE     "rd=md0 debug=0x8 serial=3 -v"
@@ -148,6 +173,9 @@ typedef struct n88 {
 
     s5l_vic_t vic[N88_VIC_COUNT];
     uint32_t  gpio[N88_GPIO_REGS];  /* the GPIO pad controller's register file */
+    s5l_spi_t spi0;
+    spi_nor_t nor;
+    uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;
@@ -238,6 +266,10 @@ void n88_nvram_image(uint8_t *img, uint32_t len);
 
 /* /arm-io's clock-frequencies as iBoot writes it (see n88.c); for tests. */
 extern const uint32_t n88_clock_frequencies[N88_CLOCK_COUNT];
+
+/* The NOR flash's array (N88_NOR_SIZE octets), to load before a boot or save
+ * after one. NULL if the machine has none. */
+uint8_t *n88_nor(n88_t *m);
 
 /* The bus, for tests and the harness: the same routing the CPU sees. */
 uint32_t n88_read32(n88_t *m, uint32_t pa);

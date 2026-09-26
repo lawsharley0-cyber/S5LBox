@@ -516,6 +516,21 @@ int main(int argc, char **argv) {
                    g_m.md.last_error.pc);
         printf("\n");
     }
+    {
+        const s5l_spi_t *sp = &g_m.spi0;
+        const spi_nor_t *nr = &g_m.nor;
+        printf("spi0: %" PRIu64 " words, %" PRIu64 " receive reads, %" PRIu64
+               " interrupt rises, %" PRIu64 " transmit drops\n",
+               sp->words, sp->rx_reads, sp->irq_rises, sp->tx_drops);
+        printf("nor: %" PRIu64 " selections, %" PRIu64 " commands; %" PRIu64 " reads (%"
+               PRIu64 " octets), %" PRIu64 " programs (%" PRIu64 " octets), %" PRIu64
+               " erases, %" PRIu64 " status writes, %" PRIu64 " refused, %" PRIu64
+               " unknown", nr->selections, nr->commands, nr->reads, nr->read_octets,
+               nr->programs, nr->programmed_octets, nr->erases, nr->status_writes,
+               nr->refused, nr->unknown);
+        if (nr->unknown) printf(" (last %02x)", nr->last_unknown);
+        printf("\n");
+    }
     dump_state();
     if (!engine) {
         printf("\nlast pcs:\n");

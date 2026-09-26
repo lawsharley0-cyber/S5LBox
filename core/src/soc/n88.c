@@ -131,6 +131,17 @@ static bool in_gpio(uint32_t pa) {
     return pa >= N88_GPIO_PA && pa < N88_GPIO_PA + N88_GPIO_SIZE;
 }
 
+static bool in_spi0(uint32_t pa) {
+    return pa >= N88_SPI0_PA && pa < N88_SPI0_PA + N88_SPI0_SIZE;
+}
+
+/* spi0's interrupt is a level the controller derives from its own state;
+ * sampling it here also counts its rising edges (irq_rises). */
+static void spi0_line(n88_t *m) {
+    s5l_spi_irq_note(&m->spi0);
+    s5l_vic_set_line(&m->vic[0], N88_SPI0_LINE, m->spi0.irq_last);
+}
+
 static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
     if (in_timer(pa)) {
         /* Reading the timer changes no level, so it does not stop the cached
@@ -161,6 +172,15 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
     if (pa == N88_UART0_PA + 0x10u) {           /* UTRSTAT: transmitter empty */
         m->mmio++;
         return 0x6u;
+    }
+    if (in_spi0(pa)) {
+        /* Not a pure read: RXDATA pops the receive FIFO, which can let the
+         * shifter run and move the line. */
+        m->mmio++;
+        const uint32_t v = s5l_spi_read(&m->spi0, pa - N88_SPI0_PA);
+        spi0_line(m);
+        irq_update(m);
+        return v;
     }
     if (in_vic(pa)) {
         m->mmio++;
@@ -195,6 +215,10 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         s5l_vic_write(&m->vic[(pa - N88_VIC_PA) >> 16], pa & 0xffffu, v);
     } else if (in_gpio(pa)) {
         m->gpio[(pa - N88_GPIO_PA) >> 2] = v;   /* stored, read back verbatim */
+        if (pa - N88_GPIO_PA == N88_SPI0_CS_GPIO)
+            spi_nor_select(&m->nor, (v & 1u) == 0u);    /* active low */
+    } else if (in_spi0(pa)) {
+        s5l_spi_write(&m->spi0, pa - N88_SPI0_PA, v);
     } else {
         modelled = false;
     }
@@ -203,6 +227,7 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         m->unmodelled++;
         if (m->trace) m->trace(m->trace_ctx, pa, size, true, v, m->cpu.r[15]);
     }
+    spi0_line(m);
     timer_update(m);
 }
 
@@ -282,7 +307,13 @@ bool n88_init(n88_t *m, bool cached_engine) {
     if (!m) return false;
     memset(m, 0, sizeof *m);
     m->ram = calloc(1, N88_DRAM_SIZE);
-    if (!m->ram) return false;
+    m->nor_mem = malloc(N88_NOR_SIZE);
+    if (!m->ram || !m->nor_mem) { n88_free(m); return false; }
+    memset(m->nor_mem, 0xff, N88_NOR_SIZE);     /* an erased part */
+    if (!spi_nor_init(&m->nor, m->nor_mem, N88_NOR_SIZE, SPI_NOR_M25PE80_ID)) {
+        n88_free(m);
+        return false;
+    }
     m->bus = (arm_bus_t){
         .ctx = m,
         .read32 = b_r32, .read16 = b_r16, .read8 = b_r8,
@@ -310,6 +341,12 @@ void n88_free(n88_t *m) {
     m->ci = NULL;
     free(m->ram);
     m->ram = NULL;
+    free(m->nor_mem);
+    m->nor_mem = NULL;
+}
+
+uint8_t *n88_nor(n88_t *m) {
+    return m ? m->nor_mem : NULL;
 }
 
 /* ---------------------------------------------------------------- run */
@@ -709,6 +746,16 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     for (unsigned i = 0; i < N88_VIC_COUNT; i++) s5l_vic_reset(&m->vic[i]);
     memset(&m->timer, 0, sizeof m->timer);
     memset(m->gpio, 0, sizeof m->gpio);
+    /* spi0 at version 1 with the flash at its only select; the flash keeps
+     * its array, as a real one does across a reboot. */
+    s5l_spi_reset(&m->spi0);
+    s5l_spi_set_version(&m->spi0, 1u);
+    {
+        s5l_spi_slave_t nor_slave;
+        spi_nor_bind(&m->nor, &nor_slave);
+        s5l_spi_attach(&m->spi0, 0u, &nor_slave);
+    }
+    spi_nor_reset(&m->nor);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
     if (m->ci) arm_ci_flush(m->ci);

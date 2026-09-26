@@ -41,6 +41,7 @@ add_library(emucore STATIC
     src/soc/wm8991.c
     src/soc/i2s.c
     src/soc/spi.c
+    src/soc/spi_nor.c
     src/soc/gpioic.c
     src/soc/buttons.c
     src/soc/mtz2.c
@@ -243,6 +244,10 @@ add_test(NAME wm8991_codec_and_i2s COMMAND test_wm8991)
 add_executable(test_spi tests/test_spi.c)
 target_link_libraries(test_spi PRIVATE emucore)
 add_test(NAME s5l8900_spi COMMAND test_spi)
+
+add_executable(test_spi_nor tests/test_spi_nor.c)
+target_link_libraries(test_spi_nor PRIVATE emucore)
+add_test(NAME spi_nor COMMAND test_spi_nor)
 
 add_executable(test_gpioic tests/test_gpioic.c)
 target_link_libraries(test_gpioic PRIVATE emucore)

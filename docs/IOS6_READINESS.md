@@ -531,6 +531,37 @@ first step below.
    spi0 so far sees only its configuration writes, no transfers, so the NOR
    under it has not probed yet.
 
+   **Step 3: spi0, the NOR flash, and effaceable storage starts
+   (2026-09-26).** The flash driver (`AppleARMSPIFlashController`) queued a
+   read-status command and slept waiting for spi0's interrupt. Three pieces,
+   each read from the 10B500 drivers' own code:
+   - The core's Samsung SPI model gained `spi-version 1` (commit 0fefcc7):
+     five-bit FIFO levels at STATUS [10:6]/[15:11], depth 16, event mask
+     0x0040000F, SETUP base 0x4000, the 0x4c count register. The interrupt
+     rule is unchanged, and the S5L8900 machine and its snapshots are
+     untouched.
+   - `core/src/soc/spi_nor.c`: a serial NOR flash implementing exactly the
+     commands the driver sends (ID, status, write enable/disable, write
+     status, read, page program, 4 KiB erase), framed by chip select, with
+     the datasheet rules for when each takes effect. It presents ST's M25PE80
+     (JEDEC 20 80 14), a 1 MiB part from the driver's own table; which
+     vendor's part a given phone has is not known here, so this is a choice
+     among supported parts. Time is not modelled (busy never reads 1).
+   - `n88` wires spi0 at 0x82000000 on VIC0 line 29, with the flash at its
+     only select. The select is GPIO pin 0x1204, register 0x250 in the pad
+     block: the driver writes 0x12 before a transfer and 0x13 after, so bit 0
+     is the level and the select is active low. The flash starts erased and
+     keeps its contents across reboots of the machine.
+   Result on 10B500: the driver identifies the part,
+   `AppleDiagnosticDataAccess started with AppleARMNORFlashDevice`, and
+   **AppleEffaceableStorage starts**: it finds the blank lockbox ("unable to
+   find content"), formats it (two 4 KiB erases and 32 page programs, the
+   two lockbox copies at 0xfa000/0xfb000), and reports `[effaceable:INIT]
+   started`. 191 flash commands, none refused or unknown. Both CPU engines
+   give identical device counters and console text at 300M instructions.
+   The keybag still fails, as expected: what remains is the AES engine
+   (`IOAESAccelerator`) and a writable data volume at `/private/var`.
+
 5. SMP only if the chosen device needs it and a single-core boot-arg is not
    enough.
 
