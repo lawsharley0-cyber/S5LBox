@@ -726,3 +726,26 @@ nothing made on a real phone unwraps here. (Podium, an iPod touch 4 / iOS
   the hardware key), 0 errors, and the boot otherwise follows the same path
   as before. kb_load still fails, because no system keybag file exists:
   on a real phone a restore creates it (#47).
+
+### The display controller (AppleM2CLCD)
+
+`core/src/soc/m2clcd.c` models /arm-io/clcd at 0x85400000 from the iOS 6
+driver's own code (com.apple.driver.AppleM2DisplayDrivers) and openiBoot's
+independent register map:
+
+- At hand-off it shows what iBoot left: +0x4 bit 4 (window A on), window A
+  = the boot framebuffer (0x4fe3a000, 320x480, stride 320 pixels, format 7 =
+  32-bit ARGB). `create_default_fb_surface` (0x809961f8) adopts the boot
+  framebuffer from exactly these registers; with zeros it would find none.
+- `start_hardware` (0x80995652) and the interrupt (0x809947f4): +0x0 bit 0
+  enable / bit 1 idle / bit 8 soft reset, +0x8 interrupt enable, +0xC status
+  (write one to clear; bit 0 = frame, 0x1700 = underruns), 0xF to +0x1B2C.
+- A frame starts every 1/60 s of guest time; with frame interrupts enabled it
+  raises line 0x25 (VIC1 bit 5, through the daisy chain) and the run loop
+  and WFI stop exactly there.
+- `n88_framebuffer()` follows the window registers (a swap moves what the app
+  and `boot3gs -F` show) while the geometry stays 320x480x32.
+
+In the 10B500 boot the driver is constructed (60.3 s) but never touches the
+controller before the keybag reboot, so the boot is unchanged; the swap path
+is exercised only once a UI process runs.

@@ -945,6 +945,58 @@ static void test_devicetree_identity(void) {
     CHECK(!n88_devicetree_is_3gs(NULL, 0), "nothing");
 }
 
+/* The display controller on the bus: iBoot's hand-off as AppleM2CLCD reads
+ * it, a frame interrupt that wakes a waiting core (WFI fast-forwards to the
+ * frame, not past it), its acknowledgement, and the scanout following a swap. */
+static void test_display_controller(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { 0xe320f003u /* WFI */, B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 2);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    const uint32_t C = N88_CLCD_PA;
+    const uint64_t unmodelled = m->unmodelled;
+    CHECK((n88_read32(m, C + 0x4) & 0x10u) && n88_read32(m, C + 0x24) == N88_VRAM_PA &&
+          n88_read32(m, C + 0x28) == N88_FB_WIDTH &&
+          n88_read32(m, C + 0x30) == ((N88_FB_WIDTH << 16) | N88_FB_HEIGHT) &&
+          (n88_read32(m, C + 0x20) & 0xf00u) == 0x700u, "window A as iBoot leaves it");
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "scanout at hand-off");
+
+    /* Frame interrupts on, line 0x25 = VIC1 bit 5 enabled; the core waits. */
+    n88_write32(m, C + 0x8, 1u);
+    n88_write32(m, N88_VIC_PA + 0x10000u + VIC_INTENABLE, 1u << 5);
+    const uint64_t frame = (uint64_t)(N88_TB_HZ / N88_FRAME_HZ) * N88_CYCLES_PER_TICK;
+    arm_status_t st;
+    n88_run(m, 3, &st);
+    CHECK(m->cpu.cycles >= frame && m->cpu.cycles < frame + 16u,
+          "WFI woke at cycle %llu, the frame starts at %llu",
+          (unsigned long long)m->cpu.cycles, (unsigned long long)frame);
+    CHECK((s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 5)) &&
+          n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == (0x80000000u | N88_CLCD_LINE),
+          "frame interrupt on line 0x25, through the chain");
+    CHECK((n88_read32(m, C + 0xc) & n88_read32(m, C + 0x8)) == 1u, "status & enable");
+    n88_write32(m, C + 0x1b2c, 0xfu);
+    n88_write32(m, C + 0xc, 1u);
+    CHECK(!(s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 5)), "acknowledged");
+
+    /* A swap to the second boot buffer moves what the host shows. */
+    n88_write32(m, C + 0x24, N88_VRAM_PA + N88_FB_BYTES);
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA + N88_FB_BYTES), "swapped scanout");
+    /* A geometry the hosts cannot show falls back to iBoot's buffer. */
+    n88_write32(m, C + 0x30, (240u << 16) | 320u);
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "fallback");
+    CHECK(m->unmodelled == unmodelled, "every access modelled");
+    n88_free(m);
+    free(m);
+}
+
 /* The CDMA engine on the bus: a UID-key request as iOS 6 makes it moves
  * through DRAM and raises channel 1's line, VIC1 line 11. */
 static void test_cdma_on_the_bus(void) {
@@ -999,6 +1051,7 @@ int main(void) {
     test_clock_table();
     test_spi0_flash();
     test_cdma_on_the_bus();
+    test_display_controller();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

@@ -98,23 +98,31 @@ static void irq_update(n88_t *m) {
     m->cpu.fiq_line = fiq;
 }
 
-/* Expire the decrementer if its interval has passed, and drive line 6. */
+/* Everything time moves: expire the decrementer if its interval has passed
+ * (line 6), start display frames that are due (line 0x25). */
 static void timer_update(n88_t *m) {
-    if (m->timer.armed &&
-        n88_timer_count(m) - m->timer.start >= m->timer.interval) {
+    const uint64_t now = n88_timer_count(m);
+    if (m->timer.armed && now - m->timer.start >= m->timer.interval) {
         m->timer.armed = false;
         m->timer.pending = true;
         m->timer.fired++;
     }
     s5l_vic_set_line(&m->vic[0], N88_TIMER_LINE,
                      m->timer.pending && (m->timer.ctrl & 1u));
+    m2clcd_advance(&m->clcd, now);
+    s5l_vic_set_line(&m->vic[N88_CLCD_LINE / 32u], N88_CLCD_LINE % 32u, m2clcd_irq(&m->clcd));
     irq_update(m);
 }
 
-/* The first cycle at which the decrementer expires, or UINT64_MAX. */
+/* The first cycle at which time raises a line -- the decrementer expiring
+ * or an enabled display frame starting -- or UINT64_MAX. */
 static uint64_t timer_due_cycles(const n88_t *m) {
-    if (!m->timer.armed) return UINT64_MAX;
-    return (m->timer.start + m->timer.interval) * N88_CYCLES_PER_TICK;
+    uint64_t due = m->timer.armed
+        ? (m->timer.start + m->timer.interval) * N88_CYCLES_PER_TICK : UINT64_MAX;
+    const uint64_t frame = m2clcd_due(&m->clcd);
+    if (frame != UINT64_MAX && frame * N88_CYCLES_PER_TICK < due)
+        due = frame * N88_CYCLES_PER_TICK;
+    return due;
 }
 
 /* ---------------------------------------------------------------- bus */
@@ -133,6 +141,10 @@ static bool in_gpio(uint32_t pa) {
 
 static bool in_spi0(uint32_t pa) {
     return pa >= N88_SPI0_PA && pa < N88_SPI0_PA + N88_SPI0_SIZE;
+}
+
+static bool in_clcd(uint32_t pa) {
+    return pa >= N88_CLCD_PA && pa < N88_CLCD_PA + M2CLCD_SIZE;
 }
 
 static bool in_cdma(uint32_t pa) {
@@ -219,6 +231,13 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         m->mmio++;
         return cdma_read(&m->cdma, pa - N88_CDMA_PA);
     }
+    if (in_clcd(pa)) {
+        /* Frame starts are brought up to date first, so a polled status
+         * read sees the frame the timebase says has begun. */
+        m->mmio++;
+        timer_update(m);
+        return m2clcd_read(&m->clcd, pa - N88_CLCD_PA);
+    }
     if (in_cdma_aes(pa)) {
         m->mmio++;
         return cdma_aes_read(&m->cdma, pa - N88_CDMA_AES_PA);
@@ -273,6 +292,9 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         cdma_lines(m);
     } else if (in_cdma_aes(pa)) {
         cdma_aes_write(&m->cdma, pa - N88_CDMA_AES_PA, v);
+    } else if (in_clcd(pa)) {
+        m2clcd_advance(&m->clcd, n88_timer_count(m));
+        m2clcd_write(&m->clcd, pa - N88_CLCD_PA, v);
     } else {
         modelled = false;
     }
@@ -344,10 +366,12 @@ static uint8_t *b_host_write(void *c, uint32_t a, uint32_t n) {
 static bool b_wfi(void *c) {
     n88_t *m = c;
     m->wfi++;
-    if (m->timer.armed && (m->timer.ctrl & 1u)) {
-        const uint64_t due = timer_due_cycles(m);
-        if (due > m->cpu.cycles) m->cpu.cycles = due;
-    }
+    uint64_t due = m->timer.armed && (m->timer.ctrl & 1u)
+        ? (m->timer.start + m->timer.interval) * N88_CYCLES_PER_TICK : UINT64_MAX;
+    const uint64_t frame = m2clcd_due(&m->clcd);
+    if (frame != UINT64_MAX && frame * N88_CYCLES_PER_TICK < due)
+        due = frame * N88_CYCLES_PER_TICK;
+    if (due != UINT64_MAX && due > m->cpu.cycles) m->cpu.cycles = due;
     timer_update(m);
     return m->cpu.irq_line || m->cpu.fiq_line;
 }
@@ -406,7 +430,17 @@ uint8_t *n88_nor(n88_t *m) {
 }
 
 const uint8_t *n88_framebuffer(const n88_t *m) {
-    return m && m->ram && m->booted ? m->ram + (N88_VRAM_PA - N88_DRAM_BASE) : NULL;
+    if (!m || !m->ram || !m->booted) return NULL;
+    /* What the display controller scans out, while it keeps the boot
+     * framebuffer's geometry (the hosts show N88_FB_WIDTH x N88_FB_HEIGHT
+     * at N88_FB_STRIDE); otherwise iBoot's framebuffer. */
+    m2clcd_scanout_t s;
+    if (m2clcd_scanout(&m->clcd, &s) && s.bpp == N88_FB_DEPTH &&
+        s.width == N88_FB_WIDTH && s.height == N88_FB_HEIGHT &&
+        s.stride_bytes == N88_FB_STRIDE &&
+        in_ram(s.addr, N88_FB_STRIDE * N88_FB_HEIGHT))
+        return m->ram + (s.addr - N88_DRAM_BASE);
+    return m->ram + (N88_VRAM_PA - N88_DRAM_BASE);
 }
 
 /* ---------------------------------------------------------------- run */
@@ -422,7 +456,7 @@ unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status) {
      * as it happens; the only one time makes is the decrementer expiring. */
     timer_update(m);
     while (n < max_steps) {
-        if (m->timer.armed) timer_update(m);
+        if (m->timer.armed || m2clcd_due(&m->clcd) != UINT64_MAX) timer_update(m);
         if (m->ci) {
             /* Never past the decrementer's expiry, so the timer line moves
              * at exactly the instruction it would under arm_step. */
@@ -850,6 +884,13 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     cdma_reset(&m->cdma);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
+    {
+        /* After the CPU reset, whose cycle count is the clock. The display
+         * as iBoot leaves it: running, showing the first
+         * boot framebuffer. */
+        const m2clcd_boot_fb_t fb = { N88_VRAM_PA, N88_FB_WIDTH, N88_FB_HEIGHT, N88_FB_WIDTH };
+        m2clcd_reset(&m->clcd, &fb, n88_timer_count(m), N88_TB_HZ / N88_FRAME_HZ);
+    }
     if (m->ci) arm_ci_flush(m->ci);
     m->cpu.cpsr = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
     const uint32_t entry_pa = k.entry - virt_base + N88_DRAM_BASE;

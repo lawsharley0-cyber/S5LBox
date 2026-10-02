@@ -51,6 +51,7 @@
 #include "arm.h"
 #include "arm_ci.h"
 #include "cdma.h"
+#include "m2clcd.h"
 #include "md_bridge.h"
 #include "soc.h"
 #include "spi_nor.h"
@@ -167,6 +168,16 @@
 #define N88_CDMA_AES_PA   UINT32_C(0x87800000)
 #define N88_CDMA_LINE0    0x2au
 
+/*
+ * The display controller (m2clcd.h): /arm-io/clcd at 0x85400000, interrupt
+ * 0x25. It starts a frame every 1/60 s of guest time; at boot it shows the
+ * framebuffer iBoot left (N88_VRAM_PA), and n88_framebuffer() follows its
+ * window registers from then on.
+ */
+#define N88_CLCD_PA       UINT32_C(0x85400000)
+#define N88_CLCD_LINE     0x25u
+#define N88_FRAME_HZ      60u
+
 #define N88_SPI0_PA       UINT32_C(0x82000000)
 #define N88_SPI0_SIZE     UINT32_C(0x1000)
 #define N88_SPI0_LINE     29u
@@ -204,6 +215,7 @@ typedef struct n88 {
     spi_nor_t nor;
     uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
     cdma_t    cdma;                 /* the DMA engine and AES contexts        */
+    m2clcd_t  clcd;                 /* the display controller                 */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;

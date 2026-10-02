@@ -43,6 +43,7 @@ add_library(emucore STATIC
     src/soc/spi.c
     src/soc/spi_nor.c
     src/soc/cdma.c
+    src/soc/m2clcd.c
     src/soc/gpioic.c
     src/soc/buttons.c
     src/soc/mtz2.c
@@ -253,6 +254,10 @@ add_test(NAME spi_nor COMMAND test_spi_nor)
 add_executable(test_cdma tests/test_cdma.c)
 target_link_libraries(test_cdma PRIVATE emucore)
 add_test(NAME cdma_aes COMMAND test_cdma)
+
+add_executable(test_m2clcd tests/test_m2clcd.c)
+target_link_libraries(test_m2clcd PRIVATE emucore)
+add_test(NAME m2clcd COMMAND test_m2clcd)
 
 add_executable(test_gpioic tests/test_gpioic.c)
 target_link_libraries(test_gpioic PRIVATE emucore)

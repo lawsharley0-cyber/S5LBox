@@ -29,7 +29,7 @@ not replace, tracing what iOS 6's own drivers do.
 | I²C0/1/2 | 0x83200000, 0x83300000, 0x83400000 | i2c0: pmu, audio0, accelerometer, compass, mikey; i2c2: als | not modelled |
 | CDMA | 0x87000000; channel n IRQ = 0x2A + n | reg 0x07000000+0x1C000, IRQs 0x2B.. | modelled (cdma.c) — **agrees** |
 | AES | +0x800000; ctx control: bit16 encrypt, bit17 CBC, bits19:18 key size, bit20 register key, bits21+ hardware key (0 UID, 1 GID); IV ctx1 at 0x87801010; global +0x0 bits 0/1 = UID/GID disabled | reg 0x07800000+0x9000 | modelled with a stand-in hardware key — **agrees**; global register reads 0 (both keys available) |
-| CLCD | 0x85400000; control +0x0 (bit0 enable, bit1 idle), window +0x20..+0x3C (framebuffer address +0x24, stride +0x28, size +0x30), timing +0x1B10..+0x1B24, +0x300, +0x400..+0x40C | reg 0x05400000+0x300000, IRQ 0x25, `clcd,s5l8920x` | **not modelled** |
+| CLCD | 0x85400000; control +0x0 (bit0 enable, bit1 idle), window +0x20..+0x3C (framebuffer address +0x24, stride +0x28, size +0x30), timing +0x1B10..+0x1B24, +0x300, +0x400..+0x40C | reg 0x05400000+0x300000, IRQ 0x25, `clcd,s5l8920x` | modelled (`m2clcd.c`): iBoot's hand-off, the driver's start/interrupt protocol, 60 Hz frames, scanout from the window registers |
 | MIPI-DSIM | 0x89000000; Samsung DSIM register map (STATUS, SWRST, CLKCTRL, … PLLCTRL) | reg 0x09000000+0x100000, IRQ 0x24, `mipi-dsim-1,samsung`, child `lcd` | not modelled |
 | PMU | (none for 3GS) | `pmu,d1755` (Dialog) at i2c0 address 0x74, IRQ 0x9D via GPIO | not modelled |
 | Buttons | GPIO-based; pins from board config | volup GPIO 0x1600, voldown 0x1601, menu 0x1606, hold 0x1607, ringer 0x1403; wake via PMU | not modelled |
@@ -55,10 +55,11 @@ ROM, LLB and iBoot stay out of scope. ROM bytes are never used.
 
 ## What these references unblock, in order
 
-1. **Display** (needed as soon as SpringBoard/backboardd draw): a CLCD model
-   at 0x85400000 (window 0 framebuffer address/stride/size, enable/idle bits,
-   the interrupt on line 0x25) and a MIPI-DSIM stub at 0x89000000 that reports
-   ready. openiBoot's register map plus a trace of AppleM2CLCD's own accesses.
+1. **Display**: the CLCD at 0x85400000 is now modelled (`core/src/soc/m2clcd.c`,
+   from AppleM2CLCD's own code plus openiBoot's map). Still to come: the
+   MIPI-DSIM at 0x89000000, which the boot only reads once (zeros are
+   accepted), and validation of the swap path, which needs a UI process
+   (after the keybag on iOS 6, or 3.1.3 with a root filesystem).
 2. **The timer block** at 0xBF100000 (per-timer config/state/count), which
    the 3.1.3 kernel probes.
 3. **GPIO interrupts and buttons**: the GPIO interrupt registers at
