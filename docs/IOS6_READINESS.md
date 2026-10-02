@@ -843,8 +843,16 @@ on the emulated 3GS: "Searching...", the iTunes and cable art, and "slide
 for emergency" (boot3gs -F, 33,317 lit pixels, from about 11 s of guest
 time), with SpringBoard's background apps (MobilePhone, MobileMail,
 MobileMusicPlayer, voiced) running behind it. It is the screen of a phone
-that has not been activated and has no SIM: activation and touch are the
-next steps.
+that has not been activated and has no SIM.
+
+**Activation** is the S5L8900 machine's: boot3gs's -P now also writes the
+lockdown activation record into the work copy for the 7E18 kernel
+(`rootfs_work_activation_entries`, the plan bootkernel's --activate
+writes, derived from lockdownd in docs/derivations.md 23.3; -a leaves it
+out). With it SpringBoard shows the **lock screen**: the clock, the Earth
+wallpaper and "slide to unlock" (92,133 lit pixels). The clock reads
+4:00, Wednesday December 31 -- 1969, the D1755's RTC registers being
+zero. Touch (the N1 on spi1) is next.
 
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 

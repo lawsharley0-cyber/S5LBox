@@ -24,7 +24,7 @@
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
- *           [-r root.img [-P pristine.img]] [-w] [-F screen.ppm] [-B epoch]
+ *           [-r root.img [-P pristine.img [-a]]] [-w] [-F screen.ppm] [-B epoch]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default: "arm-io/iop", or for the 7E18
@@ -34,7 +34,8 @@
  * the app's. -r serves a root filesystem image as /dev/md0 (the kernel must
  * be 10B500 or the 3GS 7E18, whose gates are in tools/); the image is written
  * to, so pass a working copy, never the only one; with -P, a missing -r
- * image is first made from the pristine one (see make_work_image). -w (single-step mode)
+ * image is first made from the pristine one (see make_work_image), for the
+ * 7E18 kernel with its activation record unless -a. -w (single-step mode)
  * records, for every kernel thread, the call chain of the last time it
  * blocked (entry to thread_block / thread_block_parameter), and prints each
  * thread's last wait at the end: where a stalled boot is waiting. -F writes
@@ -146,13 +147,25 @@ log:
  */
 #define WORK_GROWTH_BYTES (UINT64_C(256) << 20)
 
-static void make_work_image(const char *pristine, const char *work) {
+/* `activate`: also create the lockdown activation record iPhone OS 3's
+ * lockdownd reads (rootfs_work_activation_entries, the same plan bootkernel's
+ * --activate writes for the S5L8900 machine), so SpringBoard goes past its
+ * iTunes activation screen. In the work copy only; for the 7E18 kernel. */
+static void make_work_image(const char *pristine, const char *work, bool activate) {
     rootfs_work_options_t ro;
     rootfs_work_result_t rr;
+    rootfs_work_entry_t entries[8];
     memset(&ro, 0, sizeof ro);
     memset(&rr, 0, sizeof rr);
     ro.growth_bytes = WORK_GROWTH_BYTES;
-    printf("making %s from %s\n", work, pristine);
+    if (activate) {
+        const size_t n = rootfs_work_standard_entries(true, false, entries,
+                                                      sizeof entries / sizeof entries[0]);
+        if (!n || n > sizeof entries / sizeof entries[0]) die("rootfs_work: no activation plan");
+        ro.entries = entries;
+        ro.entry_count = n;
+    }
+    printf("making %s from %s%s\n", work, pristine, activate ? ", activated" : "");
     const rootfs_work_status_t rs = rootfs_work_create(pristine, work, &ro, &rr);
     if (rs != ROOTFS_WORK_OK)
         die("rootfs_work: %s at %s (%s)", rootfs_work_status_name(rs),
@@ -339,6 +352,7 @@ int main(int argc, char **argv) {
     const char *root_path = NULL, *pristine_path = NULL;
     const char *unmatch[16];
     unsigned nunmatch = 0;
+    bool activate = true;
     bool engine = false, waits = false;
     unsigned epoch = 0;
     for (int i = 3; i < argc; i++) {
@@ -351,6 +365,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-F") && i + 1 < argc) screen_out = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
+        else if (!strcmp(argv[i], "-a")) activate = false;
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) {
             epoch = (unsigned)strtoul(argv[++i], NULL, 0);
             if (!epoch || epoch > 255u) die("-B wants an epoch from 1 to 255");
@@ -402,7 +417,7 @@ int main(int argc, char **argv) {
             die("-r needs the iPhone2,1 10B500 or 7E18 kernel (its UUID is neither)");
         FILE *existing = fopen(root_path, "rb");
         if (existing) fclose(existing);
-        else if (pristine_path) make_work_image(pristine_path, root_path);
+        else if (pristine_path) make_work_image(pristine_path, root_path, is_ios3 && activate);
         root_file = file_block_create();
         FILE *f = fopen(root_path, "rb");
         if (!f || fseek(f, 0, SEEK_END) != 0) die("cannot open %s", root_path);
