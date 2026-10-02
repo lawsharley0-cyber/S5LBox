@@ -1041,6 +1041,45 @@ static void test_cdma_on_the_bus(void) {
     free(m);
 }
 
+/* The SHA-1 engine behind CDMA channel 4, programmed as iPhone OS 3.1.3's
+ * AppleS5L8920XSHA1 and AppleCDMA program them: "abc", padded by the
+ * driver, through the FIFO; channel 4's line is VIC1 line 14. */
+static void test_sha1_through_cdma(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    const uint32_t C = N88_CDMA_PA, S = N88_SHA1_PA, data = 0x40300000u, chain = 0x40200000u;
+    uint8_t *p = ram_at(m, data);
+    memcpy(p, "abc", 3);
+    p[3] = 0x80;
+    p[63] = 24;                                    /* the length in bits */
+    const uint32_t d[4] = { chain + 0x20u, 0x303u, data, 64u };
+    for (unsigned i = 0; i < 4u; i++) n88_write32(m, chain + 4u * i, d[i]);
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, S + 0x4u, 1u);
+    n88_write32(m, S + 0x10u, 0u);
+    n88_write32(m, S + 0x0u, 0x2u);
+    n88_write32(m, C + 0x4000u, 0x18u);
+    n88_write32(m, C + 0x4004u, 0xcau);
+    n88_write32(m, C + 0x4008u, S + 0xa0u);
+    n88_write32(m, C + 0x4014u, chain);
+    n88_write32(m, C + 0x4000u, 0x19u);
+    static const uint32_t want[5] = { 0xa9993e36u, 0x4706816au, 0xba3e2571u, 0x7850c26cu, 0x9cd0d89du };
+    bool same = true;
+    for (unsigned i = 0; i < 5u; i++) {
+        const uint32_t v = n88_read32(m, S + 0x20u + 4u * i);
+        const uint32_t h = (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);
+        same = same && h == want[i];
+    }
+    CHECK(same, "the digest of \"abc\" at +0x20, byte-reversed");
+    CHECK((n88_read32(m, C + 0x4000u) & CDMA_CSR_DONE) &&
+          (s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 14)) &&
+          m->cdma.periph_transfers == 1u && m->unmodelled == unmodelled,
+          "channel 4 done on VIC1 line 14, every access modelled");
+    n88_free(m);
+    free(m);
+}
+
 int main(void) {
     test_bus_routing();
     test_timer_registers();
@@ -1051,6 +1090,7 @@ int main(void) {
     test_clock_table();
     test_spi0_flash();
     test_cdma_on_the_bus();
+    test_sha1_through_cdma();
     test_display_controller();
     test_boot_with_root();
     test_console_ring();

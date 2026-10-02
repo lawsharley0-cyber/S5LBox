@@ -155,6 +155,10 @@ static bool in_cdma_aes(uint32_t pa) {
     return pa >= N88_CDMA_AES_PA && pa < N88_CDMA_AES_PA + CDMA_AES_SIZE;
 }
 
+static bool in_sha1(uint32_t pa) {
+    return pa >= N88_SHA1_PA && pa < N88_SHA1_PA + S5L_SHA1_SIZE;
+}
+
 /* The engine's view of memory: DRAM only, and a write tells the cached
  * interpreter, as a CPU store does, in case it lands on translated code. */
 static bool cdma_mem(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool write) {
@@ -169,6 +173,14 @@ static bool cdma_mem(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool wr
     } else {
         memcpy(buf, p, len);
     }
+    return true;
+}
+
+/* Where CDMA's peripheral requests go: the SHA-1 engine's FIFO. */
+static bool cdma_periph(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len) {
+    n88_t *m = ctx;
+    if (fifo != N88_SHA1_PA + S5L_SHA1_FIFO) return false;
+    s5l_sha1_feed(&m->sha1, data, len);
     return true;
 }
 
@@ -242,6 +254,10 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         m->mmio++;
         return cdma_aes_read(&m->cdma, pa - N88_CDMA_AES_PA);
     }
+    if (in_sha1(pa)) {
+        m->mmio++;
+        return s5l_sha1_read(&m->sha1, pa - N88_SHA1_PA);
+    }
     if (in_vic(pa)) {
         m->mmio++;
         const unsigned n = (pa - N88_VIC_PA) >> 16;
@@ -292,6 +308,8 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         cdma_lines(m);
     } else if (in_cdma_aes(pa)) {
         cdma_aes_write(&m->cdma, pa - N88_CDMA_AES_PA, v);
+    } else if (in_sha1(pa)) {
+        s5l_sha1_write(&m->sha1, pa - N88_SHA1_PA, v);
     } else if (in_clcd(pa)) {
         m2clcd_advance(&m->clcd, n88_timer_count(m));
         m2clcd_write(&m->clcd, pa - N88_CLCD_PA, v);
@@ -393,6 +411,7 @@ bool n88_init(n88_t *m, bool cached_engine) {
         return false;
     }
     if (!cdma_init(&m->cdma, cdma_mem, m)) { n88_free(m); return false; }
+    cdma_set_peripheral(&m->cdma, cdma_periph, m);
     m->bus = (arm_bus_t){
         .ctx = m,
         .read32 = b_r32, .read16 = b_r16, .read8 = b_r8,
@@ -882,6 +901,7 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     }
     spi_nor_reset(&m->nor);
     cdma_reset(&m->cdma);
+    s5l_sha1_reset(&m->sha1);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
     {

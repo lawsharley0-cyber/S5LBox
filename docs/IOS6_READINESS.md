@@ -702,6 +702,64 @@ UART, camera, NOR image access), and waits for its root filesystem
 time. Next is a root filesystem for it: the iOS 6 memory-disk bridge
 patches the 10B500 kernel at fixed sites, and 7E18 needs its own.
 
+#### Root filesystem to SpringBoard (#48)
+
+`boot3gs kernelcache.macho devicetree.bin -e -P rootfs.hfs -r work.hfs` now
+takes 7E18 from the root mount to a running user space. Four things were
+needed, in the order the boot met them:
+
+- **The memory-disk bridge for 7E18** (`tools/ios3_n88_kernel_patch.c`):
+  the same SVC #0xe1/#0xe2 bridge as 10B500, at mdevstrategy's two
+  bcopy_phys calls (0xc007238e read, 0xc0072442 write), plus the
+  "physical" flag (0xc019c6d0). The sites are gated on the kernel's
+  LC_UUID and the expected bytes; boot3gs picks the 7E18 patch and epoch
+  4 from the kernel itself. Result: `BSD root: md0` at 60.15 s.
+- **The SHA-1 engine** (`core/src/soc/s5l_sha1.c`, /arm-io/sha1 at
+  0x80100000). Every executable page is hashed by cs_validate_page, and
+  with IOCryptoAcceleratorFamily present SHA1Init/SHA1Update run on this
+  engine, fed only by CDMA channel 4 as a peripheral request (CSR 0x18,
+  FIFO +0xA0). Before it, launchd's first page never validated and its
+  exec slept forever. The engine's protocol (start bit 1, continue bit 3,
+  state byte-reversed at +0x20, the driver's own padding) is read from
+  AppleS5L8920XSHA1 and checked against the FIPS 180 vectors.
+- **CDMA peripheral requests and CAR progress** (cdma.h). A channel
+  without the memory-to-memory bit now sends its chain to the device at
+  +0x8, and when a request ends CAR is left past the descriptors consumed.
+  3.1.3's AppleCDMA keeps a 128-descriptor ring and completes requests
+  from CAR, so with CAR left at the start the first hash "finished" and
+  was never delivered. iOS 6 is unaffected (same device-access counts,
+  same milestones: root 60.27 s, reboot 92.78 s).
+- **The fstab and the Thumb-2 `STRB.W r0, [r4, sp]`.** `-P` provisions
+  the work image as the S5L8900 machine does (fstab to /dev/md0, the
+  volume grown), so launchctl's fsck passes and / is remounted
+  read-write. Then a library (lowercasing into a stack buffer) runs
+  0xf804 0x000d: a register offset of SP, UNPREDICTABLE in the ARM ARM
+  but executed as written by the Cortex-A8 and emitted by Apple's
+  compiler. The interpreter now uses SP's value there (PC is still
+  refused).
+
+Result at 74 s of guest time (6000M instructions, 42 s of host time):
+21 processes: launchd, launchctl, syslogd, ptpd, lockdownd, mediaserverd,
+mDNSResponder, itunesstored, IQAgent, fairplayd, configd, accessoryd,
+**SpringBoard**, misd, CommCenter, notifyd, ReportCrash, installd,
+mDNSResponderHelper and securityd. 4,404 code pages are SHA-1 validated
+on the engine. At 90 s the same SpringBoard (pid 18) is still running.
+
+The screen stays black because no framebuffer is ever published.
+AppleM2DisplayDrivers' start has slept since 0.4 s in waitForService: the
+tree's /arm-io/clcd takes `function-lcd_enable` from
+/arm-io/mipi-dsim/lcd (the "pinot" panel), which takes `function-lcd_ldo`
+from /arm-io/i2c0/pmu (the Dialog D1755), and neither the S5L8920 I2C
+controllers, the D1755 nor the MIPI-DSI controller is modelled. The one
+crash report shows it from the other side: DataMigrator (run once after a
+restore) draws its progress bar through CoreSurface, gets a NULL base
+address, and faults at 0xffffff70. Next, in order: I2C0 and enough of the
+D1755 for its driver to start and provide the LDO, the DSIM controller
+for the panel driver, then the display driver publishes the framebuffer
+that m2clcd.c already scans out. A camera client also retries the ISP
+(no firmware, no mailbox) every 2 s, and the clock reads 1969 (no RTC,
+which is also the PMU).
+
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 
 This was the step the keybag work stopped short of. It turns out not to

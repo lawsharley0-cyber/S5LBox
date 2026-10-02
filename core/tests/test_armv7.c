@@ -395,6 +395,25 @@ static void test_thumb2_exclusives_allow_lr(void) {
     CHECK(arm_step(&c) == ARM_UNDEFINED, "LDREX pc is UNDEFINED");
 }
 
+/* Register-offset loads and stores with SP as the offset register, which the
+ * Cortex-A8 runs and 3.1.3's libraries use (see t2_load_store_single). */
+static void test_thumb2_register_offset_from_sp(void) {
+    arm_cpu_t c;
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    c.r[0] = 0x55u; c.r[4] = 2u; c.r[13] = 0x8000u;
+    put16(0x1000u, 0xf804u); put16(0x1002u, 0x000du);   /* STRB.W r0, [r4, sp] */
+    CHECK(arm_step(&c) == ARM_OK && g_ram[0x8002u] == 0x55u && c.r[15] == 0x1004u,
+          "STRB.W r0, [r4, sp]");
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    m_w32(NULL, 0x8010u, 0xcafef00du);
+    c.r[2] = 0x10u; c.r[13] = 0x2000u;                  /* 0x10 + (0x2000 << 2) */
+    put16(0x1000u, 0xf852u); put16(0x1002u, 0x102du);   /* LDR.W r1, [r2, sp, lsl #2] */
+    CHECK(arm_step(&c) == ARM_OK && c.r[1] == 0xcafef00du, "LDR.W r1, [r2, sp, lsl #2]");
+    boot(&c, &g_bus, ARM_ARCH_V7_A8, 0x1000u, true);
+    put16(0x1000u, 0xf804u); put16(0x1002u, 0x000fu);   /* STRB.W r0, [r4, pc] */
+    CHECK(arm_step(&c) == ARM_UNDEFINED, "Rm == PC stays UNDEFINED");
+}
+
 static void test_msr_mrs_and_the_execution_state_bits(void) {
     /* MSR CPSR_fsxc, r0 (0xf380 0x8f00) cannot clear T or set IT or J; the
      * SPSR, a saved copy, takes them. */
@@ -1103,6 +1122,7 @@ int main(void) {
     test_wide_instruction_across_a_page();
     test_wide_instruction_across_a_fetch_block();
     test_thumb2_exclusives_allow_lr();
+    test_thumb2_register_offset_from_sp();
     test_msr_mrs_and_the_execution_state_bits();
     test_sctlr_te_selects_thumb_handlers();
     test_arm_state_armv7_additions();

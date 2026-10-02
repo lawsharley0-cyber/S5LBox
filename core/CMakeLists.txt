@@ -44,6 +44,7 @@ add_library(emucore STATIC
     src/soc/spi_nor.c
     src/soc/cdma.c
     src/soc/m2clcd.c
+    src/soc/s5l_sha1.c
     src/soc/gpioic.c
     src/soc/buttons.c
     src/soc/mtz2.c
@@ -258,6 +259,10 @@ add_test(NAME cdma_aes COMMAND test_cdma)
 add_executable(test_m2clcd tests/test_m2clcd.c)
 target_link_libraries(test_m2clcd PRIVATE emucore)
 add_test(NAME m2clcd COMMAND test_m2clcd)
+
+add_executable(test_s5l_sha1 tests/test_s5l_sha1.c)
+target_link_libraries(test_s5l_sha1 PRIVATE emucore)
+add_test(NAME s5l_sha1 COMMAND test_s5l_sha1)
 
 add_executable(test_gpioic tests/test_gpioic.c)
 target_link_libraries(test_gpioic PRIVATE emucore)
@@ -1193,6 +1198,28 @@ add_executable(test_ios6_kernel_patch tests/test_ios6_kernel_patch.c)
 target_link_libraries(test_ios6_kernel_patch PRIVATE host_ios6_kernel_patch emucore)
 add_test(NAME ios6_kernel_patch COMMAND test_ios6_kernel_patch)
 
+# The iPhone OS 3.1.3 (7E18) kernel gate for the iPhone 3GS machine: the three
+# patches the memory-disk bridge needs, nothing else
+# (tools/ios3_n88_kernel_patch.h).
+add_library(host_ios3_n88_kernel_patch STATIC ../tools/ios3_n88_kernel_patch.c)
+target_include_directories(host_ios3_n88_kernel_patch PUBLIC ../tools include)
+target_link_libraries(host_ios3_n88_kernel_patch
+    PUBLIC host_guest_patch
+    PRIVATE emucore)
+set_target_properties(host_ios3_n88_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_ios3_n88_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_ios3_n88_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_ios3_n88_kernel_patch tests/test_ios3_n88_kernel_patch.c)
+target_link_libraries(test_ios3_n88_kernel_patch PRIVATE host_ios3_n88_kernel_patch emucore)
+add_test(NAME ios3_n88_kernel_patch COMMAND test_ios3_n88_kernel_patch)
+
 # The gate as a bring-up hook: one adapter, shared by the desktop test below
 # and by the iOS app, so a kernel is authorized by the same code in both.
 add_library(host_ios3_bringup_gate STATIC ../tools/ios3_bringup_gate.c)
@@ -1551,5 +1578,5 @@ target_link_libraries(arm_diff_probe PRIVATE emucore)
 # iPhone 3GS / iOS 6 bring-up research harness: runs the user's kernelcache on
 # a bare Cortex-A8 machine and logs every device access (tools/boot3gs.c).
 add_executable(boot3gs ../tools/boot3gs.c)
-target_link_libraries(boot3gs PRIVATE emucore host_ios6_kernel_patch host_file_block
+target_link_libraries(boot3gs PRIVATE emucore host_ios6_kernel_patch host_ios3_n88_kernel_patch host_file_block
     host_rootfs_work)

@@ -32,6 +32,11 @@ void cdma_free(cdma_t *d) {
     d->buf = NULL;
 }
 
+void cdma_set_peripheral(cdma_t *d, cdma_periph_fn fn, void *ctx) {
+    d->periph = fn;
+    d->periph_ctx = ctx;
+}
+
 void cdma_reset(cdma_t *d) {
     memset(d->ch, 0, sizeof d->ch);
     memset(d->enabled, 0, sizeof d->enabled);
@@ -44,8 +49,11 @@ static uint32_t rd32le(const uint8_t *p) {
 
 /* Walks channel n's chain. With `out` NULL, gathers its segments into
  * d->buf and returns the total; otherwise scatters `len` octets of `out`
- * over them. -1 if the chain is malformed or names memory that is not. */
-static int64_t walk_chain(cdma_t *d, unsigned n, const uint8_t *out, uint32_t len) {
+ * over them. -1 if the chain is malformed or names memory that is not.
+ * *end is where the engine stops: the terminating descriptor (a zero
+ * command), or the next one after a descriptor that ends the request. */
+static int64_t walk_chain(cdma_t *d, unsigned n, const uint8_t *out, uint32_t len,
+                          uint32_t *end) {
     uint32_t desc = d->ch[n][CDMA_CAR / 4u];
     uint32_t done = 0;
     for (unsigned i = 0; i < CDMA_MAX_DESCRIPTORS; i++) {
@@ -53,7 +61,7 @@ static int64_t walk_chain(cdma_t *d, unsigned n, const uint8_t *out, uint32_t le
         if (!d->mem(d->mem_ctx, desc, raw, sizeof raw, false)) return -1;
         const uint32_t next = rd32le(raw), cmd = rd32le(raw + 4);
         const uint32_t addr = rd32le(raw + 8), seg = rd32le(raw + 12);
-        if (cmd == 0u) return done;
+        if (cmd == 0u) { *end = desc; return done; }
         if ((cmd & 3u) == CDMA_CMD_DATA && seg) {
             if (out) {
                 const uint32_t n_out = seg < len - done ? seg : len - done;
@@ -66,8 +74,7 @@ static int64_t walk_chain(cdma_t *d, unsigned n, const uint8_t *out, uint32_t le
                 done += seg;
             }
         }
-        if (cmd & CDMA_CMD_LAST) return done;
-        if (out && done == len) return done;
+        if ((cmd & CDMA_CMD_LAST) || (out && done == len)) { *end = next; return done; }
         desc = next;
     }
     return -1;
@@ -133,18 +140,47 @@ static void try_transfer(cdma_t *d, unsigned n) {
         !(s & CDMA_CSR_M2M) || !(t & CDMA_CSR_M2M))
         return;
     bool ok = true;
-    const int64_t got = walk_chain(d, src, NULL, 0);
+    uint32_t src_end = 0, dst_end = 0;
+    const int64_t got = walk_chain(d, src, NULL, 0, &src_end);
     if (got < 0) ok = false;
     uint32_t len = got < 0 ? 0u : (uint32_t)got;
     unsigned k = (s >> CDMA_CSR_CTX_SHIFT) & 0xffu;
     if (!k) k = (t >> CDMA_CSR_CTX_SHIFT) & 0xffu;
     if (ok && k) ok = k <= CDMA_AES_CONTEXTS && run_aes(d, k, len);
-    if (ok) ok = walk_chain(d, dst, d->buf, len) >= 0;
+    if (ok) ok = walk_chain(d, dst, d->buf, len, &dst_end) >= 0;
     d->transfers++;
-    if (ok) d->octets += len;
-    else d->errors++;
+    if (ok) {
+        d->octets += len;
+        d->ch[src][CDMA_CAR / 4u] = src_end;
+        d->ch[dst][CDMA_CAR / 4u] = dst_end;
+    } else {
+        d->errors++;
+    }
     finish(d, src, !ok);
     finish(d, dst, !ok);
+}
+
+/* A peripheral request on channel n: its chain's octets to the device at
+ * its FIFO address. Unclaimed, it stays running. */
+static void try_peripheral(cdma_t *d, unsigned n) {
+    if (!d->periph) { d->periph_unclaimed++; return; }
+    uint32_t end = 0;
+    const int64_t got = walk_chain(d, n, NULL, 0, &end);
+    if (got < 0) {
+        d->transfers++;
+        d->errors++;
+        finish(d, n, true);
+        return;
+    }
+    if (!d->periph(d->periph_ctx, d->ch[n][CDMA_DAR / 4u], d->buf, (uint32_t)got)) {
+        d->periph_unclaimed++;
+        return;
+    }
+    d->transfers++;
+    d->periph_transfers++;
+    d->periph_octets += (uint64_t)got;
+    d->ch[n][CDMA_CAR / 4u] = end;
+    finish(d, n, false);
 }
 
 uint32_t cdma_read(cdma_t *d, uint32_t off) {
@@ -183,7 +219,10 @@ void cdma_write(cdma_t *d, uint32_t off, uint32_t v) {
     if (v & CDMA_CSR_ABORT) next &= ~CDMA_CSR_STATE;
     if (v & CDMA_CSR_GO) next = (next & ~CDMA_CSR_STATE) | CDMA_CSR_RUNNING;
     *csr = next;
-    if (v & CDMA_CSR_GO) try_transfer(d, n);
+    if (v & CDMA_CSR_GO) {
+        if (next & CDMA_CSR_M2M) try_transfer(d, n);
+        else try_peripheral(d, n);
+    }
 }
 
 uint32_t cdma_aes_read(const cdma_t *d, uint32_t off) {

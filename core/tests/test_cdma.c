@@ -213,12 +213,72 @@ static void test_errors_and_abort(void) {
     cdma_free(&d);
 }
 
+/* Where CAR is left: past what the engine consumed. iPhone OS 3.1.3's
+ * AppleCDMA keeps a ring of 128 descriptors and finds its progress there;
+ * a request queued while the channel is busy replaces the terminator and
+ * starts the channel again without touching CAR. */
+static uint32_t g_taken[4], g_takes;
+static bool sink(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len) {
+    (void)ctx; (void)data;
+    if (fifo != 0x801000a0u) return false;
+    if (g_takes < 4u) g_taken[g_takes] = len;
+    g_takes++;
+    return true;
+}
+
+static void test_car_after_requests(void) {
+    cdma_t d;
+    CHECK(cdma_init(&d, mem, NULL), "init");
+    memset(g_ram, 0, sizeof g_ram);
+    /* Memory to memory: CAR ends past each channel's last descriptor. */
+    desc(RAM_PA + 0x100, RAM_PA + 0x120, CDMA_CMD_DATA | CDMA_CMD_LAST, RAM_PA + 0x1000, 32);
+    desc(RAM_PA + 0x200, RAM_PA + 0x220, CDMA_CMD_DATA, RAM_PA + 0x2000, 32);
+    start(&d, 1, RAM_PA + 0x100, 0, 32);
+    start(&d, 2, RAM_PA + 0x200, 0, 32);
+    CHECK(cdma_read(&d, ch(1, CDMA_CAR)) == RAM_PA + 0x120 &&
+          cdma_read(&d, ch(2, CDMA_CAR)) == RAM_PA + 0x220, "CAR past the copy's descriptors");
+
+    /* The ring: descriptor i links to i + 1, the last back to the first. */
+    const uint32_t ring = RAM_PA + 0x8000;
+    for (unsigned i = 0; i < 128u; i++)
+        desc(ring + 32u * i, ring + 32u * ((i + 1u) & 127u), 0, 0, 0);
+    cdma_set_peripheral(&d, sink, NULL);
+    cdma_write(&d, ch(4, CDMA_CSR), 0x18u);
+    cdma_write(&d, ch(4, 0x4), 0xcau);
+    cdma_write(&d, ch(4, CDMA_DAR), 0x801000a0u);
+    cdma_write(&d, ch(4, CDMA_CAR), ring);
+    /* Request one: two descriptors, 0..1, the last with 0x300. */
+    put32(ring + 0x24, 0x303u); put32(ring + 0x28, RAM_PA + 0x3000); put32(ring + 0x2c, 64u);
+    put32(ring + 0x04, 0x3u);   put32(ring + 0x08, RAM_PA + 0x4000); put32(ring + 0x0c, 128u);
+    cdma_write(&d, ch(4, CDMA_CSR), 0x19u);
+    CHECK(g_takes == 1u && g_taken[0] == 192u && cdma_read(&d, ch(4, CDMA_CAR)) == ring + 0x40u &&
+          cdma_irq(&d, 4), "the first request, CAR at its terminator");
+    /* Request two, queued in place of the terminator: descriptor 2. */
+    put32(ring + 0x48, RAM_PA + 0x5000); put32(ring + 0x4c, 64u);
+    put32(ring + 0x44, 0x303u);
+    cdma_write(&d, ch(4, CDMA_CSR), 0x19u);
+    CHECK(g_takes == 2u && g_taken[1] == 64u && cdma_read(&d, ch(4, CDMA_CAR)) == ring + 0x60u,
+          "the second carries on from CAR");
+    /* Descriptor 127 wraps: CAR comes back to the ring's start. */
+    cdma_write(&d, ch(4, CDMA_CAR), ring + 127u * 32u);
+    put32(ring + 127u * 32u + 8u, RAM_PA + 0x6000); put32(ring + 127u * 32u + 12u, 64u);
+    put32(ring + 127u * 32u + 4u, 0x303u);
+    cdma_write(&d, ch(4, CDMA_CSR), 0x19u);
+    CHECK(g_takes == 3u && cdma_read(&d, ch(4, CDMA_CAR)) == ring, "wraps to the ring's start");
+    /* Unclaimed: CAR stays where it was. */
+    cdma_write(&d, ch(4, CDMA_DAR), 0x82000010u);
+    cdma_write(&d, ch(4, CDMA_CSR), 0x19u);
+    CHECK(g_takes == 3u && cdma_read(&d, ch(4, CDMA_CAR)) == ring, "unclaimed leaves CAR");
+    cdma_free(&d);
+}
+
 int main(void) {
     printf("NEON CDMA + AES tests\n");
     test_copy_across_segments();
     test_uid_request_as_ios6_made_it();
     test_register_key_and_ecb();
     test_errors_and_abort();
+    test_car_after_requests();
     printf("  %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

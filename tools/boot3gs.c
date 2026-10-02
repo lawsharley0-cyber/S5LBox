@@ -31,7 +31,7 @@
  * cached interpreter in large slices, the way the app does, reporting only
  * the backtraces, the console and the end state -- the speed of that mode is
  * the app's. -r serves a root filesystem image as /dev/md0 (the kernel must
- * be the 10B500 one tools/ios6_kernel_patch.c knows); the image is written
+ * be 10B500 or the 3GS 7E18, whose gates are in tools/); the image is written
  * to, so pass a working copy, never the only one; with -P, a missing -r
  * image is first made from the pristine one (see make_work_image). -w (single-step mode)
  * records, for every kernel thread, the call chain of the last time it
@@ -39,8 +39,9 @@
  * thread's last wait at the end: where a stalled boot is waiting. -F writes
  * the framebuffer Boot_Video describes (n88_framebuffer) as a PPM image at
  * the end, reading each 32-bit pixel's low three octets as blue, green, red.
- * -B sets the boot_args version the kernel checks (default 5, iOS 6's; the
- * 3GS's iPhone OS 3.1.3 kernel wants 4).
+ * -B sets the boot_args version the kernel checks (default 5, iOS 6's; 4
+ * when the kernel is the 3GS's iPhone OS 3.1.3 7E18 one, which wants it).
+ * -r works with either known kernel, each with its own memory-disk gate.
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -49,6 +50,7 @@
  */
 #include "arm.h"
 #include "file_block.h"
+#include "ios3_n88_kernel_patch.h"
 #include "ios6_kernel_patch.h"
 #include "ksyms.h"
 #include "n88.h"
@@ -367,11 +369,18 @@ int main(int argc, char **argv) {
     if (!n88_devicetree_is_3gs(tree, dlen))
         printf("warning: the device tree's root is not compatible \"N88AP\"\n");
 
+    /* The two kernels this machine knows, by LC_UUID: each has its own
+     * memory-disk gate, and 3.1.3 its own boot epoch. */
+    const bool is_ios6 = ios6_kernel_patch_identify(kernel, klen);
+    const bool is_ios3 = !is_ios6 && ios3_n88_kernel_patch_identify(kernel, klen);
+    if (is_ios3 && !epoch) epoch = IOS3_N88_KERNEL_BOOT_ARGS_VERSION;
+    printf("kernel: %s\n", is_ios6 ? "iOS 6.1.6 10B500" : is_ios3 ? "iPhone OS 3.1.3 7E18" : "unrecognised");
+
     file_block_t *root_file = NULL;
     const vm_block_t *root = NULL;
     if (root_path) {
-        if (!ios6_kernel_patch_identify(kernel, klen))
-            die("-r needs the iOS 6.1.6 10B500 iPhone2,1 kernel (its UUID differs)");
+        if (!is_ios6 && !is_ios3)
+            die("-r needs the iPhone2,1 10B500 or 7E18 kernel (its UUID is neither)");
         FILE *existing = fopen(root_path, "rb");
         if (existing) fclose(existing);
         else if (pristine_path) make_work_image(pristine_path, root_path);
@@ -403,20 +412,24 @@ int main(int argc, char **argv) {
         .cmdline = cmdline,
         .unmatch = nunmatch ? unmatch : NULL, .unmatch_count = nunmatch,
         .root = root,
-        .md_read_site_pc = root ? IOS6_KERNEL_PATCH_MD_READ_VA : 0u,
-        .md_write_site_pc = root ? IOS6_KERNEL_PATCH_MD_WRITE_VA : 0u,
+        .md_read_site_pc = !root ? 0u : is_ios6 ? IOS6_KERNEL_PATCH_MD_READ_VA
+                                                : IOS3_N88_KERNEL_PATCH_MD_READ_VA,
+        .md_write_site_pc = !root ? 0u : is_ios6 ? IOS6_KERNEL_PATCH_MD_WRITE_VA
+                                                 : IOS3_N88_KERNEL_PATCH_MD_WRITE_VA,
         .boot_args_version = (uint8_t)epoch,
     };
     const n88_status_t bs = n88_boot(&g_m, &req, detail, sizeof detail);
     if (bs != N88_OK) die("%s: %s", n88_strerror(bs), detail);
     if (root) {
         guest_patch_report_t pr;
-        const guest_patch_status_t ps = ios6_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr);
+        const guest_patch_status_t ps = is_ios6
+            ? ios6_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr)
+            : ios3_n88_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr);
         if (ps != GUEST_PATCH_STATUS_OK)
             die("the kernel patch was refused: %s (entry %u, va %08llx)",
                 guest_patch_status_string(ps), pr.entry_index,
                 (unsigned long long)pr.virtual_address);
-        printf("kernel patched for the memory-disk bridge (4 sites)\n");
+        printf("kernel patched for the memory-disk bridge (%u sites)\n", is_ios6 ? 4u : 3u);
     }
     printf("device tree pa %08x (%u bytes), boot_args pa %08x, topOfKernelData pa %08x\n",
            g_m.devicetree_pa, g_m.devicetree_size, g_m.boot_args_pa, g_m.tokd_pa);
@@ -425,12 +438,14 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < (nunmatch ? nunmatch : 1u); i++)
         printf("%s/%s", i ? ", " : "", nunmatch ? unmatch[i] : "arm-io/iop");
     printf("\nentry pa %08x (%s)%s\n\n", g_m.entry_pa,
-           sym(g_m.entry_pa - N88_DRAM_BASE + N88_VIRT_BASE),
+           sym(g_m.entry_pa - N88_DRAM_BASE +
+               (is_ios3 ? IOS3_N88_KERNEL_PATCH_VIRT_BASE : N88_VIRT_BASE)),
            engine ? ", cached interpreter" : "");
 
     uint32_t ring[64] = {0};
     unsigned ring_i = 0, same = 0;
     uint64_t n = 0, exceptions = 0, interrupts = 0, undefs = 0;
+    uint32_t last_fault_pc = 0, last_fault_addr = 0, repeats = 0;
     arm_status_t st = ARM_OK;
     const char *why = "instruction budget";
     const uint32_t panic_va = g_have_syms ? ksyms_value(&g_syms, "_panic") & ~1u : 0u;
@@ -474,10 +489,20 @@ int main(int argc, char **argv) {
                  * instruction traps once and is re-run. */
                 if (npc - vbase == 0x18u || npc - vbase == 0x1cu) { interrupts++; continue; }
                 if (npc - vbase == 0x04u) { undefs++; continue; }
+                /* Aborts can be the machine working too: iPhone OS 3's kernel
+                 * memory is pageable, so it touches a new buffer page by page
+                 * and faults each one in. What is news is the same
+                 * instruction faulting on the same address over and over. */
                 exceptions++;
-                printf("  exception vector %02x from pc %08x %s  dfsr %08x dfar %08x "
-                       "ifsr %08x ifar %08x\n", npc - vbase, pc, sym(pc), g_m.cpu.cp15.dfsr,
-                       g_m.cpu.cp15.dfar, g_m.cpu.cp15.ifsr, g_m.cpu.cp15.ifar);
+                const uint32_t fault_at = npc - vbase == 0x0cu ? g_m.cpu.cp15.ifar
+                                                               : g_m.cpu.cp15.dfar;
+                repeats = (pc == last_fault_pc && fault_at == last_fault_addr) ? repeats + 1u : 0u;
+                last_fault_pc = pc;
+                last_fault_addr = fault_at;
+                if (exceptions <= 20u)
+                    printf("  exception vector %02x from pc %08x %s  dfsr %08x dfar %08x "
+                           "ifsr %08x ifar %08x\n", npc - vbase, pc, sym(pc), g_m.cpu.cp15.dfsr,
+                           g_m.cpu.cp15.dfar, g_m.cpu.cp15.ifsr, g_m.cpu.cp15.ifar);
                 if (exceptions <= 5u) {
                     /* r7 is not banked, so the chain is still the faulting
                      * code's; start it from the faulting pc. */
@@ -486,7 +511,9 @@ int main(int argc, char **argv) {
                     backtrace("      ");
                     g_m.cpu.r[15] = vpc;
                 }
-                if (exceptions > 20u) { why = "more than 20 exceptions"; n++; break; }
+                if (repeats >= 20u) {
+                    why = "the same fault 20 times in a row"; n++; break;
+                }
             }
             if ((n + 1u) % every == 0u) {
                 printf("  at %" PRIu64 "M instructions, guest time %.2f s:\n",
@@ -556,6 +583,10 @@ int main(int argc, char **argv) {
         printf("cdma: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64 " AES (%" PRIu64
                " with the stand-in hardware key), %" PRIu64 " errors\n", dm->transfers,
                dm->octets, dm->aes_ops, dm->hardware_key_ops, dm->errors);
+        if (dm->periph_transfers || dm->periph_unclaimed)
+            printf("cdma peripheral: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64
+                   " unclaimed; sha1: %" PRIu64 " blocks\n", dm->periph_transfers,
+                   dm->periph_octets, dm->periph_unclaimed, g_m.sha1.blocks);
     }
     dump_state();
     if (!engine) {

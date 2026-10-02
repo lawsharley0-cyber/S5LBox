@@ -3473,8 +3473,13 @@ static arm_status_t t2_load_store_single(arm_cpu_t *c, uint32_t pc,
         }
         hint_ok = P && !U && !W;
     } else if ((hw2 & 0xfc0u) == 0u) {                 /* [Rn, Rm, LSL #imm2] */
+        /* Rm == SP is UNPREDICTABLE in the ARM ARM, but the Cortex-A8 uses
+         * SP's value like any register's, and Apple's compiler emits it for
+         * indexing a stack buffer: iPhone OS 3.1.3's libraries carry
+         * STRB.W r0, [r4, sp] (0xf804 0x000d), run by launchd's first
+         * children. Rm == PC stays refused. */
         const unsigned rm = hw2 & 0xfu;
-        if (rm == 13u || rm == 15u) return ARM_UNDEFINED;
+        if (rm == 15u) return ARM_UNDEFINED;
         addr = c->r[rn] + (c->r[rm] << ((hw2 >> 4) & 3u));
     } else {
         return ARM_UNDEFINED;

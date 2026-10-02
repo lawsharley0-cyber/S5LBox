@@ -52,6 +52,7 @@
 #include "arm_ci.h"
 #include "cdma.h"
 #include "m2clcd.h"
+#include "s5l_sha1.h"
 #include "md_bridge.h"
 #include "soc.h"
 #include "spi_nor.h"
@@ -178,6 +179,13 @@
 #define N88_CLCD_LINE     0x25u
 #define N88_FRAME_HZ      60u
 
+/*
+ * The SHA-1 engine (s5l_sha1.h): /arm-io/sha1 at 0x80100000. It takes data
+ * only from CDMA, as a peripheral request whose FIFO address is its +0xA0;
+ * no other device here takes peripheral requests.
+ */
+#define N88_SHA1_PA       UINT32_C(0x80100000)
+
 #define N88_SPI0_PA       UINT32_C(0x82000000)
 #define N88_SPI0_SIZE     UINT32_C(0x1000)
 #define N88_SPI0_LINE     29u
@@ -216,6 +224,7 @@ typedef struct n88 {
     uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
     cdma_t    cdma;                 /* the DMA engine and AES contexts        */
     m2clcd_t  clcd;                 /* the display controller                 */
+    s5l_sha1_t sha1;                /* the SHA-1 engine                       */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;

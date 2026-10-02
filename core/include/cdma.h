@@ -27,8 +27,17 @@
  *   descriptor's physical address. The first segment of an AES-filtered
  *   transfer also carries bits 17:16, which this model does not need.
  *
- *   A request is a pair: the odd channel reads (and is the one an AES
- *   context filters), the even one after it writes. Seen in a boot: channel
+ *   When a request ends, CAR holds where the engine stopped: past the last
+ *   descriptor it consumed (the zero-command one, or the next one after a
+ *   last). iPhone OS 3.1.3's AppleCDMA depends on it: its descriptors are a
+ *   ring of 128 (one page), and its interrupt handler (0xc0525450)
+ *   completes those from its consumer index up to (CAR - ring) / 32. A
+ *   request queued while the channel is busy is linked in place of the
+ *   terminator and started with CSR = 0x19 again, CAR untouched
+ *   (0xc05252a8), so the engine carries on from where it stopped.
+ *
+ *   A memory-to-memory request is a pair: the odd channel reads (and is the
+ *   one an AES context filters), the even one after it writes. Seen in a boot: channel
  *   1 with CSR 0x188 and a 0x30103 descriptor over the input, channel 2
  *   with 0x88 and a 0x103 descriptor over the output.
  *
@@ -48,9 +57,21 @@
  * engine, which is all the guest needs, and it unwraps nothing made on a
  * real phone.
  *
- * Not modelled: time (a request completes when its second channel starts),
- * peripheral (non memory-to-memory) channels, pausing, and the IV the
- * hardware leaves behind (the driver writes it for every request).
+ *   A peripheral request is one channel without bit 7. iPhone OS 3.1.3's
+ *   AppleCDMA feeds the SHA-1 engine this way (channel 4, the tree's
+ *   dma-channels): CSR = 0x18, +0x4 = 0xCA (transfer configuration), +0x8 =
+ *   0x801000A0 (the peripheral's FIFO), the chain, then CSR |= 1; its
+ *   descriptors carry command 0x303 over the memory to send.
+ *
+ *   Peripheral requests are served memory-to-peripheral only: the chain's
+ *   octets go to the device whose FIFO is at +0x8 (cdma_set_peripheral), and
+ *   the channel completes when the device takes them. A channel whose
+ *   address no device claims stays running, counted in periph_unclaimed.
+ *
+ * Not modelled: time (a request completes when it can run: a memory-to-
+ * memory pair when its second channel starts, a peripheral one at once),
+ * peripheral-to-memory transfers, pausing, and the IV the hardware leaves
+ * behind (the driver writes it for every request).
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -66,6 +87,7 @@
 #define CDMA_AES_CONTEXTS    8u
 
 #define CDMA_CSR             0x00u
+#define CDMA_DAR             0x08u      /* a peripheral request's FIFO      */
 #define CDMA_DBR             0x0cu
 #define CDMA_CAR             0x14u
 #define CDMA_ERR             0x18u
@@ -101,15 +123,22 @@ extern const uint8_t CDMA_STANDIN_KEY[32];
  * `len` octets at `pa` is not memory. */
 typedef bool (*cdma_mem_fn)(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool write);
 
+/* A peripheral request's data for the device whose FIFO is at `fifo`: true
+ * when such a device took it, false when no device is there. */
+typedef bool (*cdma_periph_fn)(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len);
+
 typedef struct {
     uint32_t    ch[CDMA_CHANNELS][8];   /* each channel's registers +0..+0x1c */
     uint32_t    enabled[2];             /* the global page's enable bits      */
     uint32_t    aes[CDMA_AES_SIZE / 4u];
     cdma_mem_fn mem;
     void       *mem_ctx;
+    cdma_periph_fn periph;
+    void          *periph_ctx;
     uint8_t    *buf;                    /* one transfer, CDMA_MAX_TRANSFER    */
 
     uint64_t    transfers, octets, aes_ops, hardware_key_ops, errors;
+    uint64_t    periph_transfers, periph_octets, periph_unclaimed;
 } cdma_t;
 
 /* false if the transfer buffer cannot be allocated. */
@@ -117,6 +146,8 @@ bool cdma_init(cdma_t *d, cdma_mem_fn mem, void *mem_ctx);
 void cdma_free(cdma_t *d);
 /* Every register to 0; memory callbacks and counters kept. */
 void cdma_reset(cdma_t *d);
+/* Where peripheral requests deliver (NULL: nowhere; they stay running). */
+void cdma_set_peripheral(cdma_t *d, cdma_periph_fn fn, void *ctx);
 
 uint32_t cdma_read(cdma_t *d, uint32_t off);
 void     cdma_write(cdma_t *d, uint32_t off, uint32_t v);
