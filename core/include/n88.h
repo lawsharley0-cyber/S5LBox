@@ -50,6 +50,7 @@
 
 #include "arm.h"
 #include "arm_ci.h"
+#include "cdma.h"
 #include "md_bridge.h"
 #include "soc.h"
 #include "spi_nor.h"
@@ -157,6 +158,15 @@
  * keeps its contents across n88_boot as a real one does across a reboot;
  * n88_nor() gives the caller the array to load or save.
  */
+/*
+ * The CDMA engine and its AES contexts (cdma.h): /arm-io/cdma's two reg
+ * ranges through /arm-io's ranges (+0x80000000). Channel n (1..27) raises
+ * the tree's interrupts[n - 1], line 0x2a + n.
+ */
+#define N88_CDMA_PA       UINT32_C(0x87000000)
+#define N88_CDMA_AES_PA   UINT32_C(0x87800000)
+#define N88_CDMA_LINE0    0x2au
+
 #define N88_SPI0_PA       UINT32_C(0x82000000)
 #define N88_SPI0_SIZE     UINT32_C(0x1000)
 #define N88_SPI0_LINE     29u
@@ -193,6 +203,7 @@ typedef struct n88 {
     s5l_spi_t spi0;
     spi_nor_t nor;
     uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
+    cdma_t    cdma;                 /* the DMA engine and AES contexts        */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;

@@ -135,6 +135,39 @@ static bool in_spi0(uint32_t pa) {
     return pa >= N88_SPI0_PA && pa < N88_SPI0_PA + N88_SPI0_SIZE;
 }
 
+static bool in_cdma(uint32_t pa) {
+    return pa >= N88_CDMA_PA && pa < N88_CDMA_PA + CDMA_SIZE;
+}
+
+static bool in_cdma_aes(uint32_t pa) {
+    return pa >= N88_CDMA_AES_PA && pa < N88_CDMA_AES_PA + CDMA_AES_SIZE;
+}
+
+/* The engine's view of memory: DRAM only, and a write tells the cached
+ * interpreter, as a CPU store does, in case it lands on translated code. */
+static bool cdma_mem(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool write) {
+    n88_t *m = ctx;
+    if (!len) return true;
+    if (pa < N88_DRAM_BASE || (uint64_t)pa + len > (uint64_t)N88_DRAM_BASE + N88_DRAM_SIZE)
+        return false;
+    uint8_t *p = m->ram + (pa - N88_DRAM_BASE);
+    if (write) {
+        memcpy(p, buf, len);
+        if (m->ci) arm_ci_note_ram_write(m->ci, pa, len);
+    } else {
+        memcpy(buf, p, len);
+    }
+    return true;
+}
+
+/* Every channel's level onto its VIC line. */
+static void cdma_lines(n88_t *m) {
+    for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
+        const unsigned line = N88_CDMA_LINE0 + n;
+        s5l_vic_set_line(&m->vic[line / 32u], line % 32u, cdma_irq(&m->cdma, n));
+    }
+}
+
 /* spi0's interrupt is a level the controller derives from its own state;
  * sampling it here also counts its rising edges (irq_rises). */
 static void spi0_line(n88_t *m) {
@@ -182,12 +215,28 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         irq_update(m);
         return v;
     }
+    if (in_cdma(pa)) {
+        m->mmio++;
+        return cdma_read(&m->cdma, pa - N88_CDMA_PA);
+    }
+    if (in_cdma_aes(pa)) {
+        m->mmio++;
+        return cdma_aes_read(&m->cdma, pa - N88_CDMA_AES_PA);
+    }
     if (in_vic(pa)) {
         m->mmio++;
         const unsigned n = (pa - N88_VIC_PA) >> 16;
         const uint32_t off = pa & 0xffffu;
-        return off == VIC_VECTADDR ? s5l_vic_vectaddr(&m->vic[n], 32u * n)
-                                   : s5l_vic_read(&m->vic[n], off);
+        if (off != VIC_VECTADDR) return s5l_vic_read(&m->vic[n], off);
+        /* The three are daisy-chained: a VIC with nothing of its own
+         * pending passes the next one's vector through. AppleARMPL192VIC
+         * (0x807e5c54) reads VIC0's for every interrupt and, for a source
+         * on VIC1 or VIC2, acknowledges each VIC down the chain. */
+        for (unsigned i = n; i < N88_VIC_COUNT; i++) {
+            const uint32_t v = s5l_vic_vectaddr(&m->vic[i], 32u * i);
+            if (v) return v;
+        }
+        return 0u;
     }
     m->unmodelled++;
     if (m->trace) m->trace(m->trace_ctx, pa, size, false, 0u, m->cpu.r[15]);
@@ -219,6 +268,11 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
             spi_nor_select(&m->nor, (v & 1u) == 0u);    /* active low */
     } else if (in_spi0(pa)) {
         s5l_spi_write(&m->spi0, pa - N88_SPI0_PA, v);
+    } else if (in_cdma(pa)) {
+        cdma_write(&m->cdma, pa - N88_CDMA_PA, v);
+        cdma_lines(m);
+    } else if (in_cdma_aes(pa)) {
+        cdma_aes_write(&m->cdma, pa - N88_CDMA_AES_PA, v);
     } else {
         modelled = false;
     }
@@ -314,6 +368,7 @@ bool n88_init(n88_t *m, bool cached_engine) {
         n88_free(m);
         return false;
     }
+    if (!cdma_init(&m->cdma, cdma_mem, m)) { n88_free(m); return false; }
     m->bus = (arm_bus_t){
         .ctx = m,
         .read32 = b_r32, .read16 = b_r16, .read8 = b_r8,
@@ -343,6 +398,7 @@ void n88_free(n88_t *m) {
     m->ram = NULL;
     free(m->nor_mem);
     m->nor_mem = NULL;
+    cdma_free(&m->cdma);
 }
 
 uint8_t *n88_nor(n88_t *m) {
@@ -791,6 +847,7 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         s5l_spi_attach(&m->spi0, 0u, &nor_slave);
     }
     spi_nor_reset(&m->nor);
+    cdma_reset(&m->cdma);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
     if (m->ci) arm_ci_flush(m->ci);

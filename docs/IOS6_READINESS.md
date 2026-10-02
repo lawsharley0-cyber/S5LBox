@@ -701,3 +701,28 @@ UART, camera, NOR image access), and waits for its root filesystem
 ("Still waiting for root device") at 60 s guest time, about 13 s of host
 time. Next is a root filesystem for it: the iOS 6 memory-disk bridge
 patches the 10B500 kernel at fixed sites, and 7E18 needs its own.
+
+### The CDMA engine and AES with a stand-in hardware key (#46)
+
+This was the step the keybag work stopped short of. It turns out not to
+involve any real device's secret: the emulated phone gets its own fixed
+"fused" key (`CDMA_STANDIN_KEY`), the way every real phone has its own.
+Whatever the guest wraps with it is unwrapped only by this same engine, and
+nothing made on a real phone unwraps here. (Podium, an iPod touch 4 / iOS
+6.1.6 emulator, takes the same approach on the A4's identical block.)
+
+- `core/src/soc/cdma.c` models /arm-io/cdma's memory-to-memory path
+  (0x87000000, channels 1..27, line 0x2a + n) and the eight AES contexts
+  (0x87800000): UID/GID requests use the stand-in key, register keys are
+  honoured, 128/192/256-bit, CBC or ECB. The register protocol and
+  descriptor format are AppleCDMA's (cdma.h cites the addresses); the
+  boot's own request (context 0x30100, descriptors 0x30103/0x103) is a test.
+- The VICs are daisy-chained: AppleARMPL192VIC reads VIC0's VECTADDR for
+  every interrupt, so a VIC with nothing pending now passes the next one's
+  vector through. Before this, the first VIC1 interrupt this machine ever
+  raised (CDMA channel 1, line 43) dispatched as source 0, was never
+  acknowledged, and stormed.
+- Result: by 63 s of guest time, 6 transfers / 6 AES operations (5 under
+  the hardware key), 0 errors, and the boot otherwise follows the same path
+  as before. kb_load still fails, because no system keybag file exists:
+  on a real phone a restore creates it (#47).

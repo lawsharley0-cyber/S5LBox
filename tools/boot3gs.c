@@ -552,6 +552,10 @@ int main(int argc, char **argv) {
                nr->refused, nr->unknown);
         if (nr->unknown) printf(" (last %02x)", nr->last_unknown);
         printf("\n");
+        const cdma_t *dm = &g_m.cdma;
+        printf("cdma: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64 " AES (%" PRIu64
+               " with the stand-in hardware key), %" PRIu64 " errors\n", dm->transfers,
+               dm->octets, dm->aes_ops, dm->hardware_key_ops, dm->errors);
     }
     dump_state();
     if (!engine) {

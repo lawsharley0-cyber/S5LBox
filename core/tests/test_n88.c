@@ -20,6 +20,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "n88.h"
+#include "aes.h"
 #include "macho.h"
 
 #include <stdio.h>
@@ -944,6 +945,50 @@ static void test_devicetree_identity(void) {
     CHECK(!n88_devicetree_is_3gs(NULL, 0), "nothing");
 }
 
+/* The CDMA engine on the bus: a UID-key request as iOS 6 makes it moves
+ * through DRAM and raises channel 1's line, VIC1 line 11. */
+static void test_cdma_on_the_bus(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    const uint32_t C = N88_CDMA_PA, A = N88_CDMA_AES_PA, in = 0x40100000u, out = 0x40100100u;
+    for (unsigned i = 0; i < 16u; i++) ram_at(m, in)[i] = (uint8_t)i;
+    const uint32_t d1[4] = { 0x40200020u, 0x30103u, in, 16u }, d2[4] = { 0x40200120u, 0x103u, out, 16u };
+    for (unsigned i = 0; i < 4u; i++) {
+        n88_write32(m, 0x40200000u + 4u * i, d1[i]);
+        n88_write32(m, 0x40200100u + 4u * i, d2[i]);
+    }
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, A + 0x1000u, 0x30100u);
+    n88_write32(m, C + 0x1014u, 0x40200000u);
+    n88_write32(m, C + 0x1000u, 0x188u);
+    n88_write32(m, C + 0x1000u, 0x189u);
+    n88_write32(m, C + 0x2014u, 0x40200100u);
+    n88_write32(m, C + 0x2000u, 0x88u);
+    n88_write32(m, C + 0x2000u, 0x89u);
+    uint8_t want[16], plain[16];
+    for (unsigned i = 0; i < 16u; i++) plain[i] = (uint8_t)i;
+    aes_ctx_t a;
+    static const uint8_t iv[16];
+    aes_init(&a, CDMA_STANDIN_KEY, 128);
+    aes_cbc_encrypt(&a, iv, plain, want, 16);
+    CHECK(memcmp(ram_at(m, out), want, 16) == 0, "the UID encrypt did not land in DRAM");
+    CHECK((s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 11)) &&
+          (s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 12)), "channels 1 and 2 on VIC1 11/12");
+    CHECK((n88_read32(m, C + 0x1000u) & CDMA_CSR_DONE) && m->unmodelled == unmodelled,
+          "done, and every access modelled");
+    /* Daisy chain: VIC0 has nothing pending, so its vector is VIC1's. */
+    n88_write32(m, N88_VIC_PA + 0x10000u + VIC_INTENABLE, 1u << 11);
+    CHECK(n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == (0x80000000u | 43u) &&
+          n88_read32(m, N88_VIC_PA + 0x10000u + VIC_VECTADDR) == (0x80000000u | 43u),
+          "VIC0's vector is VIC1's source 43");
+    n88_write32(m, C + 0x1000u, n88_read32(m, C + 0x1000u));
+    CHECK(!(s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 11)), "acknowledge drops the line");
+    CHECK(n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == 0u, "nothing pending anywhere");
+    n88_free(m);
+    free(m);
+}
+
 int main(void) {
     test_bus_routing();
     test_timer_registers();
@@ -953,6 +998,7 @@ int main(void) {
     test_boot_refusals();
     test_clock_table();
     test_spi0_flash();
+    test_cdma_on_the_bus();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();
