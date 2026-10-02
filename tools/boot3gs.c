@@ -24,7 +24,7 @@
  * Usage:
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
- *           [-r root.img [-P pristine.img]] [-w] [-F screen.ppm]
+ *           [-r root.img [-P pristine.img]] [-w] [-F screen.ppm] [-B epoch]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default, "arm-io/iop"); -e runs on the
@@ -39,6 +39,8 @@
  * thread's last wait at the end: where a stalled boot is waiting. -F writes
  * the framebuffer Boot_Video describes (n88_framebuffer) as a PPM image at
  * the end, reading each 32-bit pixel's low three octets as blue, green, red.
+ * -B sets the boot_args version the kernel checks (default 5, iOS 6's; the
+ * 3GS's iPhone OS 3.1.3 kernel wants 4).
  * The kernelcache must be decrypted and decompressed (a plain Mach-O), and
  * the device tree decrypted (the flat tree inside the IMG3). Both come from
  * the user's own IPSW; nothing Apple-owned is in this repository.
@@ -325,7 +327,7 @@ int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: boot3gs kernelcache.macho devicetree.bin [-n insns] "
                         "[-c boot-args] [-v] [-m dram.bin] [-u node]... [-e] "
-                        "[-r root.img]\n");
+                        "[-r root.img] [-F screen.ppm] [-B epoch]\n");
         return 2;
     }
     uint64_t budget = 200000000u;
@@ -335,6 +337,7 @@ int main(int argc, char **argv) {
     const char *unmatch[16];
     unsigned nunmatch = 0;
     bool engine = false, waits = false;
+    unsigned epoch = 0;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-n") && i + 1 < argc) budget = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cmdline = argv[++i];
@@ -345,6 +348,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-F") && i + 1 < argc) screen_out = argv[++i];
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
+        else if (!strcmp(argv[i], "-B") && i + 1 < argc) {
+            epoch = (unsigned)strtoul(argv[++i], NULL, 0);
+            if (!epoch || epoch > 255u) die("-B wants an epoch from 1 to 255");
+        }
         else if (!strcmp(argv[i], "-u") && i + 1 < argc && nunmatch < 16u)
             unmatch[nunmatch++] = argv[++i];
         else die("unknown option %s", argv[i]);
@@ -398,6 +405,7 @@ int main(int argc, char **argv) {
         .root = root,
         .md_read_site_pc = root ? IOS6_KERNEL_PATCH_MD_READ_VA : 0u,
         .md_write_site_pc = root ? IOS6_KERNEL_PATCH_MD_WRITE_VA : 0u,
+        .boot_args_version = (uint8_t)epoch,
     };
     const n88_status_t bs = n88_boot(&g_m, &req, detail, sizeof detail);
     if (bs != N88_OK) die("%s: %s", n88_strerror(bs), detail);

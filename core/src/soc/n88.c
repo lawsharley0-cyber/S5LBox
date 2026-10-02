@@ -585,10 +585,20 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         return fail(N88_ERR_KERNEL, detail, cap,
                     "kernelcache: no entry point, or linked below 0x80000000");
 
+    /*
+     * The kernel's virtual base, from its own Mach-O: the va that maps to the
+     * start of DRAM. iOS 6's 3GS kernel is linked at 0x80000000, iPhone OS
+     * 3.1.3's at 0xC0000000; both load at physical 0x40000000. Rounding the
+     * lowest segment down to a 256 MiB boundary (the DRAM size) gives that
+     * base (0x80001000 -> 0x80000000, 0xC0008000 -> 0xC0000000), so the
+     * physical layout below is identical for iOS 6 and correct for 3.1.3.
+     */
+    const uint32_t virt_base = k.vm_low & ~(uint32_t)(N88_DRAM_SIZE - 1u);
+
     /* Where everything goes: the kernel at its link address, then the tree,
      * boot_args and topOfKernelData, 16 KiB aligned because the kernel builds
      * its first-level translation table there. */
-    const uint64_t kernel_end = (uint64_t)k.vm_high - N88_VIRT_BASE + N88_DRAM_BASE;
+    const uint64_t kernel_end = (uint64_t)k.vm_high - virt_base + N88_DRAM_BASE;
     const uint64_t tree_pa = (kernel_end + 0xfffu) & ~(uint64_t)0xfffu;
     const uint64_t args_pa = (tree_pa + req->devicetree_size + 0xfffu) & ~(uint64_t)0xfffu;
     const uint64_t tokd_pa = (args_pa + 0x1000u + 0x3fffu) & ~(uint64_t)0x3fffu;
@@ -605,9 +615,9 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     for (unsigned i = 0; i < k.segment_count; i++) {
         const macho_segment_t *s = &k.segments[i];
         if (!s->vmsize) continue;
-        if (s->vmaddr < N88_VIRT_BASE)
-            return fail(N88_ERR_KERNEL, detail, cap, "segment %s below 0x80000000", s->name);
-        const uint32_t pa = s->vmaddr - N88_VIRT_BASE + N88_DRAM_BASE;
+        if (s->vmaddr < virt_base)
+            return fail(N88_ERR_KERNEL, detail, cap, "segment %s below %08x", s->name, virt_base);
+        const uint32_t pa = s->vmaddr - virt_base + N88_DRAM_BASE;
         if (!in_ram(pa, 1) || (uint64_t)pa + s->vmsize > usable_end)
             return fail(N88_ERR_LAYOUT, detail, cap, "segment %s outside DRAM", s->name);
         const uint32_t n = s->filesize < s->vmsize ? s->filesize : s->vmsize;
@@ -662,12 +672,15 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
                            &ncoref, 1);
     }
     {
+        /* iOS 6's iBoot hands the kernel NVRAM through this property; iPhone
+         * OS 3's tree has none (its kernel reads NVRAM from the NOR), so a
+         * tree without it is passed over, and only a short one refused. */
         uint32_t nl = 0;
         uint8_t *nv = dt_prop_rw(tree, &dt, &root, "chosen", "nvram-proxy-data", &nl);
-        if (!nv || nl < 0x1000u)
+        if (nv && nl < 0x1000u)
             return fail(N88_ERR_DEVICETREE, detail, cap,
-                        "device tree: no /chosen:nvram-proxy-data of at least 4 KB");
-        n88_nvram_image(nv, nl);
+                        "device tree: /chosen:nvram-proxy-data is under 4 KB");
+        if (nv) n88_nvram_image(nv, nl);
     }
     /* Un-match: an 'x' over the first byte of the node's compatible, so no
      * driver claims it (core/src/boot/bringup.c does the same). */
@@ -737,12 +750,16 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     /* boot_args (the layout core/src/boot/bringup.c documents). */
     uint8_t *ba = m->ram + ((uint32_t)args_pa - N88_DRAM_BASE);
     ba[0] = 1; ba[1] = 0;                       /* Revision */
-    /* Version 5: pe_identify_machine (0x8027ace0) loads boot_args+2 and
-     * panics "Epoch Mismatch" unless it is 5. (iPhone OS 3's wants 6.) */
-    ba[2] = 5; ba[3] = 0;
-    st32(ba + 0x04, N88_VIRT_BASE);
+    /* The version is the kernel's epoch: pe_identify_machine loads
+     * boot_args+2 and panics unless it matches. iOS 6 (0x8027ace0) wants 5,
+     * the default; the 3GS's iPhone OS 3.1.3 (0xc01a292e) wants 4. */
+    ba[2] = req->boot_args_version ? req->boot_args_version : 5u; ba[3] = 0;
+    st32(ba + 0x04, virt_base);
     st32(ba + 0x08, N88_DRAM_BASE);
-    st32(ba + 0x0c, N88_DRAM_SIZE - N88_TOP_RESERVE);   /* the top is boot-owned */
+    /* The top is boot-owned. Whole MiB: iPhone OS 3.1.3's start code
+     * (0xc00670c8) maps memory a MiB at a time until memSize reaches exactly
+     * zero, and walks off the end of DRAM forever on any remainder. */
+    st32(ba + 0x0c, (N88_DRAM_SIZE - N88_TOP_RESERVE) & ~UINT32_C(0xfffff));
     st32(ba + 0x10, (uint32_t)tokd_pa);
     /* Boot_Video: iBoot's first framebuffer (n88.h). v_display selects the
      * console mode, not whether a display exists: the iPhone OS 3 machine
@@ -756,7 +773,7 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     st32(ba + 0x20, N88_FB_WIDTH);
     st32(ba + 0x24, N88_FB_HEIGHT);
     st32(ba + 0x28, N88_FB_DEPTH);
-    st32(ba + 0x30, (uint32_t)tree_pa - N88_DRAM_BASE + N88_VIRT_BASE);
+    st32(ba + 0x30, (uint32_t)tree_pa - N88_DRAM_BASE + virt_base);
     st32(ba + 0x34, (uint32_t)req->devicetree_size);
     memcpy(ba + 0x38, cmdline, strlen(cmdline));
 
@@ -778,7 +795,7 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     arm_reset(&m->cpu, &m->bus);
     if (m->ci) arm_ci_flush(m->ci);
     m->cpu.cpsr = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
-    const uint32_t entry_pa = k.entry - N88_VIRT_BASE + N88_DRAM_BASE;
+    const uint32_t entry_pa = k.entry - virt_base + N88_DRAM_BASE;
     m->cpu.r[15] = entry_pa & ~1u;
     if (k.entry & 1u) m->cpu.cpsr |= ARM_CPSR_T;
     m->cpu.r[0] = (uint32_t)args_pa;

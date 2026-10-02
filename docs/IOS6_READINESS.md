@@ -663,3 +663,41 @@ booting system. The verifiable slice of #44 -- iBoot's framebuffer with
 the kernel's own boot log on it, and the spi-version 1 controller the
 touch device would sit on -- is done; the rest is gated behind the keybag,
 which this session stopped short of (see above).
+
+### iPhone OS 3.1.3 on the same machine
+
+iPhone OS 3.1.3 (7E18) for the 3GS predates data protection (iOS 4), so it
+has no keybag to stop at; it is the way past the point where iOS 6
+reboots, on the same n88 hardware model. Four differences from iOS 6 had
+to be handled, each measured on the 7E18 kernelcache and device tree:
+
+- **Virtual base.** The 3.1.3 kernel is linked at 0xC0000000, iOS 6's at
+  0x80000000; both load at physical 0x40000000. n88 now takes the base
+  from the kernel's lowest segment, rounded down to 256 MiB (the DRAM
+  size), so a kernel linked high inside that window is still refused.
+- **memSize must be whole MiB.** 3.1.3's start code (0xc00670c8) maps
+  memory a MiB at a time and stops only when memSize reaches exactly zero;
+  the old memSize (DRAM less the 0x1C6000 framebuffer + PRAM top) never
+  did, and the loop walked off the end of DRAM forever. memSize is now
+  rounded down to 0x0FE00000; iOS 6 follows the same path with the same
+  timings (root at 60.27 s, keybagd stopped at 68.77 s).
+- **No `/chosen/nvram-proxy-data`.** 3.1.3's tree has no such property
+  (its kernel reads NVRAM from the NOR), so a tree without it is passed
+  over and only a short one refused.
+- **Epoch 4.** pe_identify_machine (0xc01a292e) panics unless the
+  boot_args version is 4 (iOS 6: 5; the S5L8900 iPhone OS 3: 6). It is a
+  request field (`n88_boot_t.boot_args_version`), `boot3gs -B 4`.
+
+Also fixed on the way: the IMG3 decrypt left the last partial AES block of
+a payload as ciphertext. The 3.1.3 device tree is 42840 bytes in a tag
+padded to 42848, so its last 8 bytes (the final `AAPL,phandle`) came out
+as garbage and the tree did not parse; a tail whose block the tag's
+padding completes is now decrypted, as iBoot does.
+
+Result (`boot3gs kernelcache.macho devicetree.bin -e -B 4`): the kernel
+reaches IOKit, starts the platform drivers (VIC, GPIO, performance
+controller, SPI v1 x2, I2C, PWM, USB PHY, MIPI DSI, I2S x3, CS42L61 audio,
+UART, camera, NOR image access), and waits for its root filesystem
+("Still waiting for root device") at 60 s guest time, about 13 s of host
+time. Next is a root filesystem for it: the iOS 6 memory-disk bridge
+patches the 10B500 kernel at fixed sites, and 7E18 needs its own.

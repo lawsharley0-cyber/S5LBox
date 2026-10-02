@@ -250,6 +250,8 @@ typedef struct {
     const vm_block_t  *root;
     uint32_t           md_read_site_pc;
     uint32_t           md_write_site_pc;
+    /* boot_args revision byte; 0 means 5, what iOS 6 expects. */
+    uint8_t            boot_args_version;
 } n88_boot_t;
 
 /* Allocate DRAM, wire the bus, reset the CPU. `cached_engine` puts the CPU on

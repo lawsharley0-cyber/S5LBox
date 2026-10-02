@@ -71,6 +71,7 @@ typedef struct {
 
     const uint8_t *data;    /* DATA tag payload (points into the input) */
     uint32_t       data_len;
+    uint32_t       data_room; /* bytes the DATA tag holds, padding included */
 
     img3_kbag_t kbag;
     bool        has_shsh;
@@ -91,8 +92,11 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
  * uses img.kbag.iv.
  *
  * `key_bits` must match the parsed KBAG and `out_cap` must cover img.data_len
- * bytes. Only whole 16-byte blocks are decrypted; an unaligned tail is copied
- * through verbatim, matching Apple's container convention. `out_len` receives
+ * bytes. When the payload ends inside a block, the tag's padding normally
+ * holds the rest of that block's ciphertext (the 3GS's iPhone OS 3.1.3
+ * device tree: 42840 bytes in a 42848-byte tag), and then the whole block is
+ * decrypted and only `data_len` bytes kept, as iBoot does. A tag with no such
+ * padding has its unaligned tail copied through verbatim. `out_len` receives
  * the number of bytes written.
  */
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,

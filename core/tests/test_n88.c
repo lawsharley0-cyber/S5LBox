@@ -523,8 +523,8 @@ static void test_boot_layout_and_tree(void) {
         const uint8_t *ba = ram_at(m, args_pa);
         CHECK(ba[0] == 1 && ba[1] == 0 && ba[2] == 5 && ba[3] == 0, "boot_args revision 1, version 5");
         CHECK(get32(ba + 0x04) == N88_VIRT_BASE && get32(ba + 0x08) == N88_DRAM_BASE &&
-              get32(ba + 0x0c) == N88_DRAM_SIZE - N88_TOP_RESERVE && get32(ba + 0x10) == tokd_pa,
-              "boot_args bases, memSize below the boot-owned top, topOfKernelData");
+              get32(ba + 0x0c) == 0x0fe00000u && get32(ba + 0x10) == tokd_pa,
+              "boot_args bases, memSize whole MiB below the boot-owned top, topOfKernelData");
         CHECK(get32(ba + 0x30) == tree_pa - N88_DRAM_BASE + N88_VIRT_BASE &&
               get32(ba + 0x34) == tree.n, "boot_args device tree VA and size");
         CHECK(strcmp((const char *)ba + 0x38, N88_DEFAULT_CMDLINE) == 0, "the default boot-args");
@@ -647,6 +647,22 @@ static void test_boot_refusals(void) {
     const size_t highlen = build_kernel(high, sizeof high, 0x8ff00000u, code, 1);
     r.kernel = high; r.kernel_size = highlen;
     CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_LAYOUT, "no room above the kernel: %s", d);
+
+    /* iPhone OS 3.1.3's kernel is linked at 0xC0000000 and loads at the same
+     * physical base; its epoch is 4. */
+    static uint8_t ios3[0x400];
+    const size_t ios3len = build_kernel(ios3, sizeof ios3, 0xc0001000u, code, 1);
+    r.kernel = ios3; r.kernel_size = ios3len; r.boot_args_version = 4;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "a kernel at 0xC0000000: %s", d);
+    {
+        const uint8_t *ba = ram_at(m, m->boot_args_pa);
+        CHECK(m->entry_pa == 0x40001000u && get32(ba + 0x04) == 0xc0000000u &&
+              get32(ba + 0x08) == N88_DRAM_BASE && ba[2] == 4 &&
+              get32(ba + 0x30) == m->devicetree_pa - N88_DRAM_BASE + 0xc0000000u,
+              "0xC0000000 base: entry pa %08x, virtBase %08x, epoch %u", m->entry_pa,
+              get32(ba + 0x04), ba[2]);
+    }
+    r.boot_args_version = 0;
     r.kernel = kernel; r.kernel_size = klen;
 
     r.devicetree_size = tree.n - 4;
