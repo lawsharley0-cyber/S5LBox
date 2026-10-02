@@ -45,6 +45,9 @@ add_library(emucore STATIC
     src/soc/cdma.c
     src/soc/m2clcd.c
     src/soc/s5l_sha1.c
+    src/soc/s5l8920_i2c.c
+    src/soc/s5l8920_dart.c
+    src/soc/s5l8920_dsim.c
     src/soc/gpioic.c
     src/soc/buttons.c
     src/soc/mtz2.c
@@ -263,6 +266,9 @@ add_test(NAME m2clcd COMMAND test_m2clcd)
 add_executable(test_s5l_sha1 tests/test_s5l_sha1.c)
 target_link_libraries(test_s5l_sha1 PRIVATE emucore)
 add_test(NAME s5l_sha1 COMMAND test_s5l_sha1)
+add_executable(test_s5l8920_i2c tests/test_s5l8920_i2c.c)
+target_link_libraries(test_s5l8920_i2c PRIVATE emucore)
+add_test(NAME s5l8920_i2c_dart_dsim COMMAND test_s5l8920_i2c)
 
 add_executable(test_gpioic tests/test_gpioic.c)
 target_link_libraries(test_gpioic PRIVATE emucore)

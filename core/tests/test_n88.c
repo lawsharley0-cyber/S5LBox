@@ -399,15 +399,19 @@ static void build_tree(buf_t *t, tree_opts_t o) {
         b_prop(t, "MemoryMapReserved-2", zero8, 8);
       if (o.clock_bytes) {
         static const uint8_t zero128[128];
-        b_node(t, 3, 2); b_str(t, "name", "arm-io");
+        b_node(t, 3, 3); b_str(t, "name", "arm-io");
         b_prop(t, "clock-frequencies", zero128, o.clock_bytes);
         b_prop(t, "usbphy-frequency", zero4, 4);
           b_node(t, 2, 0); b_str(t, "name", "audio-complex");
           b_prop(t, "ncoref-frequency", zero4, 4);
+          b_node(t, 1, 1); b_str(t, "name", "mipi-dsim");
+            b_node(t, 2, 0); b_str(t, "name", "lcd");
+            b_prop(t, "lcd-panel-id", zero4, 4);
       } else {
         b_node(t, 1, 1); b_str(t, "name", "arm-io");
       }
-        b_node(t, 2, 0); b_str(t, "name", "iop"); b_str(t, "compatible", "iop-s5l8920x");
+        b_node(t, 2, 0); b_str(t, "name", "iop");
+        b_prop(t, "compatible", "iop-s5l8920x\0iop-s5l8720x", 26);
 }
 
 static const char N88_COMPAT[] = "N88AP\0iPhone2,1\0AppleARM";
@@ -569,10 +573,13 @@ static void test_boot_layout_and_tree(void) {
         CHECK(p && get32(p) == N88_USBPHY_HZ, "/arm-io:usbphy-frequency");
         p = tree_prop(dt, tree.n, "arm-io/audio-complex", "ncoref-frequency", &l);
         CHECK(p && get32(p) == N88_NCOREF_HZ, "/arm-io/audio-complex:ncoref-frequency");
+        p = tree_prop(dt, tree.n, "arm-io/mipi-dsim/lcd", "lcd-panel-id", &l);
+        CHECK(p && l == 4u && get32(p) == N88_LCD_PANEL_ID, "the panel id iBoot would read");
         p = tree_prop(dt, tree.n, "chosen", "nvram-proxy-data", &l);
         CHECK(p && l == 0x2000 && p[0] == 0x70 && p[0x800] == 0x7f, "the NVRAM image");
         p = tree_prop(dt, tree.n, "arm-io/iop", "compatible", &l);
-        CHECK(p && memcmp(p, "xop-s5l8920x", 12) == 0, "the IOP un-matched by default");
+        CHECK(p && memcmp(p, "xop-s5l8920x\0xop-s5l8720x", 26) == 0,
+              "the IOP un-matched by default, every compatible string struck");
         p = tree_prop(dt, tree.n, "chosen/memory-map", "DeviceTree", &l);
         CHECK(p && l == 8 && get32(p) == tree_pa && get32(p + 4) == tree.n,
               "memory-map DeviceTree took the first placeholder");
@@ -989,6 +996,32 @@ static void test_display_controller(void) {
     /* A swap to the second boot buffer moves what the host shows. */
     n88_write32(m, C + 0x24, N88_VRAM_PA + N88_FB_BYTES);
     CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA + N88_FB_BYTES), "swapped scanout");
+    /* An I/O address, as 3.1.3's display driver leaves it (0x3C0D8000):
+     * gathered through dart0 a page at a time, in the order the DART maps
+     * them, which here is backwards through DRAM. */
+    {
+        const uint32_t D = N88_DART0_PA, tables = 0x40400000u, pages = 0x40500000u;
+        const uint32_t bytes = N88_FB_STRIDE * N88_FB_HEIGHT, npages = (bytes + 0xfffu) >> 12;
+        n88_write32(m, D + 0xc, 0u);
+        for (uint32_t n = 0; n < 16u; n++)
+            n88_write32(m, D + 0x8, ((tables - N88_DRAM_BASE) + (n << 12)) | (n << 8) | 1u);
+        n88_write32(m, D + 0xc, 0x80000070u);
+        for (uint32_t i = 0; i < npages; i++) {
+            const uint32_t iova = 0x3c0d8000u + (i << 12);
+            const uint32_t page = pages + ((npages - 1u - i) << 12);
+            n88_write32(m, tables + ((iova >> 22) & 0xfu) * 0x1000u + ((iova >> 12) & 0x3ffu) * 4u,
+                        (page - N88_DRAM_BASE) | 1u);
+            n88_write32(m, page, 0xff000000u | i);
+        }
+        n88_write32(m, C + 0x24, 0x3c0d8000u);
+        const uint8_t *fb = n88_framebuffer(m);
+        bool ok = fb && fb != ram_at(m, N88_VRAM_PA);
+        for (uint32_t i = 0; ok && i < npages; i++) ok = get32(fb + (i << 12)) == (0xff000000u | i);
+        CHECK(ok, "scanout through dart0, page by page");
+        n88_write32(m, D + 0xc, 0u);
+        CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "translation off: iBoot's buffer");
+        n88_write32(m, C + 0x24, N88_VRAM_PA + N88_FB_BYTES);
+    }
     /* A geometry the hosts cannot show falls back to iBoot's buffer. */
     n88_write32(m, C + 0x30, (240u << 16) | 320u);
     CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "fallback");

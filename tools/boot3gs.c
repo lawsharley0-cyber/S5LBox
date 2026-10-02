@@ -27,7 +27,8 @@
  *           [-r root.img [-P pristine.img]] [-w] [-F screen.ppm] [-B epoch]
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
- * device-tree node (replacing the default, "arm-io/iop"); -e runs on the
+ * device-tree node (replacing the default: "arm-io/iop", or for the 7E18
+ * kernel the list at ios3_unmatch); -e runs on the
  * cached interpreter in large slices, the way the app does, reporting only
  * the backtraces, the console and the end state -- the speed of that mode is
  * the app's. -r serves a root filesystem image as /dev/md0 (the kernel must
@@ -375,6 +376,24 @@ int main(int argc, char **argv) {
     const bool is_ios3 = !is_ios6 && ios3_n88_kernel_patch_identify(kernel, klen);
     if (is_ios3 && !epoch) epoch = IOS3_N88_KERNEL_BOOT_ARGS_VERSION;
     printf("kernel: %s\n", is_ios6 ? "iOS 6.1.6 10B500" : is_ios3 ? "iPhone OS 3.1.3 7E18" : "unrecognised");
+    /* 3.1.3's devices that are worse declared and silent than absent, each
+     * the cause of a hang or panic before its removal (docs/IOS6_READINESS.md,
+     * #55). Without them SpringBoard draws its activation screen. Any -u
+     * replaces the whole list. */
+    static const char *const ios3_unmatch[] = {
+        "arm-io/iop",               /* the IOP firmware is not modelled           */
+        "baseband",                 /* no modem: CommCenter would retry forever   */
+        "arm-io/spi2",              /* the modem's SPI bus                        */
+        "arm-io/sgx",               /* QuartzCore draws in software instead       */
+        "arm-io/usb-otg",           /* findMaxEndpoints panics on its registers   */
+        "arm-io/isp",               /* the camera's ISP never answers its mailbox */
+        "arm-io/amc",               /* the hardware audio decoder is not modelled */
+        "arm-io/spi1/multi-touch",  /* the touch controller is not modelled       */
+        "arm-io/tv-out",            /* closing its framebuffer hangs SpringBoard  */
+    };
+    if (is_ios3 && !nunmatch)
+        for (; nunmatch < sizeof ios3_unmatch / sizeof ios3_unmatch[0]; nunmatch++)
+            unmatch[nunmatch] = ios3_unmatch[nunmatch];
 
     file_block_t *root_file = NULL;
     const vm_block_t *root = NULL;
@@ -467,8 +486,10 @@ int main(int argc, char **argv) {
             drain_console();
             if (st != ARM_OK) { why = "the core refused an instruction"; break; }
             if (n % every == 0u) {
-                printf("  at %" PRIu64 "M instructions, guest time %.2f s:\n",
-                       n / 1000000u, n88_guest_seconds(&g_m));
+                printf("  at %" PRIu64 "M instructions, guest time %.2f s (ttbr0 %08x,"
+                       " user sp %08x lr %08x):\n", n / 1000000u, n88_guest_seconds(&g_m),
+                       g_m.cpu.cp15.ttbr0, g_m.cpu.bank_r13[ARM_BANK_USR],
+                       g_m.cpu.bank_r14[ARM_BANK_USR]);
                 backtrace("    ");
             }
         }
@@ -583,6 +604,37 @@ int main(int argc, char **argv) {
         printf("cdma: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64 " AES (%" PRIu64
                " with the stand-in hardware key), %" PRIu64 " errors\n", dm->transfers,
                dm->octets, dm->aes_ops, dm->hardware_key_ops, dm->errors);
+        {
+            const m2clcd_t *lc = &g_m.clcd;
+            m2clcd_scanout_t so;
+            const bool on = m2clcd_scanout(lc, &so);
+            printf("clcd: %" PRIu64 " frames; control %08x, +0x4 %08x; window A", lc->frames,
+                   lc->reg[0], lc->reg[1]);
+            for (unsigned r = 0x20u; r < 0x40u; r += 4u) printf(" %08x", lc->reg[r / 4u]);
+            if (on) printf("; scanout %ux%u, %u bytes a row, %u bpp at %08x", so.width, so.height,
+                           so.stride_bytes, so.bpp, so.addr);
+            printf("\n");
+        }
+        printf("dsim: %" PRIu64 " packets (%" PRIu64 " payload words), last header %08x\n",
+               g_m.dsim.packets, g_m.dsim.payload_words, g_m.dsim.last_header);
+        for (unsigned b = 0; b < 2u; b++) {
+            const s5l8920_i2c_t *ic = b ? &g_m.i2c2 : &g_m.i2c0;
+            printf("i2c%u: %" PRIu64 " transfers, %" PRIu64 " not acknowledged, %" PRIu64
+                   " octets out, %" PRIu64 " in\n", b ? 2u : 0u, ic->transfers, ic->naks,
+                   ic->bytes_tx, ic->bytes_rx);
+        }
+        for (unsigned d = 0; d < 2u; d++) {
+            const i2c_regfile_t *rf = d ? &g_m.pmu : &g_m.accel;
+            if (!rf->reads && !rf->writes) continue;
+            printf("  %s (0x%02x): %" PRIu64 " reads, %" PRIu64 " writes; registers",
+                   d ? "pmu" : "accelerometer", rf->addr, rf->reads, rf->writes);
+            for (unsigned r = 0; r < 256u; r++) {
+                const bool rd = (rf->read_map[r >> 3] >> (r & 7u)) & 1u;
+                const bool wr = (rf->write_map[r >> 3] >> (r & 7u)) & 1u;
+                if (rd || wr) printf(" %02x%s%s=%02x", r, rd ? "r" : "", wr ? "w" : "", rf->reg[r]);
+            }
+            printf("\n");
+        }
         if (dm->periph_transfers || dm->periph_unclaimed)
             printf("cdma peripheral: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64
                    " unclaimed; sha1: %" PRIu64 " blocks\n", dm->periph_transfers,

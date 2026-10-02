@@ -53,6 +53,9 @@
 #include "cdma.h"
 #include "m2clcd.h"
 #include "s5l_sha1.h"
+#include "s5l8920_i2c.h"
+#include "s5l8920_dart.h"
+#include "s5l8920_dsim.h"
 #include "md_bridge.h"
 #include "soc.h"
 #include "spi_nor.h"
@@ -175,6 +178,17 @@
  * framebuffer iBoot left (N88_VRAM_PA), and n88_framebuffer() follows its
  * window registers from then on.
  */
+#define N88_LCD_PANEL_ID  UINT32_C(0x4e454f4e)   /* "NEON": no real panel's  */
+
+/*
+ * The DARTs (s5l8920_dart.h): dart0 at 0xBFE00000 translates for the
+ * display controller, dart1 at 0xBFF00000 for the camera blocks. Once the
+ * display driver owns the controller its window holds an I/O address
+ * (3.1.3: 0x3C0D8000), which n88_framebuffer() follows through dart0.
+ */
+#define N88_DSIM_PA       UINT32_C(0x89000000)   /* s5l8920_dsim.h         */
+#define N88_DART0_PA      UINT32_C(0xbfe00000)
+#define N88_DART1_PA      UINT32_C(0xbff00000)
 #define N88_CLCD_PA       UINT32_C(0x85400000)
 #define N88_CLCD_LINE     0x25u
 #define N88_FRAME_HZ      60u
@@ -185,6 +199,20 @@
  * no other device here takes peripheral requests.
  */
 #define N88_SHA1_PA       UINT32_C(0x80100000)
+
+/*
+ * The I2C controllers (s5l8920_i2c.h): /arm-io/i2c0 at 0x83200000, line
+ * 0x13, and /arm-io/i2c2 at 0x83400000, line 0x11. On i2c0, as the tree
+ * places them: the LIS331DL accelerometer (0x1D) and the D1755 PMU (0x74).
+ * The other devices there (compass, CS42L61 codec, Mikey, tethered) and
+ * i2c2's light sensor do not acknowledge.
+ */
+#define N88_I2C0_PA       UINT32_C(0x83200000)
+#define N88_I2C2_PA       UINT32_C(0x83400000)
+#define N88_I2C0_LINE     0x13u
+#define N88_I2C2_LINE     0x11u
+#define N88_ACCEL_ADDR    0x1du
+#define N88_PMU_ADDR      0x74u
 
 #define N88_SPI0_PA       UINT32_C(0x82000000)
 #define N88_SPI0_SIZE     UINT32_C(0x1000)
@@ -225,6 +253,12 @@ typedef struct n88 {
     cdma_t    cdma;                 /* the DMA engine and AES contexts        */
     m2clcd_t  clcd;                 /* the display controller                 */
     s5l_sha1_t sha1;                /* the SHA-1 engine                       */
+    s5l8920_i2c_t i2c0, i2c2;       /* the I2C controllers                    */
+    i2c_regfile_t accel;            /* LIS331DL on i2c0                       */
+    i2c_regfile_t pmu;              /* D1755 on i2c0                          */
+    s5l8920_dart_t dart0, dart1;    /* I/O address translation                */
+    s5l8920_dsim_t dsim;            /* the MIPI-DSI master                    */
+    uint8_t  *scanout;              /* the screen gathered through dart0      */
     struct {
         uint64_t start;             /* count when the decrementer was written */
         uint32_t interval;

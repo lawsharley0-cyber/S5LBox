@@ -155,6 +155,27 @@ static bool in_cdma_aes(uint32_t pa) {
     return pa >= N88_CDMA_AES_PA && pa < N88_CDMA_AES_PA + CDMA_AES_SIZE;
 }
 
+static bool in_i2c0(uint32_t pa) {
+    return pa >= N88_I2C0_PA && pa < N88_I2C0_PA + S5L8920_I2C_SIZE;
+}
+
+static bool in_i2c2(uint32_t pa) {
+    return pa >= N88_I2C2_PA && pa < N88_I2C2_PA + S5L8920_I2C_SIZE;
+}
+
+static bool in_dsim(uint32_t pa) {
+    return pa >= N88_DSIM_PA && pa < N88_DSIM_PA + S5L8920_DSIM_SIZE;
+}
+
+static bool in_dart(uint32_t pa) {
+    return (pa >= N88_DART0_PA && pa < N88_DART0_PA + S5L8920_DART_SIZE) ||
+           (pa >= N88_DART1_PA && pa < N88_DART1_PA + S5L8920_DART_SIZE);
+}
+
+static s5l8920_dart_t *dart_at(n88_t *m, uint32_t pa) {
+    return pa >= N88_DART1_PA ? &m->dart1 : &m->dart0;
+}
+
 static bool in_sha1(uint32_t pa) {
     return pa >= N88_SHA1_PA && pa < N88_SHA1_PA + S5L_SHA1_SIZE;
 }
@@ -190,6 +211,26 @@ static void cdma_lines(n88_t *m) {
         const unsigned line = N88_CDMA_LINE0 + n;
         s5l_vic_set_line(&m->vic[line / 32u], line % 32u, cdma_irq(&m->cdma, n));
     }
+}
+
+static void i2c_lines(n88_t *m) {
+    s5l_vic_set_line(&m->vic[0], N88_I2C0_LINE, s5l8920_i2c_irq(&m->i2c0));
+    s5l_vic_set_line(&m->vic[0], N88_I2C2_LINE, s5l8920_i2c_irq(&m->i2c2));
+}
+
+/* The LIS331DL's CTRL_REG2 BOOT bit reloads its trim and clears itself;
+ * AppleLIS302DL::enableAccelerometer panics if it reads it set 500 ms on. */
+static void accel_write(i2c_regfile_t *r, uint8_t reg, uint8_t v) {
+    if (reg == 0x21u) r->reg[0x21] = (uint8_t)(v & ~0x40u);
+}
+
+/* The devices on the I2C buses as they power up. */
+static void i2c_devices_reset(n88_t *m) {
+    i2c_regfile_init(&m->accel, N88_ACCEL_ADDR);
+    m->accel.autoinc_bit = 0x80u;               /* the LIS3xx's MSB flag     */
+    m->accel.reg[0x0f] = 0x3bu;                 /* WHO_AM_I: LIS331DL        */
+    m->accel.on_write = accel_write;
+    i2c_regfile_init(&m->pmu, N88_PMU_ADDR);
 }
 
 /* spi0's interrupt is a level the controller derives from its own state;
@@ -258,6 +299,22 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         m->mmio++;
         return s5l_sha1_read(&m->sha1, pa - N88_SHA1_PA);
     }
+    if (in_i2c0(pa)) {
+        m->mmio++;
+        return s5l8920_i2c_read(&m->i2c0, pa - N88_I2C0_PA);
+    }
+    if (in_dart(pa)) {
+        m->mmio++;
+        return s5l8920_dart_read(dart_at(m, pa), pa & (S5L8920_DART_SIZE - 1u));
+    }
+    if (in_dsim(pa)) {
+        m->mmio++;
+        return s5l8920_dsim_read(&m->dsim, pa - N88_DSIM_PA);
+    }
+    if (in_i2c2(pa)) {
+        m->mmio++;
+        return s5l8920_i2c_read(&m->i2c2, pa - N88_I2C2_PA);
+    }
     if (in_vic(pa)) {
         m->mmio++;
         const unsigned n = (pa - N88_VIC_PA) >> 16;
@@ -310,6 +367,16 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         cdma_aes_write(&m->cdma, pa - N88_CDMA_AES_PA, v);
     } else if (in_sha1(pa)) {
         s5l_sha1_write(&m->sha1, pa - N88_SHA1_PA, v);
+    } else if (in_dart(pa)) {
+        s5l8920_dart_write(dart_at(m, pa), pa & (S5L8920_DART_SIZE - 1u), v);
+    } else if (in_dsim(pa)) {
+        s5l8920_dsim_write(&m->dsim, pa - N88_DSIM_PA, v);
+    } else if (in_i2c0(pa)) {
+        s5l8920_i2c_write(&m->i2c0, pa - N88_I2C0_PA, v);
+        i2c_lines(m);
+    } else if (in_i2c2(pa)) {
+        s5l8920_i2c_write(&m->i2c2, pa - N88_I2C2_PA, v);
+        i2c_lines(m);
     } else if (in_clcd(pa)) {
         m2clcd_advance(&m->clcd, n88_timer_count(m));
         m2clcd_write(&m->clcd, pa - N88_CLCD_PA, v);
@@ -404,7 +471,8 @@ bool n88_init(n88_t *m, bool cached_engine) {
     memset(m, 0, sizeof *m);
     m->ram = calloc(1, N88_DRAM_SIZE);
     m->nor_mem = malloc(N88_NOR_SIZE);
-    if (!m->ram || !m->nor_mem) { n88_free(m); return false; }
+    m->scanout = calloc(1, N88_FB_STRIDE * N88_FB_HEIGHT);
+    if (!m->ram || !m->nor_mem || !m->scanout) { n88_free(m); return false; }
     memset(m->nor_mem, 0xff, N88_NOR_SIZE);     /* an erased part */
     if (!spi_nor_init(&m->nor, m->nor_mem, N88_NOR_SIZE, SPI_NOR_M25PE80_ID)) {
         n88_free(m);
@@ -412,6 +480,15 @@ bool n88_init(n88_t *m, bool cached_engine) {
     }
     if (!cdma_init(&m->cdma, cdma_mem, m)) { n88_free(m); return false; }
     cdma_set_peripheral(&m->cdma, cdma_periph, m);
+    i2c_devices_reset(m);
+    {
+        const s5l_i2c_slave_t accel = i2c_regfile_slave(&m->accel);
+        const s5l_i2c_slave_t pmu = i2c_regfile_slave(&m->pmu);
+        if (!s5l8920_i2c_attach(&m->i2c0, &accel) || !s5l8920_i2c_attach(&m->i2c0, &pmu)) {
+            n88_free(m);
+            return false;
+        }
+    }
     m->bus = (arm_bus_t){
         .ctx = m,
         .read32 = b_r32, .read16 = b_r16, .read8 = b_r8,
@@ -441,6 +518,8 @@ void n88_free(n88_t *m) {
     m->ram = NULL;
     free(m->nor_mem);
     m->nor_mem = NULL;
+    free(m->scanout);
+    m->scanout = NULL;
     cdma_free(&m->cdma);
 }
 
@@ -454,11 +533,29 @@ const uint8_t *n88_framebuffer(const n88_t *m) {
      * framebuffer's geometry (the hosts show N88_FB_WIDTH x N88_FB_HEIGHT
      * at N88_FB_STRIDE); otherwise iBoot's framebuffer. */
     m2clcd_scanout_t s;
+    const uint32_t bytes = N88_FB_STRIDE * N88_FB_HEIGHT;
     if (m2clcd_scanout(&m->clcd, &s) && s.bpp == N88_FB_DEPTH &&
         s.width == N88_FB_WIDTH && s.height == N88_FB_HEIGHT &&
-        s.stride_bytes == N88_FB_STRIDE &&
-        in_ram(s.addr, N88_FB_STRIDE * N88_FB_HEIGHT))
-        return m->ram + (s.addr - N88_DRAM_BASE);
+        s.stride_bytes == N88_FB_STRIDE) {
+        if (in_ram(s.addr, bytes)) return m->ram + (s.addr - N88_DRAM_BASE);
+        /* An I/O address: gathered through dart0 a page at a time, with a
+         * page it does not map shown black. */
+        const s5l8920_dart_ram_t dram = { m->ram, N88_DRAM_BASE, N88_DRAM_SIZE };
+        uint32_t pa = 0;
+        if (s5l8920_dart_translate(&m->dart0, &dram, s.addr, &pa)) {
+            for (uint32_t o = 0; o < bytes;) {
+                const uint32_t iova = s.addr + o;
+                uint32_t n = 0x1000u - (iova & 0xfffu);
+                if (n > bytes - o) n = bytes - o;
+                if (s5l8920_dart_translate(&m->dart0, &dram, iova, &pa) && in_ram(pa, n))
+                    memcpy(m->scanout + o, m->ram + (pa - N88_DRAM_BASE), n);
+                else
+                    memset(m->scanout + o, 0, n);
+                o += n;
+            }
+            return m->scanout;
+        }
+    }
     return m->ram + (N88_VRAM_PA - N88_DRAM_BASE);
 }
 
@@ -791,8 +888,22 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
                         "device tree: /chosen:nvram-proxy-data is under 4 KB");
         if (nv) n88_nvram_image(nv, nl);
     }
-    /* Un-match: an 'x' over the first byte of the node's compatible, so no
-     * driver claims it (core/src/boot/bringup.c does the same). */
+    {
+        /* The panel's identity: iBoot reads it from the panel over MIPI-DSI
+         * and writes it over the tree's placeholder 0. iPhone OS 3.1.3's
+         * ApplePinotLCD refuses to start on a zero lcd-panel-id (0xc03fc2b6),
+         * and with no panel driver the display driver waits for its
+         * lcd_enable function forever. Nothing reads the value otherwise
+         * (it is logged), so the emulated panel's is a made-up one. Passed
+         * over in a tree without the property. */
+        const uint32_t panel = N88_LCD_PANEL_ID;
+        (void)dt_set_words(tree, &dt, &root, "arm-io/mipi-dsim/lcd", "lcd-panel-id", &panel, 1);
+    }
+    /* Un-match: an 'x' over the first byte of every string in the node's
+     * compatible, so no driver claims it. Every string, not just the first
+     * (core/src/boot/bringup.c strikes only that): S5L8920 nodes list their
+     * older relatives too ("usb-otg,s5l8920x\0usb-otg,s5l8720x\0..."), and a
+     * driver matching a later one would still start. */
     static const char *const default_unmatch[] = { "arm-io/iop" };
     const char *const *um = req->unmatch ? req->unmatch : default_unmatch;
     const unsigned un = req->unmatch ? req->unmatch_count : 1u;
@@ -802,7 +913,8 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         if (!compat || !cl)
             return fail(N88_ERR_DEVICETREE, detail, cap, "device tree: cannot un-match /%s",
                         um[i] ? um[i] : "(null)");
-        compat[0] = 'x';
+        for (uint32_t at = 0; at < cl; at++)
+            if (at == 0 || compat[at - 1] == '\0') compat[at] = compat[at] ? 'x' : compat[at];
     }
     if (!dt_memmap(tree, &dt, &root, "DeviceTree", (uint32_t)tree_pa,
                    (uint32_t)req->devicetree_size) ||
@@ -902,6 +1014,12 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     spi_nor_reset(&m->nor);
     cdma_reset(&m->cdma);
     s5l_sha1_reset(&m->sha1);
+    s5l8920_i2c_reset(&m->i2c0);
+    s5l8920_i2c_reset(&m->i2c2);
+    i2c_devices_reset(m);
+    s5l8920_dart_reset(&m->dart0);
+    s5l8920_dart_reset(&m->dart1);
+    s5l8920_dsim_reset(&m->dsim);
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
     {

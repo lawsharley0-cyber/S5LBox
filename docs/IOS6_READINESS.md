@@ -745,7 +745,8 @@ mDNSResponder, itunesstored, IQAgent, fairplayd, configd, accessoryd,
 mDNSResponderHelper and securityd. 4,404 code pages are SHA-1 validated
 on the engine. At 90 s the same SpringBoard (pid 18) is still running.
 
-The screen stays black because no framebuffer is ever published.
+At this point (fixed in #55, below) the screen stayed black because no
+framebuffer was ever published.
 AppleM2DisplayDrivers' start has slept since 0.4 s in waitForService: the
 tree's /arm-io/clcd takes `function-lcd_enable` from
 /arm-io/mipi-dsim/lcd (the "pinot" panel), which takes `function-lcd_ldo`
@@ -759,6 +760,91 @@ for the panel driver, then the display driver publishes the framebuffer
 that m2clcd.c already scans out. A camera client also retries the ISP
 (no firmware, no mailbox) every 2 s, and the clock reads 1969 (no RTC,
 which is also the PMU).
+
+#### The display chain: I2C, the PMU, the panel id and the DART (#55)
+
+The chain turned out to need four pieces, and no DSIM model yet:
+
+- **The I2C controllers** (`core/src/soc/s5l8920_i2c.c`, i2c0 at
+  0x83200000 line 0x13, i2c2 at 0x83400000 line 0x11). Not the S5L8900's
+  Samsung controller: AppleS5L8920XI2CController runs a whole transfer
+  from a few registers (address +0x0, first byte +0x10, count +0x18, FIFO
+  +0x20, start +0x24 = 4 | write; status +0xC, bit 4 done, bit 5 no
+  acknowledge). The boot's first transfer was the accelerometer's
+  WHO_AM_I (slave 0x1D, register 0x0F), and every later one, the PMU's
+  included, queued behind it.
+- **The devices**: the LIS331DL answers WHO_AM_I = 0x3B; the D1755 is a
+  register file that acknowledges and keeps what is written. That is
+  enough for AppleD1755PMU to start (it reads its bucks as 725 mV and
+  programs its LDOs), and with it the backlight, the multitouch loader,
+  USB and, most of all, the RTC users: **the root mount moves from 60 s
+  to 0.42 s** (the 60 s was "RTC did not show up"), and iOS 6's from
+  60.27 s to 0.52 s. iOS 6 then takes its usual path (the keybag fails at
+  3.9 s, launchd stops every job), and its restart now arrives through
+  the PMU ("pmu restart", 10.3 s) where it came at 92.8 s before; the PMU
+  model does not yet reset the machine.
+- **The panel id.** ApplePinotLCD refuses to start on the tree's
+  placeholder `lcd-panel-id` 0, which iBoot fills after reading the panel
+  over MIPI-DSI. n88_boot now writes a made-up one (`N88_LCD_PANEL_ID`,
+  "NEON"); nothing but Pinot reads it, and Pinot only logs it. With the
+  panel service up, the display driver's lcd_enable wait ends.
+- **The DART** (`core/src/soc/s5l8920_dart.c`). The display driver then
+  takes the controller over and points window A at 0x3C0D8000, an I/O
+  address behind dart0 (the clcd's `iommu-parent`). AppleH2PDART loads 16
+  first-level slots through +0x8 (bits 11:8 the slot, bits 27:12 a
+  second-level table's DRAM offset) and 4 KiB tables of
+  (DRAM offset | 1) entries. `n88_framebuffer()` now gathers the scanout
+  through dart0 a page at a time.
+
+With those four the screen shows what the guest draws: the Apple logo on
+black (boot3gs -F, 3,322 lit pixels) from about 0.5 s of guest time, and
+DataMigrator no longer crashes (it gets a real framebuffer). SpringBoard,
+running, still drew nothing; the rest was finding what it waited for.
+
+**Devices worse declared and silent than absent.** As on the S5L8900
+machine (app/Sources/VMBootOptions.c), a node whose hardware is not
+modelled can hang or panic the boot, where an absent one just takes its
+driver's no-hardware path. Each of these was found as the cause of a
+stall, in this order, by walking the threads of the stalled process in a
+DRAM dump (the task and thread layouts are the kernel's own panic
+printer's: a task's threads at +0x28, a thread's user state at +0x324,
+task+0x14 -> map, +0x24 -> pmap, +0x4 -> its table):
+
+- `/baseband` and `/arm-io/spi2`: with a modem declared and silent,
+  lockdownd spins in pthread_once behind CoreTelephony's first call (the
+  3G machine's CommCenter wall, docs/ROADMAP.md).
+- `/arm-io/usb-otg`: AppleSynopsysOTGDevice::findMaxEndpoints panics
+  on unmodelled configuration registers once lockdownd brings USB up.
+- `/arm-io/isp`: the camera client polls the ISP's mailbox forever.
+- `/arm-io/spi1/multi-touch`: the touch controller is not modelled.
+- `/arm-io/tv-out`: SpringBoard's main thread, in UIApplicationMain ->
+  CAWindowServer _detectDisplays -> M2TVOutDisplay::open, releases the TV
+  out framebuffer, and IOServiceClose sleeps in IOMobileGraphicsFamily
+  waiting for a swap the TV out never completes (iOS 6 logs the same:
+  "AppleM2TVOut, client ... going to wait on swap").
+- `/arm-io/sgx` and `/arm-io/amc`, as on the 3G: QuartzCore draws in
+  software, and audio decodes in software.
+
+Un-matching had to strike every string of a node's compatible: S5L8920
+nodes also list their older relatives ("usb-otg,s5l8920x",
+"usb-otg,s5l8720x", ...), and a driver matching a later one still started.
+boot3gs applies this list by default to the 7E18 kernel (`ios3_unmatch`).
+
+Two more device details then mattered: the LIS331DL's CTRL_REG2 BOOT bit
+clears itself (AppleLIS302DL panics if it reads it set 500 ms later), and
+**the MIPI-DSI master** (`core/src/soc/s5l8920_dsim.c`), which
+AppleS5L8900XMIPIDSIController polls without timeouts: STATUS bit 10
+follows CLKCTRL bit 31 (the HS clock), bit 20 reads the software reset
+released, and the ULPS bits (7:4, 9) follow ESCMODE 0x8A in and 0x8F/0x80
+out. Before it, one of those loops took 730 million reads.
+
+**Result: iPhone OS 3.1.3's own activation screen**, drawn by SpringBoard
+on the emulated 3GS: "Searching...", the iTunes and cable art, and "slide
+for emergency" (boot3gs -F, 33,317 lit pixels, from about 11 s of guest
+time), with SpringBoard's background apps (MobilePhone, MobileMail,
+MobileMusicPlayer, voiced) running behind it. It is the screen of a phone
+that has not been activated and has no SIM: activation and touch are the
+next steps.
 
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 
