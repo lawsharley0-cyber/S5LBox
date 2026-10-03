@@ -25,6 +25,7 @@
  *   boot3gs <kernelcache.macho> <devicetree.bin> [-n instructions]
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
  *           [-r root.img [-P pristine.img [-a]]] [-w] [-F screen.ppm] [-B epoch]
+ *           [-D x0,y0,x1,y1,t]... [-T x,y,t]... [-K name,t[,s]]... [-R s] [-S t]...
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default: "arm-io/iop", or for the 7E18
@@ -41,9 +42,14 @@
  * thread's last wait at the end: where a stalled boot is waiting. -F writes
  * the framebuffer Boot_Video describes (n88_framebuffer) as a PPM image at
  * the end, reading each 32-bit pixel's low three octets as blue, green, red.
- * -D x0,y0,x1,y1,t drags one finger across the touchscreen from guest time t
- * (see drag_tick); -S t (up to eight) also writes the screen at guest time
- * t, to the -F path with ".<t>s.ppm" appended (the engine mode only).
+ * -D x0,y0,x1,y1,t drags one finger across the touchscreen from guest time t,
+ * and -T x,y,t taps it at (x,y) (see gesture_tick; up to eight gestures, in
+ * the order given). -K name,t[,s] presses the button "hold", "menu", "volup"
+ * or "voldown" at guest time t for s seconds (0.15 if not given), or moves
+ * the ringer switch to "silent" or "ring" (see press_tick; up to eight). -R s
+ * sets the RTC to s seconds since the Unix epoch (default: the host's
+ * clock). -S t (up to eight) also writes the screen at guest time t, to the
+ * -F path with ".<t>s.ppm" appended (the engine mode only).
  * -B sets the boot_args version the kernel checks (default 5, iOS 6's; 4
  * when the kernel is the 3GS's iPhone OS 3.1.3 7E18 one, which wants it).
  * -r works with either known kernel, each with its own memory-disk gate.
@@ -163,36 +169,94 @@ static void write_screen(const char *path) {
  * -D x0,y0,x1,y1,t: one finger dragged in a straight line, as the touch
  * controller reports it: down at (x0,y0) once t seconds of guest time have
  * passed, DRAG_STEPS - 2 moves, and a lift at (x1,y1), one report per
- * MTZ2_FRAME_PERIOD_MS of guest time. A report the device cannot take yet
- * (one still unread) is offered again on the next slice. Panel pixels.
+ * MTZ2_FRAME_PERIOD_MS of guest time. -T x,y,t: a tap, the same with
+ * TAP_STEPS reports at one point. Gestures run one after another, in the
+ * order given. A report the device cannot take yet (one still unread) is
+ * offered again on the next slice. Panel pixels.
  */
 #define DRAG_STEPS 24u
-static struct {
-    bool     on;
+#define TAP_STEPS   4u
+#define MAX_GESTURES 8u
+typedef struct {
     double   x0, y0, x1, y1, t, next;
-    unsigned step;
+    unsigned step, steps;
     uint64_t refused;
-} g_drag;
+} gesture_t;
+static gesture_t g_gesture[MAX_GESTURES];
+static unsigned  g_ngestures;
 
-static void drag_tick(void) {
-    if (!g_drag.on || g_drag.step >= DRAG_STEPS) return;
+/* The gesture under way or next, or NULL when all are done. */
+static gesture_t *gesture_current(void) {
+    for (unsigned i = 0; i < g_ngestures; i++)
+        if (g_gesture[i].step < g_gesture[i].steps) return &g_gesture[i];
+    return NULL;
+}
+
+static void gesture_tick(void) {
+    gesture_t *g = gesture_current();
+    if (!g) return;
     const double now = n88_guest_seconds(&g_m);
-    if (now < g_drag.t || now < g_drag.next) return;
-    const double f = (double)g_drag.step / (double)(DRAG_STEPS - 1u);
+    if (now < g->t || now < g->next) return;
+    const unsigned last = g->steps - 1u;
+    const double f = (double)g->step / (double)last;
     s5l_mt_contact_t c;
     memset(&c, 0, sizeof c);
     c.id = 1;
-    c.x = (uint16_t)(g_drag.x0 + (g_drag.x1 - g_drag.x0) * f + 0.5);
-    c.y = (uint16_t)(g_drag.y0 + (g_drag.y1 - g_drag.y0) * f + 0.5);
-    c.phase = g_drag.step == 0u ? MTZ2_PHASE_MAKE_TOUCH
-            : g_drag.step == DRAG_STEPS - 1u ? MTZ2_PHASE_BREAK_TOUCH : MTZ2_PHASE_TOUCHING;
-    c.pressure = g_drag.step == DRAG_STEPS - 1u ? 0u : 160u;
+    c.x = (uint16_t)(g->x0 + (g->x1 - g->x0) * f + 0.5);
+    c.y = (uint16_t)(g->y0 + (g->y1 - g->y0) * f + 0.5);
+    c.phase = g->step == 0u ? MTZ2_PHASE_MAKE_TOUCH
+            : g->step == last ? MTZ2_PHASE_BREAK_TOUCH : MTZ2_PHASE_TOUCHING;
+    c.pressure = g->step == last ? 0u : 160u;
     c.major = c.minor = 10u;
-    if (!s5l_mtz2_set_contacts(&g_m.touch, &c, 1)) { g_drag.refused++; return; }
-    if (g_drag.step == 0u) printf("  drag: finger down at %u,%u, guest time %.3f s\n", c.x, c.y, now);
-    if (g_drag.step == DRAG_STEPS - 1u) printf("  drag: lifted at %u,%u, guest time %.3f s\n", c.x, c.y, now);
-    g_drag.step++;
-    g_drag.next = now + MTZ2_FRAME_PERIOD_MS / 1000.0;
+    if (!s5l_mtz2_set_contacts(&g_m.touch, &c, 1)) { g->refused++; return; }
+    const char *what = g->steps == TAP_STEPS ? "tap" : "drag";
+    if (g->step == 0u) printf("  %s: finger down at %u,%u, guest time %.3f s\n", what, c.x, c.y, now);
+    if (g->step == last) printf("  %s: lifted at %u,%u, guest time %.3f s\n", what, c.x, c.y, now);
+    g->step++;
+    g->next = now + MTZ2_FRAME_PERIOD_MS / 1000.0;
+}
+
+/* ------------------------------------------------------------ buttons */
+/*
+ * -K name,t[,s]: a button pressed at guest time t and released s seconds
+ * later, or the ringer switch moved at t (n88_set_input).
+ */
+#define MAX_PRESSES 8u
+typedef struct {
+    n88_input_t in;
+    bool        on;             /* the switch: where it goes                */
+    bool        is_switch;
+    double      t, hold;
+    unsigned    state;          /* 0 waiting, 1 pressed, 2 done             */
+} press_t;
+static press_t  g_press[MAX_PRESSES];
+static unsigned g_npresses;
+
+static const char *const input_name[N88_INPUT_COUNT] = {
+    "hold", "menu", "volup", "voldown", "silent",
+};
+
+static void press_tick(void) {
+    const double now = n88_guest_seconds(&g_m);
+    for (unsigned i = 0; i < g_npresses; i++) {
+        press_t *p = &g_press[i];
+        if (p->state == 0u && now >= p->t) {
+            n88_set_input(&g_m, p->in, p->on);
+            printf("  %s %s, guest time %.3f s\n", p->is_switch ? "ringer switch to" : "pressed",
+                   p->is_switch ? (p->on ? "silent" : "ring") : input_name[p->in], now);
+            p->state = p->is_switch ? 2u : 1u;
+        } else if (p->state == 1u && now >= p->t + p->hold) {
+            n88_set_input(&g_m, p->in, false);
+            printf("  released %s, guest time %.3f s\n", input_name[p->in], now);
+            p->state = 2u;
+        }
+    }
+}
+
+static bool press_held(void) {
+    for (unsigned i = 0; i < g_npresses; i++)
+        if (g_press[i].state == 1u) return true;
+    return false;
 }
 
 /* --------------------------------------------------- the working image */
@@ -418,6 +482,8 @@ int main(int argc, char **argv) {
     unsigned nshots = 0, shots_taken = 0;
     bool engine = false, waits = false;
     unsigned epoch = 0;
+    uint64_t rtc = 0;
+    bool rtc_given = false;
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "-n") && i + 1 < argc) budget = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) cmdline = argv[++i];
@@ -429,11 +495,40 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
         else if (!strcmp(argv[i], "-a")) activate = false;
-        else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
-            if (sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf", &g_drag.x0, &g_drag.y0, &g_drag.x1,
-                       &g_drag.y1, &g_drag.t) != 5)
+        else if (!strcmp(argv[i], "-D") && i + 1 < argc && g_ngestures < MAX_GESTURES) {
+            gesture_t *g = &g_gesture[g_ngestures++];
+            if (sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf", &g->x0, &g->y0, &g->x1, &g->y1,
+                       &g->t) != 5)
                 die("-D wants x0,y0,x1,y1,t");
-            g_drag.on = true;
+            g->steps = DRAG_STEPS;
+        }
+        else if (!strcmp(argv[i], "-T") && i + 1 < argc && g_ngestures < MAX_GESTURES) {
+            gesture_t *g = &g_gesture[g_ngestures++];
+            if (sscanf(argv[++i], "%lf,%lf,%lf", &g->x0, &g->y0, &g->t) != 3)
+                die("-T wants x,y,t");
+            g->x1 = g->x0;
+            g->y1 = g->y0;
+            g->steps = TAP_STEPS;
+        }
+        else if (!strcmp(argv[i], "-K") && i + 1 < argc && g_npresses < MAX_PRESSES) {
+            press_t *p = &g_press[g_npresses++];
+            char name[16];
+            p->hold = 0.15;
+            if (sscanf(argv[++i], "%15[a-z],%lf,%lf", name, &p->t, &p->hold) < 2)
+                die("-K wants name,t[,seconds]");
+            p->on = true;
+            if (!strcmp(name, "ring")) { p->in = N88_INPUT_SILENT; p->on = false; p->is_switch = true; }
+            else if (!strcmp(name, "silent")) { p->in = N88_INPUT_SILENT; p->is_switch = true; }
+            else {
+                unsigned k = 0;
+                while (k < N88_INPUT_SILENT && strcmp(name, input_name[k])) k++;
+                if (k == N88_INPUT_SILENT) die("-K: no button %s", name);
+                p->in = (n88_input_t)k;
+            }
+        }
+        else if (!strcmp(argv[i], "-R") && i + 1 < argc) {
+            rtc = strtoull(argv[++i], NULL, 0);
+            rtc_given = true;
         }
         else if (!strcmp(argv[i], "-S") && i + 1 < argc && nshots < 8u)
             shot_at[nshots++] = strtod(argv[++i], NULL);
@@ -524,6 +619,7 @@ int main(int argc, char **argv) {
     };
     const n88_status_t bs = n88_boot(&g_m, &req, detail, sizeof detail);
     if (bs != N88_OK) die("%s: %s", n88_strerror(bs), detail);
+    n88_set_rtc(&g_m, rtc_given ? (uint32_t)rtc : (uint32_t)time(NULL));
     if (root) {
         guest_patch_report_t pr;
         const guest_patch_status_t ps = is_ios6
@@ -569,10 +665,20 @@ int main(int argc, char **argv) {
             if (slice > 10000000u) slice = 10000000u;
             /* While a gesture is under way, slices short enough to pace its
              * reports in guest time. */
-            if (g_drag.on && g_drag.step < DRAG_STEPS && slice > 1000000u) slice = 1000000u;
-            n += n88_run(&g_m, (unsigned)slice, &st);
+            if ((gesture_current() || press_held()) && slice > 1000000u) slice = 1000000u;
+            const bool was_asleep = n88_asleep(&g_m);
+            const unsigned ran = n88_run(&g_m, (unsigned)slice, &st);
+            /* Asleep, a slice is time passing: count it against the budget. */
+            n += was_asleep ? slice : ran;
+            if (!was_asleep && n88_asleep(&g_m))
+                printf("  asleep: the CPU parked for the PMU, guest time %.3f s\n",
+                       n88_guest_seconds(&g_m));
             drain_console();
-            drag_tick();
+            gesture_tick();
+            press_tick();
+            if (was_asleep && !n88_asleep(&g_m))
+                printf("  awake: resumed through the vector page, guest time %.3f s\n",
+                       n88_guest_seconds(&g_m));
             while (shots_taken < nshots && n88_guest_seconds(&g_m) >= shot_at[shots_taken]) {
                 char path[512];
                 snprintf(path, sizeof path, "%s.%.1fs.ppm", screen_out ? screen_out : "screen",
@@ -595,7 +701,11 @@ int main(int argc, char **argv) {
             if (panic_va && pc == panic_va) report_panic();
             if (waits && (pc == block_va || pc == blockp_va)) note_wait();
             ring[ring_i++ & 63u] = pc;
-            if (n88_run(&g_m, 1, &st) != 1u) { why = "the core refused an instruction"; break; }
+            if (n88_run(&g_m, 1, &st) != 1u) {
+                why = n88_asleep(&g_m) ? "the CPU parked with interrupts masked (asleep)"
+                                       : "the core refused an instruction";
+                break;
+            }
             drain_console();
             const uint32_t npc = g_m.cpu.r[15], nmode = g_m.cpu.cpsr & 0x1fu;
             const uint32_t vbase = (g_m.cpu.cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u;
@@ -659,6 +769,9 @@ int main(int argc, char **argv) {
                interrupts, undefs);
     printf("%" PRIu64 " timer expiries, guest time %.3f s\n", g_m.timer.fired,
            n88_guest_seconds(&g_m));
+    if (g_m.sleeps)
+        printf("slept %" PRIu64 " times, woke %" PRIu64 " times%s\n", g_m.sleeps, g_m.wakes,
+               n88_asleep(&g_m) ? "; asleep at the end" : "");
     if (engine && g_m.ci) {
         /* The cached interpreter's own accounting: how much of the boot the
          * engine retired, and which instruction classes drop to the slower
@@ -738,10 +851,11 @@ int main(int argc, char **argv) {
                 printf(" %02x/%u", t->pkt_op[i], t->pkt_len[i]);
             printf("\n");
         }
-        if (g_drag.on)
-            printf("drag: %u of %u reports queued, %" PRIu64 " offers refused (device busy,"
-                   " in reset, or not yet told it is alive)\n", g_drag.step, DRAG_STEPS,
-                   g_drag.refused);
+        for (unsigned i = 0; i < g_ngestures; i++)
+            printf("%s %u: %u of %u reports queued, %" PRIu64 " offers refused (device busy,"
+                   " in reset, or not yet told it is alive)\n",
+                   g_gesture[i].steps == TAP_STEPS ? "tap" : "drag", i, g_gesture[i].step,
+                   g_gesture[i].steps, g_gesture[i].refused);
         printf("dsim: %" PRIu64 " packets (%" PRIu64 " payload words), last header %08x\n",
                g_m.dsim.packets, g_m.dsim.payload_words, g_m.dsim.last_header);
         for (unsigned b = 0; b < 2u; b++) {

@@ -100,11 +100,38 @@ static void irq_update(n88_t *m) {
 
 static void gpio_lines(n88_t *m);
 
-/* A pad's level as the pin drives it: bits 1:0 = 1x drive bit 0 out (spi0's
- * select is 0x12 asserted, 0x13 released); 0x is an input, which the board
- * pulls high -- the touch reset is released by 0x12 -> 0x10. */
+/* A pad drives its pin in modes 001 and 111 (n88.h). */
+static bool pad_output(uint32_t v) {
+    const uint32_t mode = N88_GPIO_MODE(v);
+    return mode == 1u || mode == 7u;
+}
+
+/* A pad's level as the pin drives it: an output drives bit 0 (spi0's select
+ * is 0x12 asserted, 0x13 released); an input the board pulls high -- the
+ * touch reset is released by 0x12 -> 0x10. */
 static bool pad_level(uint32_t v) {
-    return (v & 2u) ? (v & 1u) != 0u : true;
+    return pad_output(v) ? (v & 1u) != 0u : true;
+}
+
+/* The buttons and the ringer switch: each one's pad, and whether its pin is
+ * high when it is pressed (or the switch is at silent). See n88.h. */
+static const struct { uint16_t pad; bool active_high; } n88_inputs[N88_INPUT_COUNT] = {
+    [N88_INPUT_HOLD]    = { 0x2dcu, true  },
+    [N88_INPUT_MENU]    = { 0x2d8u, true  },
+    [N88_INPUT_VOLUP]   = { 0x2c0u, false },
+    [N88_INPUT_VOLDOWN] = { 0x2c4u, false },
+    [N88_INPUT_SILENT]  = { 0x28cu, false },
+};
+
+static bool input_level(const n88_t *m, unsigned i) {
+    return m->input[i] == n88_inputs[i].active_high;
+}
+
+/* The input wired to the pad at register index `reg`, or -1. */
+static int input_at(uint32_t reg) {
+    for (unsigned i = 0; i < N88_INPUT_COUNT; i++)
+        if (n88_inputs[i].pad == reg << 2) return (int)i;
+    return -1;
 }
 
 /* Everything time moves: expire the decrementer if its interval has passed
@@ -252,6 +279,20 @@ static void accel_write(i2c_regfile_t *r, uint8_t reg, uint8_t v) {
     if (reg == 0x21u) r->reg[0x21] = (uint8_t)(v & ~0x40u);
 }
 
+/* The D1755's RTC count, read an octet at a time (n88.h). */
+static uint8_t pmu_read(i2c_regfile_t *r, uint8_t reg) {
+    const n88_t *m = r->ctx;
+    if (reg >= N88_PMU_RTC && reg < N88_PMU_RTC + 4u)
+        return (uint8_t)(n88_rtc(m) >> (8u * (reg - N88_PMU_RTC)));
+    return r->reg[reg];
+}
+
+/* The touch controller's LDO follows its PMU bit (n88.h). */
+static void pmu_write(i2c_regfile_t *r, uint8_t reg, uint8_t v) {
+    n88_t *m = r->ctx;
+    if (reg == N88_PMU_LDO) s5l_mtz2_power_pin(&m->touch, (v & N88_PMU_LDO_TOUCH) != 0u);
+}
+
 /* The devices on the I2C buses as they power up. */
 static void i2c_devices_reset(n88_t *m) {
     i2c_regfile_init(&m->accel, N88_ACCEL_ADDR);
@@ -259,25 +300,107 @@ static void i2c_devices_reset(n88_t *m) {
     m->accel.reg[0x0f] = 0x3bu;                 /* WHO_AM_I: LIS331DL        */
     m->accel.on_write = accel_write;
     i2c_regfile_init(&m->pmu, N88_PMU_ADDR);
+    m->pmu.on_read = pmu_read;
+    m->pmu.on_write = pmu_write;
+    m->pmu.ctx = m;
+    m->pmu.reg[N88_PMU_LDO] = N88_PMU_LDO_TOUCH;    /* matches the boot's power */
 }
 
-/* The GPIO interrupt controller's line, from the one source wired to it:
- * the touch controller's attention, on interrupt N88_TOUCH_ATN_IRQ, while
- * its pad does not mask it. A level-triggered pin's status follows the
- * line; an edge-triggered one latches on assertion until written back. */
-static void gpio_lines(n88_t *m) {
-    const bool atn = s5l_mtz2_irq(&m->touch);
-    const uint32_t pad = m->gpio[N88_TOUCH_ATN_IRQ];
-    const unsigned g = N88_TOUCH_ATN_IRQ / 32u, bit = N88_TOUCH_ATN_IRQ % 32u;
+uint32_t n88_rtc(const n88_t *m) {
+    return m->rtc_base + (uint32_t)(n88_timer_count(m) / N88_TB_HZ);
+}
+
+void n88_set_rtc(n88_t *m, uint32_t seconds) {
+    m->rtc_base = seconds - (uint32_t)(n88_timer_count(m) / N88_TB_HZ);
+}
+
+/* ------------------------------------------------------------- sleep */
+
+/* The kernel's suspend mark, "XSOMPSUS" as cpu_sleep copies it. */
+static const uint8_t suspend_mark[8] = { 'X', 'S', 'O', 'M', 'P', 'S', 'U', 'S' };
+
+/* True when the CPU sits on a branch to itself with IRQ and FIQ masked:
+ * nothing but a reset moves it on (n88.h). Only a run that ends where the
+ * one before it did is looked at, so single-stepping costs one compare. */
+static bool cpu_parked(n88_t *m) {
+    const uint32_t cpsr = m->cpu.cpsr, pc = m->cpu.r[15];
+    const bool again = pc == m->park_pc;
+    m->park_pc = pc;
+    if (!again || (cpsr & (ARM_CPSR_I | ARM_CPSR_F)) != (ARM_CPSR_I | ARM_CPSR_F)) return false;
+    const uint32_t par = arm_mmu_ats(&m->cpu, pc, false, true);
+    if (par & 1u) return false;
+    const uint32_t pa = (par & 2u) ? (par & 0xff000000u) | (pc & 0x00ffffffu)
+                                   : (par & 0xfffff000u) | (pc & 0xfffu);
+    if (pa < N88_DRAM_BASE || pa - N88_DRAM_BASE > N88_DRAM_SIZE - 4u) return false;
+    const uint8_t *p = m->ram + (pa - N88_DRAM_BASE);
+    if (cpsr & ARM_CPSR_T) return p[0] == 0xfeu && p[1] == 0xe7u;          /* b . */
+    return p[0] == 0xfeu && p[1] == 0xffu && p[2] == 0xffu && p[3] == 0xeau;
+}
+
+static void fall_asleep(n88_t *m) {
+    m->asleep = true;
+    m->sleeps++;
+    m->pmu.reg[N88_PMU_WAKE_REASON] &= (uint8_t)~3u;
+}
+
+/* What the PMU and the boot loader do for a wake button: power up, and
+ * resume the kernel through its vector page if it left the mark. */
+static void wake(n88_t *m, n88_input_t in) {
+    m->pmu.reg[N88_PMU_WAKE_REASON] |= in == N88_INPUT_HOLD ? 2u : 1u;
+    if (memcmp(m->ram + N88_SUSPEND_MARK_OFF, suspend_mark, sizeof suspend_mark)) return;
+    const uint64_t cycles = m->cpu.cycles;
+    arm_reset(&m->cpu, &m->bus);
+    m->cpu.cycles = cycles;
+    if (m->ci) arm_ci_flush(m->ci);
+    m->cpu.cpsr = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
+    m->cpu.r[15] = N88_DRAM_BASE;
+    m->asleep = false;
+    m->wakes++;
+    timer_update(m);
+}
+
+bool n88_asleep(const n88_t *m) {
+    return m && m->asleep;
+}
+
+void n88_set_input(n88_t *m, n88_input_t in, bool on) {
+    if ((unsigned)in >= N88_INPUT_COUNT) return;
+    m->input[in] = on;
+    gpio_lines(m);
+    irq_update(m);
+    m->level_dirty = true;
+    if (m->asleep && on && (in == N88_INPUT_HOLD || in == N88_INPUT_MENU)) wake(m, in);
+}
+
+/* One wired pin's interrupt status, by its pad's mode (n88.h): in a level
+ * mode the bit follows the pin; in an edge mode it latches until written
+ * back. A masked pad changes nothing. `last` is the level last sampled. */
+static void gpio_pin(n88_t *m, unsigned irq, bool level, bool *last) {
+    const uint32_t pad = m->gpio[irq], bit = 1u << (irq % 32u);
+    uint32_t *status = &m->gpioic_status[irq / 32u];
     if (!(pad & N88_GPIO_IRQ_MASKED)) {
-        if ((pad & 0xcu) == 4u) {
-            if (atn) m->gpioic_status[g] |= 1u << bit;
-            else     m->gpioic_status[g] &= ~(1u << bit);
-        } else if (atn && !m->touch_atn_last) {
-            m->gpioic_status[g] |= 1u << bit;
+        bool on = false, off = false;
+        switch (N88_GPIO_MODE(pad)) {
+        case 2u: on = level;  off = !level; break;         /* while high    */
+        case 3u: on = !level; off = level;  break;         /* while low     */
+        case 4u: on = level && !*last;      break;         /* rising edge   */
+        case 5u: on = !level && *last;      break;         /* falling edge  */
+        case 6u: on = level != *last;       break;         /* both edges    */
+        default: break;
         }
+        if (on)  *status |= bit;
+        if (off) *status &= ~bit;
     }
-    m->touch_atn_last = atn;
+    *last = level;
+}
+
+/* The GPIO interrupt controller's line, from the pins wired to it: the touch
+ * controller's attention (active low) on N88_TOUCH_ATN_IRQ, and the buttons
+ * and the ringer switch on their pad indices. */
+static void gpio_lines(n88_t *m) {
+    gpio_pin(m, N88_TOUCH_ATN_IRQ, !s5l_mtz2_irq(&m->touch), &m->pin_last[0]);
+    for (unsigned i = 0; i < N88_INPUT_COUNT; i++)
+        gpio_pin(m, n88_inputs[i].pad >> 2, input_level(m, i), &m->pin_last[1u + i]);
     bool any = false;
     for (unsigned i = 0; i < N88_GPIOIC_GROUPS; i++) any |= m->gpioic_status[i] != 0u;
     s5l_vic_set_line(&m->vic[N88_GPIOIC_LINE / 32u], N88_GPIOIC_LINE % 32u, any);
@@ -317,11 +440,16 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         return m->gpioic_status[(pa - N88_GPIO_PA - N88_GPIOIC_STATUS) >> 2];
     }
     if (in_gpio(pa)) {
-        /* A pure register-file read: the value the CPU last wrote to this
-         * pin's config, reset 0. It drives no interrupt line here, so, like
-         * the timer count, it does not stop the cached interpreter. */
+        /* A pure read: the value the CPU last wrote to this pin's config,
+         * reset 0, with an input's level in bit 0 where something is wired
+         * to the pin (a button). It drives no interrupt line, so, like the
+         * timer count, it does not stop the cached interpreter. */
         m->mmio++;
-        return m->gpio[(pa - N88_GPIO_PA) >> 2];
+        const uint32_t reg = (pa - N88_GPIO_PA) >> 2;
+        const int in = input_at(reg);
+        uint32_t v = m->gpio[reg];
+        if (in >= 0 && !pad_output(v)) v = (v & ~1u) | (input_level(m, (unsigned)in) ? 1u : 0u);
+        return v;
     }
     m->level_dirty = true;
     if (pa == N88_UART0_PA + 0x10u) {           /* UTRSTAT: transmitter empty */
@@ -644,6 +772,11 @@ unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status) {
         if (status) *status = ARM_HALT;
         return 0;
     }
+    if (m->asleep) {
+        m->cpu.cycles += max_steps;
+        if (status) *status = ARM_OK;
+        return 0;
+    }
     /* Every level change a device access makes is applied by mmio_write()
      * as it happens; the only one time makes is the decrementer expiring. */
     timer_update(m);
@@ -671,6 +804,7 @@ unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status) {
         if (st != ARM_OK) break;
         n++;
     }
+    if (st == ARM_OK && cpu_parked(m)) fall_asleep(m);
     if (status) *status = st;
     return n;
 }
@@ -1089,7 +1223,8 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     }
     spi_nor_reset(&m->nor);
     /* spi1 at version 1 with the touch controller at its only select, powered
-     * (its LDO is the PMU's) and held in reset until the driver releases it. */
+     * (its LDO, the PMU's, as the boot loader leaves it) and held in reset
+     * until the driver releases it. */
     s5l_spi_reset(&m->spi1);
     s5l_spi_set_version(&m->spi1, 1u);
     s5l_mtz2_reset(&m->touch);
@@ -1100,7 +1235,12 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     }
     s5l_mtz2_power_pin(&m->touch, true);
     memset(m->gpioic_status, 0, sizeof m->gpioic_status);
-    m->touch_atn_last = false;
+    m->asleep = false;
+    m->park_pc = 0u;
+    /* The pins as they stand: the attention released (high), the buttons
+     * and the switch wherever the person holding the phone left them. */
+    m->pin_last[0] = true;
+    for (unsigned i = 0; i < N88_INPUT_COUNT; i++) m->pin_last[1u + i] = input_level(m, i);
     cdma_reset(&m->cdma);
     s5l_sha1_reset(&m->sha1);
     s5l8920_i2c_reset(&m->i2c0);

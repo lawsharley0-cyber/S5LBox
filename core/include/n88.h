@@ -251,6 +251,87 @@
 #define N88_GPIOIC_LINE      0x5eu
 #define N88_GPIO_IRQ_MASKED  0x10u
 
+/*
+ * A pad's bits 3:1 are its mode, as AppleS5L8920XGPIO's configure (0xc0674164)
+ * and interrupt setup (0xc0673ff0) write them: 000 input, 001 and 111 output
+ * (bit 0 the level driven), 010 interrupt while high, 011 while low, 100 on a
+ * rising edge, 101 on a falling one, 110 on both. Bit 0 of an input pad reads
+ * the level on the pin (the pin read, 0xc06736f4). The touch attention is
+ * active low: pad 0x2D0 = 0x20A is a falling edge.
+ *
+ * The buttons and the ringer switch (/buttons, AppleM68Buttons) are pins too,
+ * from function-button_<name> = <gpio 'GPIO' pin flags>, each interrupting on
+ * its pad index (pad / 4). The function reads a pin as is when flags bit 8 is
+ * set and inverted when it is clear (0xc06737a8):
+ *
+ *   hold      pin 0x1607  pad 0x2DC  interrupt 0xB7  pressed = high
+ *   menu      pin 0x1606  pad 0x2D8  interrupt 0xB6  pressed = high
+ *   volup     pin 0x1600  pad 0x2C0  interrupt 0xB0  pressed = low
+ *   voldown   pin 0x1601  pad 0x2C4  interrupt 0xB1  pressed = low
+ *   ringerab  pin 0x1403  pad 0x28C  interrupt 0xA3  silent  = low
+ *
+ * The driver sets all five to interrupt on both edges (0x20C), and on any of
+ * those interrupts reads every button (0xc068a1a4), reporting each change as
+ * a HID consumer usage (0x30 power, 0x40 menu, 0xE9 and 0xEA volume) or, for
+ * the ringer, telephony usage 0x2E, with the function's value inverted once
+ * more. While these pins read back their own registers (bit 0 clear) both
+ * volume buttons read as held from the first poll, and SpringBoard showed its
+ * "Ringer" volume display over the home screen.
+ */
+#define N88_GPIO_MODE(pad)   (((pad) >> 1) & 7u)
+
+typedef enum {
+    N88_INPUT_HOLD,             /* the sleep/wake button, pressed           */
+    N88_INPUT_MENU,             /* the home button, pressed                 */
+    N88_INPUT_VOLUP,            /* volume up, pressed                       */
+    N88_INPUT_VOLDOWN,          /* volume down, pressed                     */
+    N88_INPUT_SILENT,           /* the ringer switch at silent              */
+    N88_INPUT_COUNT
+} n88_input_t;
+
+/*
+ * The D1755's real-time clock: a 32-bit count of seconds at PMU registers
+ * 0x4C..0x4F, least significant first, which AppleD1755PMU reads (four
+ * octets, twice, until both agree: 0xc038aacc); setting the time stores the
+ * difference from the count at 0x64..0x67 instead (0xc038ab00). The count
+ * runs with guest time from whatever the caller sets (n88_set_rtc); 0 is the
+ * Unix epoch, which iPhone OS shows as 31 December 1969 west of Greenwich.
+ */
+#define N88_PMU_RTC          0x4cu
+
+/*
+ * Sleep. iPhone OS 3.1.3 sleeps the whole system a while after the display
+ * goes off: IOPMrootDomain -> IOCPUSleepKernel -> cpu_sleep (0xc00606a4),
+ * which writes start_cpu's physical address into the exception-vector page
+ * at the bottom of DRAM (+0x24; the reset vector there jumps through it with
+ * r0 = +0x28) and the eight octets "XSOMPSUS" at +0x80, cleans the caches,
+ * and parks the CPU on a branch to itself with interrupts masked
+ * (ml_arm_sleep, 0xc00603cc) for the PMU to cut the power. On a 3GS the PMU
+ * powers the SoC up again for the hold or menu button, and the boot loader,
+ * finding the mark, resumes the kernel through that vector.
+ *
+ * The model: a CPU parked that way (a branch to itself, IRQ and FIQ masked)
+ * is asleep, and n88_run retires nothing while time passes. Pressing hold or
+ * menu wakes it: the PMU latches the reason in register 0x01 (bit 1 hold,
+ * bit 0 menu: AppleD1755PMU reads 0x01..0x04 into a cache on wake, 0xc0386d66,
+ * and AppleM68Buttons reports a press of the button whose
+ * function-wake_button_* -- 'STAT' 0x181 and 0x180, cached byte 0, bits 1 and
+ * 0 (0xc0385c90) -- reads set), and, if the mark is there, the CPU alone is
+ * reset and started at the vector page, its cycle count (time) kept. The
+ * devices keep their state, as if retained; the drivers set up what they need
+ * on wake. Without the mark the CPU stays parked. The reason is cleared at the
+ * next sleep. Nothing else wakes it (not the PMU's alarm).
+ *
+ * The touch controller's power is a PMU LDO, register 0x11 bit 6: on at
+ * reset, as the boot loader leaves it; AppleMultitouchN1SPI turns it off and
+ * on around its probe, off when the display goes off and at sleep, and on
+ * again at wake, when the flashless part must be bootloaded again.
+ */
+#define N88_PMU_WAKE_REASON  0x01u
+#define N88_PMU_LDO          0x11u
+#define N88_PMU_LDO_TOUCH    0x40u
+#define N88_SUSPEND_MARK_OFF 0x80u
+
 #define N88_CONSOLE_CAPACITY 65536u
 #define N88_DEFAULT_CMDLINE  "debug=0x8 serial=3 -v"
 #define N88_ROOT_CMDLINE     "rd=md0 debug=0x8 serial=3 -v"
@@ -282,7 +363,14 @@ typedef struct n88 {
     s5l_spi_t spi1;
     s5l_mtz2_t touch;               /* the N1 on spi1 (mtz2.c)                */
     uint32_t  gpioic_status[N88_GPIOIC_GROUPS];
-    bool      touch_atn_last;       /* for an edge-triggered attention line   */
+    bool      input[N88_INPUT_COUNT];   /* buttons pressed, switch at silent */
+    /* Each wired pin's level when last sampled, for edges: the touch
+     * attention, then the inputs. */
+    bool      pin_last[1 + N88_INPUT_COUNT];
+    uint32_t  rtc_base;             /* the RTC count at guest time zero       */
+    bool      asleep;               /* the CPU parked for the PMU (see above) */
+    uint32_t  park_pc;              /* where the last run ended               */
+    uint64_t  sleeps, wakes;
     spi_nor_t nor;
     uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
     cdma_t    cdma;                 /* the DMA engine and AES contexts        */
@@ -367,7 +455,8 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail,
 const char *n88_strerror(n88_status_t st);
 
 /* Run up to `max_steps` instructions; returns how many retired. Stops early
- * only on a non-OK CPU status, which `status` carries. */
+ * only on a non-OK CPU status, which `status` carries. Asleep, it retires
+ * none and lets `max_steps` cycles of time pass. */
 unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status);
 
 /* Move up to `capacity` bytes of console output (oldest first) into `out`;
@@ -394,6 +483,17 @@ uint8_t *n88_nor(n88_t *m);
 /* The framebuffer Boot_Video describes: N88_FB_HEIGHT rows of N88_FB_STRIDE
  * octets at N88_VRAM_PA, 32 bits per pixel. NULL before a boot. */
 const uint8_t *n88_framebuffer(const n88_t *m);
+
+/* Press or release a button, or move the ringer switch (on = silent): the
+ * pin's level changes, and its interrupt follows the pad's mode. */
+void n88_set_input(n88_t *m, n88_input_t in, bool on);
+
+/* True while the system sleeps (see above). */
+bool n88_asleep(const n88_t *m);
+
+/* Set the RTC to `seconds` since the Unix epoch, from now on in guest time. */
+void     n88_set_rtc(n88_t *m, uint32_t seconds);
+uint32_t n88_rtc(const n88_t *m);
 
 /* The bus, for tests and the harness: the same routing the CPU sees. */
 uint32_t n88_read32(n88_t *m, uint32_t pa);

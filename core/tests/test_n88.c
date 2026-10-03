@@ -1167,6 +1167,201 @@ static void test_touch_on_spi1(void) {
     free(m);
 }
 
+/* A booted machine whose kernel is one branch to itself; NULL on failure. */
+static n88_t *boot_parked(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    if (!m || !n88_init(m, false)) { free(m); return NULL; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    if (n88_boot(m, &r, d, sizeof d) != N88_OK) { n88_free(m); free(m); return NULL; }
+    return m;
+}
+
+/* One transfer with the PMU on i2c0, the way AppleS5L8920XI2CController
+ * makes it; returns the status it ended with. */
+static uint32_t pmu_xfer(n88_t *m, uint8_t reg, uint8_t *buf, unsigned n, bool write) {
+    const uint32_t I = N88_I2C0_PA;
+    n88_write32(m, I + S5L8920_I2C_ADDR, N88_PMU_ADDR);
+    n88_write32(m, I + S5L8920_I2C_FIRST, reg);
+    n88_write32(m, I + S5L8920_I2C_COUNT, n);
+    for (unsigned i = 0; write && i < n; i++) n88_write32(m, I + S5L8920_I2C_FIFO, buf[i]);
+    n88_write32(m, I + S5L8920_I2C_CONTROL,
+                S5L8920_I2C_CTRL_START | (write ? S5L8920_I2C_CTRL_WRITE : 0u));
+    const uint32_t st = n88_read32(m, I + S5L8920_I2C_STATUS);
+    for (unsigned i = 0; !write && i < n; i++)
+        buf[i] = (uint8_t)n88_read32(m, I + S5L8920_I2C_FIFO);
+    n88_write32(m, I + S5L8920_I2C_STATUS, st);
+    return st;
+}
+
+static bool gpio_pending(n88_t *m, unsigned irq) {
+    return (n88_read32(m, N88_GPIO_PA + N88_GPIOIC_STATUS + 4u * (irq / 32u)) >> (irq % 32u)) & 1u;
+}
+
+static void gpio_ack(n88_t *m, unsigned irq) {
+    n88_write32(m, N88_GPIO_PA + N88_GPIOIC_STATUS + 4u * (irq / 32u), 1u << (irq % 32u));
+}
+
+/* The buttons and the ringer switch: each pin's level in bit 0 of its pad,
+ * by its polarity, and its interrupt by the pad's mode. */
+static void test_buttons_and_switch(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    const uint32_t G = N88_GPIO_PA;
+    static const uint32_t pads[] = { 0x2dcu, 0x2d8u, 0x2c0u, 0x2c4u, 0x28cu };
+    /* AppleS5L8920XGPIO's interrupt setup: masked, both edges; then enabled. */
+    for (unsigned i = 0; i < 5u; i++) n88_write32(m, G + pads[i], 0x21cu);
+    for (unsigned i = 0; i < 5u; i++) n88_write32(m, G + pads[i], 0x20cu);
+    CHECK((n88_read32(m, G + 0x2dcu) & 1u) == 0u && (n88_read32(m, G + 0x2d8u) & 1u) == 0u,
+          "hold and menu released read low");
+    CHECK((n88_read32(m, G + 0x2c0u) & 1u) == 1u && (n88_read32(m, G + 0x2c4u) & 1u) == 1u,
+          "volume buttons released read high (pressed is low)");
+    CHECK((n88_read32(m, G + 0x28cu) & 1u) == 1u, "the switch at ring reads high");
+    CHECK(n88_read32(m, G + 0x2c0u) == 0x20du, "the rest of the pad is its register");
+    bool none = true;
+    for (unsigned i = 0; i < 5u; i++) none &= !gpio_pending(m, pads[i] >> 2);
+    CHECK(none, "configuring them raises nothing");
+
+    n88_set_input(m, N88_INPUT_VOLUP, true);
+    CHECK((n88_read32(m, G + 0x2c0u) & 1u) == 0u, "volume up pressed reads low");
+    CHECK(gpio_pending(m, 0xb0u) && (s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+                                     (1u << (N88_GPIOIC_LINE % 32u))),
+          "the press interrupts on 0xB0 and raises line 0x5E");
+    gpio_ack(m, 0xb0u);
+    CHECK(!gpio_pending(m, 0xb0u), "written back");
+    n88_set_input(m, N88_INPUT_VOLUP, false);
+    CHECK(gpio_pending(m, 0xb0u), "both edges: the release interrupts too");
+    gpio_ack(m, 0xb0u);
+
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK((n88_read32(m, G + 0x2d8u) & 1u) == 1u && gpio_pending(m, 0xb6u),
+          "menu pressed reads high and interrupts on 0xB6");
+    gpio_ack(m, 0xb6u);
+    n88_write32(m, G + 0x2d8u, 0x21cu);
+    n88_set_input(m, N88_INPUT_MENU, false);
+    CHECK(!gpio_pending(m, 0xb6u), "a masked pad latches nothing");
+    n88_write32(m, G + 0x2d8u, 0x20cu);
+    CHECK(!gpio_pending(m, 0xb6u), "and unmasking it is no edge");
+    n88_write32(m, G + 0x2d8u, 0x13u);
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK(n88_read32(m, G + 0x2d8u) == 0x13u, "a pad driven as an output reads its register");
+    n88_set_input(m, N88_INPUT_MENU, false);
+
+    n88_set_input(m, N88_INPUT_SILENT, true);
+    CHECK((n88_read32(m, G + 0x28cu) & 1u) == 0u && gpio_pending(m, 0xa3u),
+          "the switch at silent reads low and interrupts on 0xA3");
+    gpio_ack(m, 0xa3u);
+
+    /* The other modes, on volume down (pressed = low). */
+    n88_write32(m, G + 0x2c4u, 0x208u);                     /* rising edge */
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(!gpio_pending(m, 0xb1u), "rising edge: the press (falling) is not one");
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    CHECK(gpio_pending(m, 0xb1u), "rising edge: the release is");
+    gpio_ack(m, 0xb1u);
+    n88_write32(m, G + 0x2c4u, 0x20au);                     /* falling edge */
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(gpio_pending(m, 0xb1u), "falling edge: the press is one");
+    gpio_ack(m, 0xb1u);
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    n88_write32(m, G + 0x2c4u, 0x206u);                     /* while low */
+    CHECK(!gpio_pending(m, 0xb1u), "level low: released, nothing");
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(gpio_pending(m, 0xb1u), "level low: pressed, pending");
+    gpio_ack(m, 0xb1u);
+    CHECK(gpio_pending(m, 0xb1u), "level: writing back does not clear a held level");
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    CHECK(!gpio_pending(m, 0xb1u), "level: released, the status follows the pin");
+    n88_free(m);
+    free(m);
+}
+
+/* The D1755's clock at 0x4C and the touch controller's LDO at 0x11 bit 6. */
+static void test_pmu_clock_and_ldo(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    n88_set_rtc(m, 0x5f5e1000u);
+    uint8_t b[4] = {0};
+    CHECK(pmu_xfer(m, N88_PMU_RTC, b, 4, false) == S5L8920_I2C_ST_DONE &&
+          get32(b) == 0x5f5e1000u, "the count reads back, least significant first (%08x)",
+          get32(b));
+    m->cpu.cycles += 3ull * N88_TB_HZ * N88_CYCLES_PER_TICK;
+    pmu_xfer(m, N88_PMU_RTC, b, 4, false);
+    CHECK(get32(b) == 0x5f5e1003u && n88_rtc(m) == 0x5f5e1003u, "and runs with guest time");
+
+    CHECK(pmu_xfer(m, N88_PMU_LDO, b, 1, false) == S5L8920_I2C_ST_DONE &&
+          b[0] == N88_PMU_LDO_TOUCH && m->touch.power_level, "the touch LDO on at hand-off");
+    const uint64_t edges = m->touch.power_edges;
+    b[0] = 0x01u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(!m->touch.power_level && m->touch.power_edges == edges + 1u, "bit 6 clear: off");
+    b[0] = 0x41u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(m->touch.power_level && m->touch.hbpp_mode && m->touch.power_edges == edges + 2u,
+          "on again, in its boot loader");
+    b[0] = 0x40u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(m->touch.power_edges == edges + 2u, "another write with bit 6 set is no edge");
+    n88_free(m);
+    free(m);
+}
+
+/* A CPU parked with interrupts masked sleeps; hold or menu wakes it through
+ * the vector page when the kernel left its mark. */
+static void test_sleep_and_wake(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    arm_status_t st;
+    m->cpu.cpsr &= ~ARM_CPSR_I;
+    CHECK(n88_run(m, 50, &st) == 50u && !n88_asleep(m), "IRQs open: a branch to itself runs");
+    m->cpu.cpsr |= ARM_CPSR_I;
+    n88_run(m, 50, &st);
+    n88_run(m, 50, &st);
+    CHECK(n88_asleep(m) && m->sleeps == 1u, "IRQ and FIQ masked: asleep (two runs ending there)");
+    const uint64_t c0 = m->cpu.cycles;
+    CHECK(n88_run(m, 1000, &st) == 0u && st == ARM_OK && m->cpu.cycles == c0 + 1000u,
+          "asleep, nothing retires and time passes");
+    n88_set_input(m, N88_INPUT_VOLUP, true);
+    n88_set_input(m, N88_INPUT_VOLUP, false);
+    CHECK(n88_asleep(m), "volume does not wake it");
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK(n88_asleep(m) && (m->pmu.reg[N88_PMU_WAKE_REASON] & 1u),
+          "without the mark it stays parked; the PMU still latched menu");
+    n88_set_input(m, N88_INPUT_MENU, false);
+
+    /* The kernel's vector page and mark, and a resume that parks again. */
+    put32(ram_at(m, N88_DRAM_BASE), mov_imm(1, 0x55));
+    put32(ram_at(m, N88_DRAM_BASE + 4u), B_SELF);
+    memcpy(ram_at(m, N88_DRAM_BASE + N88_SUSPEND_MARK_OFF), "XSOMPSUS", 8);
+    m->cpu.cycles += 5000u;
+    const uint64_t c1 = m->cpu.cycles;
+    n88_set_input(m, N88_INPUT_HOLD, true);
+    CHECK(!n88_asleep(m) && m->wakes == 1u && m->cpu.r[15] == N88_DRAM_BASE &&
+          (m->cpu.cpsr & 0x1fu) == ARM_MODE_SVC && (m->cpu.cpsr & ARM_CPSR_I) &&
+          !(m->cpu.cp15.sctlr & 1u) && m->cpu.cycles == c1,
+          "hold: reset into the vector page, MMU off, the clock kept");
+    CHECK((m->pmu.reg[N88_PMU_WAKE_REASON] & 3u) == 3u, "the PMU says hold (and the menu before)");
+    uint8_t b[4] = {0};
+    pmu_xfer(m, N88_PMU_WAKE_REASON, b, 4, false);
+    CHECK(b[0] & 2u, "read over I2C as AppleD1755PMU does on wake");
+    n88_set_input(m, N88_INPUT_HOLD, false);
+    n88_run(m, 10, &st);
+    n88_run(m, 10, &st);
+    CHECK(m->cpu.r[1] == 0x55u && n88_asleep(m) && m->sleeps == 2u &&
+          !(m->pmu.reg[N88_PMU_WAKE_REASON] & 3u), "resumed, ran, and slept again; reason cleared");
+    n88_free(m);
+    free(m);
+}
+
 int main(void) {
     test_bus_routing();
     test_timer_registers();
@@ -1180,6 +1375,9 @@ int main(void) {
     test_sha1_through_cdma();
     test_display_controller();
     test_touch_on_spi1();
+    test_buttons_and_switch();
+    test_pmu_clock_and_ldo();
+    test_sleep_and_wake();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

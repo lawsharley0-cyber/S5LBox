@@ -866,11 +866,11 @@ unchanged. What was new was the board around it:
 - **spi1** at 0x82100000 (line 0x1C), version 1, with the device at its
   only select.
 - **The pins**, decoded like spi0's select: select 0x1300 (pad 0x260),
-  reset 0x1401 (pad 0x284). The pad mode matters: bits 1:0 = 1x drive bit
-  0 out, 0x make the pin an input the board pulls high, and the driver
-  releases the reset that way (0x12, then 0x10). Read as "bit 0 is the
-  level" it stayed in reset and the driver reported "Could not detect
-  HBPP".
+  reset 0x1401 (pad 0x284). The pad mode matters: bits 3:1 = 001 drive
+  bit 0 out, 000 make the pin an input the board pulls high, and the
+  driver releases the reset that way (0x12, then 0x10). Read as "bit 0 is
+  the level" it stayed in reset and the driver reported "Could not detect
+  HBPP". (The full mode table is in the next section.)
 - **The firmware arrives by CDMA** (channel 18 into spi1's TXDATA), and the
   driver starts the channel *before* it sets the port's DMA bit (SETUP
   0x4018 -> 0x4058); on hardware the channel waits on the port's request.
@@ -895,11 +895,74 @@ display timed out, and the touch with it). At 13 s, from (50,431) to
 OS 3.1.3's **home screen** (Messages, Calendar, Photos, Camera, ...,
 Settings, iTunes, App Store, Compass; the dock's Phone, Mail, Safari and
 iPod) under the first-run "Edit Home Screen" tip, with a "ringer" HUD
-(the ringer switch is not modelled) and "No Service" (no modem). 111,269
-lit pixels against the lock screen's 92,133.
+(the volume buttons, it turned out; see below) and "No Service" (no
+modem). 111,269 lit pixels against the lock screen's 92,133.
 
-Next: the buttons (home and hold, to wake a display that timed out, and
-the ringer switch), the RTC, and tapping into an app.
+#### Buttons, the ringer switch, the clock, sleep and wake (#57)
+
+**The pins.** /buttons gives each button a GPIO function, <gpio 'GPIO'
+pin flags>, and an interrupt on its pad index: hold 0x1607 (pad 0x2DC,
+0xB7), menu 0x1606 (0x2D8, 0xB6), volume up 0x1600 (0x2C0, 0xB0), volume
+down 0x1601 (0x2C4, 0xB1), the ringer switch 0x1403 (0x28C, 0xA3).
+AppleS5L8920XGPIO's pin read (0xc06736f4) configures the pin as an input
+and returns bit 0 of its pad; the function inverts it unless flags bit 8 is
+set (0xc06737a8), so hold and menu are high when pressed and the volume
+buttons low, and the switch is low at silent (the driver inverts the
+ringer once more before reporting it). A pad's bits 3:1 are its mode, read
+from the configure (0xc0674164) and interrupt setup (0xc0673ff0): 000
+input, 001 and 111 output, 010/011 interrupt while high/low, 100/101 on a
+rising/falling edge, 110 on both; AppleM68Buttons asks for both edges
+(0x20C), and on any of its interrupts reads every button (0xc068a1a4) and
+reports the changes as HID consumer usages 0x30 (power), 0x40 (menu),
+0xE9/0xEA (volume) and telephony usage 0x2E (the switch).
+
+**The "ringer" HUD was the volume buttons.** With every pad reading back
+its own register, bit 0 clear, the first poll found both volume buttons
+held, and SpringBoard showed its ringer-volume display over the home
+screen. With the pins wired (`n88_set_input`), it is gone, and
+`boot3gs -K name,t[,s]` presses a button or moves the switch: volume up
+shows the "ringer" volume HUD one step up, "silent" the crossed bell,
+"ring" the bell, each as on a phone.
+
+**The clock.** AppleD1755PMU reads the time as a 32-bit seconds count at
+PMU registers 0x4C..0x4F, twice until both agree (0xc038aacc); setting the
+time stores the difference from the count at 0x64..0x67 (0xc038ab00). The
+count read 0, the Unix epoch, which the lock screen showed as 4:00 PM,
+Wednesday 31 December 1969 (Pacific time). It is now a count running with
+guest time from what the host sets (`n88_set_rtc`; boot3gs uses the host's
+clock, or `-R seconds`): the status bar, the lock screen and Calendar's
+icon and day view show the day and time.
+
+**Tapping into an app.** `boot3gs -T x,y,t` taps (four reports at one
+point). A tap on the tip's Dismiss button (160,330) clears it, a tap on
+Calendar (117,70) opens **Calendar** on its day view, "Friday, Oct 2 2026",
+and one on Clock (197,246) opens its **World Clock** (Cupertino, the time,
+"Today").
+
+**Sleep and wake.** A minute after the last touch the display goes off,
+and 15 seconds later IOPMrootDomain sleeps the system: cpu_sleep
+(0xc00606a4) writes start_cpu's physical address into the exception-vector
+page at the bottom of DRAM (+0x24; the reset vector there jumps through it
+with r0 = +0x28) and the octets "XSOMPSUS" at +0x80, cleans the caches and
+parks the CPU on a branch to itself with interrupts masked (ml_arm_sleep,
+0xc00603cc) for the PMU to cut the power. n88 now treats a CPU parked that
+way as asleep (no instructions, time passing), and hold or menu does what
+the PMU and the boot loader do: latch the reason in PMU register 0x01 (bit
+0 menu, bit 1 hold, which AppleD1755PMU reads into its cache on wake and
+AppleM68Buttons reports through function-wake_button_*), and, with the mark
+present, reset the CPU alone into the vector page (time kept, devices
+retained). The kernel logs "pmu wake events: menu", "System Wake", the lock
+screen comes back with the right time, and a drag unlocks it again, back
+into the app that was open (Clock, its time moved on). The
+touch controller's power is PMU register 0x11 bit 6 (the driver turns it
+off with the display and at sleep, on at wake); wired to the touch model,
+the flashless part loses its firmware at sleep and the driver bootloads it
+again after wake, as on hardware.
+
+Not yet: the PMU's own interrupt and events, and its alarm (nothing but a
+button wakes the system); the ambient light sensor (i2c2 0x49) still does
+not answer. And the app: its 3GS engine is still the iOS 6 preview, without
+the root filesystem, touch or buttons that boot3gs drives here.
 
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 
