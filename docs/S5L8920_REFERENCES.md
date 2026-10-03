@@ -24,8 +24,8 @@ not replace, tracing what iOS 6's own drivers do.
 | VIC0/1/2 | 0xBF200000, +0x10000 each | — | same; daisy-chained VECTADDR (8e6d34d) |
 | Timer | 0xBF100000; 7 timers at 0x20 stride (+0x0..+0xE0), ticks at +0x200/+0x204, IRQ latch +0xF8, status +0x10000 | — | ticks and decrementer at 0xBF100200 only; the per-timer registers are **not modelled** (3.1.3's AppleS5L8920X reads +0x10..+0xFC) |
 | UART0 | — | 0x82500000 | modelled (console) |
-| SPI0..4 | 0x82000000 + n·0x100000; IRQ 0x1D, 0x1C, 0x1B, 0x1A, 0x19 | spi1 hosts `multi-touch,n88` | spi0 (v1) + NOR modelled; spi1 not |
-| GPIO | 0x83000000; int level/stat/en/type at +0x80/+0xA0/+0xC0/+0xE0, 7 groups | 0x83000000, size 0x100000, 7 interrupt groups, 0x2E ports, IRQ 0x5E | register file only; no GPIO interrupts |
+| SPI0..4 | 0x82000000 + n·0x100000; IRQ 0x1D, 0x1C, 0x1B, 0x1A, 0x19 | spi1 hosts `multi-touch,n88`; spi1's dma-channels: CDMA 18 into TXDATA (+0x10), 19 out of RXDATA (+0x20) | spi0 (v1) + NOR and spi1 (v1) + the touch controller modelled; CDMA channel 18 feeds spi1 once its SETUP DMA bit is set |
+| GPIO | 0x83000000; int level/stat/en/type at +0x80/+0xA0/+0xC0/+0xE0, 7 groups | 0x83000000, size 0x1000, 7 interrupt groups, 0x2E ports, IRQ 0x5E | pads a register file (bits 1:0 = 1x drive bit 0 out, 0x an input pulled high; bit 4 masks the pin's interrupt; bits 3:2 = 01 level-triggered); interrupt status at +0x800 + 4g, write one to clear (AppleS5L8920XGPIOIC, 0xc0673b94); only the touch attention (0xB4) is wired |
 | I²C0/1/2 | 0x83200000, 0x83300000, 0x83400000 | i2c0 (IRQ 0x13): accelerometer 0x1D, compass 0x1E/0x1F, audio0 0x4A, pmu 0x74, mikey 0x39, tethered 0x29; i2c2 (IRQ 0x11): als 0x49 | i2c0 and i2c2 modelled (`s5l8920_i2c.c`): not the S5L8900's Samsung controller but a whole-transfer one (address +0x0, first byte +0x10, count +0x18, FIFO +0x20, start +0x24, status +0xC); devices: LIS331DL (WHO_AM_I 0x3B) and the D1755 as a register file |
 | CDMA | 0x87000000; channel n IRQ = 0x2A + n | reg 0x07000000+0x1C000, IRQs 0x2B.. | modelled (cdma.c) — **agrees** |
 | SHA-1 | (none) | reg 0x00100000+0x1000, IRQ 0x21, `sha1,s5l8920x`, `slave-dma-only`, dma-channels {4, 0x801000A0} | modelled (`s5l_sha1.c`): fed by CDMA channel 4 as a peripheral request; 3.1.3's code-page validation runs on it |
@@ -35,7 +35,7 @@ not replace, tracing what iOS 6's own drivers do.
 | DART0/1 | — | 0x3FE00000 / 0x3FF00000 (+0x80000000), `dart,s5l8920x`; dart0 is the clcd's `iommu-parent` | modelled (`s5l8920_dart.c`): 16 slots loaded through +0x8, 4 KiB second-level tables, translation on at +0xC bit 31; the scanout follows the clcd window through dart0 |
 | PMU | (none for 3GS) | `pmu,d1755` (Dialog) at i2c0 address 0x74, IRQ 0x9D via GPIO | a register file that acknowledges: AppleD1755PMU starts (bucks read as 725 mV), so the LDOs, backlight and RTC users stop waiting; no RTC time, events or charger yet |
 | Buttons | GPIO-based; pins from board config | volup GPIO 0x1600, voldown 0x1601, menu 0x1606, hold 0x1607, ringer 0x1403; wake via PMU | not modelled |
-| Touch | (none) | `multi-touch,n88` on spi1; enable_cs GPIO 0x1300, reset GPIO 0x1401, IRQ 0xB4 | not modelled (the 3G's Z2 model, `mtz2.c`, is the starting point) |
+| Touch | (none) | `multi-touch,n88` on spi1; enable_cs GPIO 0x1300, reset GPIO 0x1401, IRQ 0xB4 | modelled with the 3G's `mtz2.c` unchanged: the N1 bootloads over HBPP (53,924-byte firmware by DMA, prox and panel calibration, N1 calibration registers 0x1000300C/305C/3058/3000, version 0x10003800) and reports contacts; a drag unlocks the phone |
 | Backlight | — | `/backlight`, `skip-clcd-probe`, a 128-entry table | not modelled |
 
 ## Boot chain

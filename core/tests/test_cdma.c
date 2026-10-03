@@ -272,6 +272,43 @@ static void test_car_after_requests(void) {
     cdma_free(&d);
 }
 
+/* A peripheral that is not asking for data yet: the request waits, running,
+ * and goes through on cdma_retry() once the device is ready (spi1's driver
+ * starts channel 18 before it sets the port's DMA bit). */
+static bool g_ready;
+static uint32_t g_got;
+static bool late_sink(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len) {
+    (void)ctx; (void)data;
+    if (fifo != 0x82100010u || !g_ready) return false;
+    g_got += len;
+    return true;
+}
+
+static void test_retry_when_ready(void) {
+    cdma_t d;
+    CHECK(cdma_init(&d, mem, NULL), "init");
+    memset(g_ram, 0, sizeof g_ram);
+    desc(RAM_PA + 0x100, RAM_PA + 0x120, 0x303u, RAM_PA + 0x1000, 96);
+    cdma_set_peripheral(&d, late_sink, NULL);
+    g_ready = false;
+    g_got = 0;
+    cdma_write(&d, ch(18, CDMA_CSR), 0x18u);
+    cdma_write(&d, ch(18, CDMA_DAR), 0x82100010u);
+    cdma_write(&d, ch(18, CDMA_CAR), RAM_PA + 0x100);
+    cdma_write(&d, ch(18, CDMA_CSR), 0x19u);
+    CHECK((cdma_read(&d, ch(18, CDMA_CSR)) & CDMA_CSR_RUNNING) && !cdma_irq(&d, 18) && g_got == 0u,
+          "not ready: still running");
+    cdma_retry(&d);
+    CHECK(g_got == 0u, "a retry before the device is ready changes nothing");
+    g_ready = true;
+    cdma_retry(&d);
+    CHECK(g_got == 96u && cdma_irq(&d, 18) && cdma_read(&d, ch(18, CDMA_CAR)) == RAM_PA + 0x120u,
+          "ready: delivered, done, CAR past the descriptor");
+    cdma_retry(&d);
+    CHECK(g_got == 96u, "a finished request is not sent twice");
+    cdma_free(&d);
+}
+
 int main(void) {
     printf("NEON CDMA + AES tests\n");
     test_copy_across_segments();
@@ -279,6 +316,7 @@ int main(void) {
     test_register_key_and_ecb();
     test_errors_and_abort();
     test_car_after_requests();
+    test_retry_when_ready();
     printf("  %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

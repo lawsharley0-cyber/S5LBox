@@ -220,6 +220,37 @@
 #define N88_SPI0_CS_GPIO  UINT32_C(0x250)      /* offset in the pad block  */
 #define N88_NOR_SIZE      UINT32_C(0x100000)
 
+/*
+ * The touch controller (/arm-io/spi1/multi-touch, "multi-touch,n88", an N1 on
+ * spi1 chip select 0) and the board around it, as iPhone OS 3.1.3's
+ * AppleMultitouchN1SPI drives it. The device is mtz2.c's: the N1 speaks the
+ * Z2's HBPP bootloader and report protocol (one kext, AppleMultitouchSPI,
+ * drives both). Its pins, decoded from the tree's function-* entries with the
+ * same rule as spi0's select ((group << 3 | pin) << 2 into the pad block):
+ * select 0x1300 (pad 0x260, spi1's function-spi_cs0, active low) and reset
+ * 0x1401 (pad 0x284). A pad's bits 1:0 = 1x drive bit 0 out; 0x make it an
+ * input the board pulls high, which is how the driver releases the reset
+ * (0x12, then 0x10). Power is a PMU LDO, taken as on. Its attention line is
+ * GPIO interrupt 0xB4 (pin 180, pad 0x2D0). spi1's DMA is CDMA channel 18
+ * into TXDATA (+0x10) and 19 out of RXDATA (+0x20).
+ *
+ * The GPIO interrupt controller is part of the pad block: status at +0x800 +
+ * 4g for groups g = 0..6 (interrupt 32g + bit), write one to clear, read and
+ * acknowledged that way by AppleS5L8920XGPIOIC (0xc0673b94), which leaves a
+ * level-triggered pin's bit alone ((pad & 0xC) == 4). Every pad is set to
+ * 0x10 at its start; that bit masks the pin's interrupt (the touch driver
+ * writes pad 0x2D0 = 0x21A, then 0x20A to enable it). One VIC line, 0x5E.
+ */
+#define N88_SPI1_PA          UINT32_C(0x82100000)
+#define N88_SPI1_LINE        28u
+#define N88_TOUCH_CS_PAD     UINT32_C(0x260)
+#define N88_TOUCH_RESET_PAD  UINT32_C(0x284)
+#define N88_TOUCH_ATN_IRQ    0xb4u
+#define N88_GPIOIC_STATUS    UINT32_C(0x800)
+#define N88_GPIOIC_GROUPS    7u
+#define N88_GPIOIC_LINE      0x5eu
+#define N88_GPIO_IRQ_MASKED  0x10u
+
 #define N88_CONSOLE_CAPACITY 65536u
 #define N88_DEFAULT_CMDLINE  "debug=0x8 serial=3 -v"
 #define N88_ROOT_CMDLINE     "rd=md0 debug=0x8 serial=3 -v"
@@ -248,6 +279,10 @@ typedef struct n88 {
     s5l_vic_t vic[N88_VIC_COUNT];
     uint32_t  gpio[N88_GPIO_REGS];  /* the GPIO pad controller's register file */
     s5l_spi_t spi0;
+    s5l_spi_t spi1;
+    s5l_mtz2_t touch;               /* the N1 on spi1 (mtz2.c)                */
+    uint32_t  gpioic_status[N88_GPIOIC_GROUPS];
+    bool      touch_atn_last;       /* for an edge-triggered attention line   */
     spi_nor_t nor;
     uint8_t  *nor_mem;              /* N88_NOR_SIZE octets, the flash's array */
     cdma_t    cdma;                 /* the DMA engine and AES contexts        */

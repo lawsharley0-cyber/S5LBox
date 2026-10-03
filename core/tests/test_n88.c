@@ -1113,6 +1113,60 @@ static void test_sha1_through_cdma(void) {
     free(m);
 }
 
+/* The touch controller on spi1, as AppleMultitouchN1SPI first reaches it:
+ * reset released through its pad (0x12 driven low, then 0x10, an input the
+ * board pulls high), selected through spi1's (0x12), and the HBPP probe
+ * `1A A1 18 E1 ...` answered with a word isInHBPP accepts. */
+static void test_touch_on_spi1(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    const uint32_t G = N88_GPIO_PA, S = N88_SPI1_PA;
+    CHECK(m->touch.in_reset, "held in reset at hand-off");
+    n88_write32(m, G + N88_TOUCH_RESET_PAD, 0x12u);
+    CHECK(m->touch.in_reset, "0x12 drives the reset low");
+    n88_write32(m, G + N88_TOUCH_RESET_PAD, 0x10u);
+    CHECK(!m->touch.in_reset, "0x10 lets the board pull it high: released");
+    n88_write32(m, G + N88_TOUCH_CS_PAD, 0x12u);
+    static const uint8_t probe[16] = { 0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
+                                       0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1 };
+    uint8_t rx[16] = {0};
+    for (unsigned i = 0; i < 16u; i++) {
+        n88_write32(m, S + SPI_TXDATA, probe[i]);
+        rx[i] = (uint8_t)n88_read32(m, S + SPI_RXDATA);
+    }
+    n88_write32(m, G + N88_TOUCH_CS_PAD, 0x13u);
+    const unsigned w0 = (unsigned)rx[0] << 8 | rx[1], w1 = (unsigned)rx[2] << 8 | rx[3];
+    static const unsigned ok[] = { 0x1aa1u, 0x18e1u, 0x1f01u, 0x4879u, 0x4969u, 0x4bc1u, 0x4ad1u };
+    bool a0 = false, a1 = false;
+    for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) { a0 |= w0 == ok[i]; a1 |= w1 == ok[i]; }
+    CHECK(a0 && a1 && m->touch.hbpp_probes == 1u, "HBPP probe answered (%04x %04x)", w0, w1);
+    /* The attention line's pad, masked as AppleS5L8920XGPIOIC leaves every
+     * pad and then as the touch driver enables it; a status bit written back
+     * clears. */
+    CHECK(n88_read32(m, G + N88_GPIOIC_STATUS + 4u * (N88_TOUCH_ATN_IRQ / 32u)) == 0u,
+          "no touch interrupt pending");
+    m->gpioic_status[N88_TOUCH_ATN_IRQ / 32u] = 1u << (N88_TOUCH_ATN_IRQ % 32u);
+    n88_write32(m, G + N88_TOUCH_ATN_IRQ * 4u, 0x20au);
+    CHECK(s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+          (1u << (N88_GPIOIC_LINE % 32u)), "a pending GPIO interrupt raises line 0x5E");
+    n88_write32(m, G + N88_GPIOIC_STATUS + 4u * (N88_TOUCH_ATN_IRQ / 32u),
+                1u << (N88_TOUCH_ATN_IRQ % 32u));
+    CHECK(!(s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+            (1u << (N88_GPIOIC_LINE % 32u))), "written back, the line drops");
+    n88_free(m);
+    free(m);
+}
+
 int main(void) {
     test_bus_routing();
     test_timer_registers();
@@ -1125,6 +1179,7 @@ int main(void) {
     test_cdma_on_the_bus();
     test_sha1_through_cdma();
     test_display_controller();
+    test_touch_on_spi1();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

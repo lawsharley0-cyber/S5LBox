@@ -41,6 +41,9 @@
  * thread's last wait at the end: where a stalled boot is waiting. -F writes
  * the framebuffer Boot_Video describes (n88_framebuffer) as a PPM image at
  * the end, reading each 32-bit pixel's low three octets as blue, green, red.
+ * -D x0,y0,x1,y1,t drags one finger across the touchscreen from guest time t
+ * (see drag_tick); -S t (up to eight) also writes the screen at guest time
+ * t, to the -F path with ".<t>s.ppm" appended (the engine mode only).
  * -B sets the boot_args version the kernel checks (default 5, iOS 6's; 4
  * when the kernel is the 3GS's iPhone OS 3.1.3 7E18 one, which wants it).
  * -r works with either known kernel, each with its own memory-disk gate.
@@ -132,6 +135,64 @@ log:
         printf("  mmio %s%u %08x %s %08x  pc %08x %s\n", write ? "W" : "R", size * 8u,
                pa, write ? "<-" : "->", v, pc, sym(pc));
     }
+}
+
+/* ------------------------------------------------------------ screens */
+/* The framebuffer (n88_framebuffer) as a PPM image, each 32-bit pixel's low
+ * three octets read as blue, green, red. */
+static void write_screen(const char *path) {
+    const uint8_t *fb = n88_framebuffer(&g_m);
+    FILE *f = fb ? fopen(path, "wb") : NULL;
+    if (!f) die("cannot write %s", path);
+    fprintf(f, "P6\n%u %u\n255\n", N88_FB_WIDTH, N88_FB_HEIGHT);
+    uint64_t lit = 0;
+    for (unsigned y = 0; y < N88_FB_HEIGHT; y++)
+        for (unsigned x = 0; x < N88_FB_WIDTH; x++) {
+            const uint8_t *px = fb + y * N88_FB_STRIDE + x * 4u;
+            const uint8_t rgb[3] = { px[2], px[1], px[0] };
+            lit += (px[0] | px[1] | px[2]) != 0;
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
+    printf("framebuffer written to %s (%" PRIu64 " of %u pixels not black, guest time %.2f s)\n",
+           path, lit, N88_FB_WIDTH * N88_FB_HEIGHT, n88_guest_seconds(&g_m));
+}
+
+/* -------------------------------------------------------------- touch */
+/*
+ * -D x0,y0,x1,y1,t: one finger dragged in a straight line, as the touch
+ * controller reports it: down at (x0,y0) once t seconds of guest time have
+ * passed, DRAG_STEPS - 2 moves, and a lift at (x1,y1), one report per
+ * MTZ2_FRAME_PERIOD_MS of guest time. A report the device cannot take yet
+ * (one still unread) is offered again on the next slice. Panel pixels.
+ */
+#define DRAG_STEPS 24u
+static struct {
+    bool     on;
+    double   x0, y0, x1, y1, t, next;
+    unsigned step;
+    uint64_t refused;
+} g_drag;
+
+static void drag_tick(void) {
+    if (!g_drag.on || g_drag.step >= DRAG_STEPS) return;
+    const double now = n88_guest_seconds(&g_m);
+    if (now < g_drag.t || now < g_drag.next) return;
+    const double f = (double)g_drag.step / (double)(DRAG_STEPS - 1u);
+    s5l_mt_contact_t c;
+    memset(&c, 0, sizeof c);
+    c.id = 1;
+    c.x = (uint16_t)(g_drag.x0 + (g_drag.x1 - g_drag.x0) * f + 0.5);
+    c.y = (uint16_t)(g_drag.y0 + (g_drag.y1 - g_drag.y0) * f + 0.5);
+    c.phase = g_drag.step == 0u ? MTZ2_PHASE_MAKE_TOUCH
+            : g_drag.step == DRAG_STEPS - 1u ? MTZ2_PHASE_BREAK_TOUCH : MTZ2_PHASE_TOUCHING;
+    c.pressure = g_drag.step == DRAG_STEPS - 1u ? 0u : 160u;
+    c.major = c.minor = 10u;
+    if (!s5l_mtz2_set_contacts(&g_m.touch, &c, 1)) { g_drag.refused++; return; }
+    if (g_drag.step == 0u) printf("  drag: finger down at %u,%u, guest time %.3f s\n", c.x, c.y, now);
+    if (g_drag.step == DRAG_STEPS - 1u) printf("  drag: lifted at %u,%u, guest time %.3f s\n", c.x, c.y, now);
+    g_drag.step++;
+    g_drag.next = now + MTZ2_FRAME_PERIOD_MS / 1000.0;
 }
 
 /* --------------------------------------------------- the working image */
@@ -353,6 +414,8 @@ int main(int argc, char **argv) {
     const char *unmatch[16];
     unsigned nunmatch = 0;
     bool activate = true;
+    double shot_at[8];
+    unsigned nshots = 0, shots_taken = 0;
     bool engine = false, waits = false;
     unsigned epoch = 0;
     for (int i = 3; i < argc; i++) {
@@ -366,6 +429,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
         else if (!strcmp(argv[i], "-a")) activate = false;
+        else if (!strcmp(argv[i], "-D") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%lf,%lf,%lf,%lf,%lf", &g_drag.x0, &g_drag.y0, &g_drag.x1,
+                       &g_drag.y1, &g_drag.t) != 5)
+                die("-D wants x0,y0,x1,y1,t");
+            g_drag.on = true;
+        }
+        else if (!strcmp(argv[i], "-S") && i + 1 < argc && nshots < 8u)
+            shot_at[nshots++] = strtod(argv[++i], NULL);
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) {
             epoch = (unsigned)strtoul(argv[++i], NULL, 0);
             if (!epoch || epoch > 255u) die("-B wants an epoch from 1 to 255");
@@ -403,7 +474,6 @@ int main(int argc, char **argv) {
         "arm-io/usb-otg",           /* findMaxEndpoints panics on its registers   */
         "arm-io/isp",               /* the camera's ISP never answers its mailbox */
         "arm-io/amc",               /* the hardware audio decoder is not modelled */
-        "arm-io/spi1/multi-touch",  /* the touch controller is not modelled       */
         "arm-io/tv-out",            /* closing its framebuffer hangs SpringBoard  */
     };
     if (is_ios3 && !nunmatch)
@@ -497,8 +567,19 @@ int main(int argc, char **argv) {
             const uint64_t to_mark = every - n % every;
             uint64_t slice = budget - n < to_mark ? budget - n : to_mark;
             if (slice > 10000000u) slice = 10000000u;
+            /* While a gesture is under way, slices short enough to pace its
+             * reports in guest time. */
+            if (g_drag.on && g_drag.step < DRAG_STEPS && slice > 1000000u) slice = 1000000u;
             n += n88_run(&g_m, (unsigned)slice, &st);
             drain_console();
+            drag_tick();
+            while (shots_taken < nshots && n88_guest_seconds(&g_m) >= shot_at[shots_taken]) {
+                char path[512];
+                snprintf(path, sizeof path, "%s.%.1fs.ppm", screen_out ? screen_out : "screen",
+                         shot_at[shots_taken]);
+                write_screen(path);
+                shots_taken++;
+            }
             if (st != ARM_OK) { why = "the core refused an instruction"; break; }
             if (n % every == 0u) {
                 printf("  at %" PRIu64 "M instructions, guest time %.2f s (ttbr0 %08x,"
@@ -630,6 +711,37 @@ int main(int argc, char **argv) {
                            so.stride_bytes, so.bpp, so.addr);
             printf("\n");
         }
+        {
+            const s5l_mtz2_t *t = &g_m.touch;
+            printf("spi1: %" PRIu64 " words, %" PRIu64 " tx drops, %" PRIu64 " dma arms; gpioic"
+                   " %08x %08x %08x %08x %08x %08x %08x, pad 0x2d0 %08x\n",
+                   g_m.spi1.words, g_m.spi1.tx_drops, g_m.spi1.dma_arms,
+                   g_m.gpioic_status[0], g_m.gpioic_status[1], g_m.gpioic_status[2],
+                   g_m.gpioic_status[3], g_m.gpioic_status[4], g_m.gpioic_status[5],
+                   g_m.gpioic_status[6], g_m.gpio[N88_TOUCH_ATN_IRQ]);
+            printf("touch: %" PRIu64 " octets, %" PRIu64 " select edges, atn %d, in hbpp %d,"
+                   " in reset %d; hbpp: %" PRIu64 " probes, %" PRIu64 " data packets (%" PRIu64
+                   " octets), %" PRIu64 " reg reads, %" PRIu64 " reg writes, %" PRIu64
+                   " calibs, %" PRIu64 " execs, %" PRIu64 " atn acks; %" PRIu64 " unknown"
+                   " (last %02x); frames %" PRIu64 " queued %" PRIu64 " read\n",
+                   t->octets, t->select_edges, (int)t->atn, (int)t->hbpp_mode,
+                   (int)t->in_reset, t->hbpp_probes, t->hbpp_data_packets, t->hbpp_data_bytes,
+                   t->hbpp_reg_reads, t->hbpp_reg_writes, t->hbpp_calibs, t->hbpp_execs,
+                   t->hbpp_atn_acks, t->unknown_opcodes, t->last_unknown_op,
+                   t->frames_queued, t->frames_read);
+            printf("  register log:");
+            for (unsigned i = 0; i < t->reg_log_n && i < 16u; i++)
+                printf(" %c%08x=%08x", t->reg_log_write[i] ? 'W' : 'R', t->reg_log_addr[i],
+                       t->reg_log_val[i]);
+            printf("\n  packets:");
+            for (unsigned i = 0; i < t->pkt_n && i < 128u; i++)
+                printf(" %02x/%u", t->pkt_op[i], t->pkt_len[i]);
+            printf("\n");
+        }
+        if (g_drag.on)
+            printf("drag: %u of %u reports queued, %" PRIu64 " offers refused (device busy,"
+                   " in reset, or not yet told it is alive)\n", g_drag.step, DRAG_STEPS,
+                   g_drag.refused);
         printf("dsim: %" PRIu64 " packets (%" PRIu64 " payload words), last header %08x\n",
                g_m.dsim.packets, g_m.dsim.payload_words, g_m.dsim.last_header);
         for (unsigned b = 0; b < 2u; b++) {
@@ -679,23 +791,7 @@ int main(int argc, char **argv) {
         printf("  %s%-2u %08x x%-7u first %08x at %08x %s\n", g_stats[i].write ? "W" : "R",
                g_stats[i].size * 8u, g_stats[i].pa, g_stats[i].count, g_stats[i].first_value,
                g_stats[i].first_pc, sym(g_stats[i].first_pc));
-    if (screen_out) {                   /* -F: the framebuffer as a PPM image */
-        const uint8_t *fb = n88_framebuffer(&g_m);
-        FILE *f = fb ? fopen(screen_out, "wb") : NULL;
-        if (!f) die("cannot write %s", screen_out);
-        fprintf(f, "P6\n%u %u\n255\n", N88_FB_WIDTH, N88_FB_HEIGHT);
-        uint64_t lit = 0;
-        for (unsigned y = 0; y < N88_FB_HEIGHT; y++)
-            for (unsigned x = 0; x < N88_FB_WIDTH; x++) {
-                const uint8_t *px = fb + y * N88_FB_STRIDE + x * 4u;
-                const uint8_t rgb[3] = { px[2], px[1], px[0] };
-                lit += (px[0] | px[1] | px[2]) != 0;
-                fwrite(rgb, 1, 3, f);
-            }
-        fclose(f);
-        printf("framebuffer written to %s (%" PRIu64 " of %u pixels not black)\n",
-               screen_out, lit, N88_FB_WIDTH * N88_FB_HEIGHT);
-    }
+    if (screen_out) write_screen(screen_out);   /* -F: the framebuffer as a PPM */
     if (ram_out) {                      /* -m: all of DRAM, for offline reading */
         FILE *f = fopen(ram_out, "wb");
         if (!f || fwrite(g_m.ram, 1, N88_DRAM_SIZE, f) != N88_DRAM_SIZE)

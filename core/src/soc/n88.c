@@ -98,6 +98,15 @@ static void irq_update(n88_t *m) {
     m->cpu.fiq_line = fiq;
 }
 
+static void gpio_lines(n88_t *m);
+
+/* A pad's level as the pin drives it: bits 1:0 = 1x drive bit 0 out (spi0's
+ * select is 0x12 asserted, 0x13 released); 0x is an input, which the board
+ * pulls high -- the touch reset is released by 0x12 -> 0x10. */
+static bool pad_level(uint32_t v) {
+    return (v & 2u) ? (v & 1u) != 0u : true;
+}
+
 /* Everything time moves: expire the decrementer if its interval has passed
  * (line 6), start display frames that are due (line 0x25). */
 static void timer_update(n88_t *m) {
@@ -112,6 +121,7 @@ static void timer_update(n88_t *m) {
     m2clcd_advance(&m->clcd, now);
     s5l_vic_set_line(&m->vic[N88_CLCD_LINE / 32u], N88_CLCD_LINE % 32u, m2clcd_irq(&m->clcd));
     irq_update(m);
+    gpio_lines(m);
 }
 
 /* The first cycle at which time raises a line -- the decrementer expiring
@@ -141,6 +151,10 @@ static bool in_gpio(uint32_t pa) {
 
 static bool in_spi0(uint32_t pa) {
     return pa >= N88_SPI0_PA && pa < N88_SPI0_PA + N88_SPI0_SIZE;
+}
+
+static bool in_spi1(uint32_t pa) {
+    return pa >= N88_SPI1_PA && pa < N88_SPI1_PA + N88_SPI0_SIZE;
 }
 
 static bool in_clcd(uint32_t pa) {
@@ -197,12 +211,26 @@ static bool cdma_mem(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool wr
     return true;
 }
 
-/* Where CDMA's peripheral requests go: the SHA-1 engine's FIFO. */
+/* Where CDMA's peripheral requests go: the SHA-1 engine's FIFO, and spi1's
+ * transmit FIFO (channel 18, the touch controller's firmware). The SPI shifts
+ * each octet as it lands; in DMA mode nothing waits on the receive side. */
 static bool cdma_periph(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len) {
     n88_t *m = ctx;
-    if (fifo != N88_SHA1_PA + S5L_SHA1_FIFO) return false;
-    s5l_sha1_feed(&m->sha1, data, len);
-    return true;
+    if (fifo == N88_SHA1_PA + S5L_SHA1_FIFO) {
+        s5l_sha1_feed(&m->sha1, data, len);
+        return true;
+    }
+    if (fifo == N88_SPI1_PA + SPI_TXDATA) {
+        /* The port asks for data only in DMA mode (SETUP bit 6); until then
+         * the request waits, and n88 retries it when SETUP changes. */
+        if (!(m->spi1.setup & SPI_SETUP_DMA)) return false;
+        for (uint32_t i = 0; i < len; i++) {
+            s5l_spi_write(&m->spi1, SPI_TXDATA, data[i]);
+            s5l_spi_step(&m->spi1);
+        }
+        return true;
+    }
+    return false;
 }
 
 /* Every channel's level onto its VIC line. */
@@ -233,6 +261,30 @@ static void i2c_devices_reset(n88_t *m) {
     i2c_regfile_init(&m->pmu, N88_PMU_ADDR);
 }
 
+/* The GPIO interrupt controller's line, from the one source wired to it:
+ * the touch controller's attention, on interrupt N88_TOUCH_ATN_IRQ, while
+ * its pad does not mask it. A level-triggered pin's status follows the
+ * line; an edge-triggered one latches on assertion until written back. */
+static void gpio_lines(n88_t *m) {
+    const bool atn = s5l_mtz2_irq(&m->touch);
+    const uint32_t pad = m->gpio[N88_TOUCH_ATN_IRQ];
+    const unsigned g = N88_TOUCH_ATN_IRQ / 32u, bit = N88_TOUCH_ATN_IRQ % 32u;
+    if (!(pad & N88_GPIO_IRQ_MASKED)) {
+        if ((pad & 0xcu) == 4u) {
+            if (atn) m->gpioic_status[g] |= 1u << bit;
+            else     m->gpioic_status[g] &= ~(1u << bit);
+        } else if (atn && !m->touch_atn_last) {
+            m->gpioic_status[g] |= 1u << bit;
+        }
+    }
+    m->touch_atn_last = atn;
+    bool any = false;
+    for (unsigned i = 0; i < N88_GPIOIC_GROUPS; i++) any |= m->gpioic_status[i] != 0u;
+    s5l_vic_set_line(&m->vic[N88_GPIOIC_LINE / 32u], N88_GPIOIC_LINE % 32u, any);
+    s5l_spi_irq_note(&m->spi1);
+    s5l_vic_set_line(&m->vic[N88_SPI1_LINE / 32u], N88_SPI1_LINE % 32u, m->spi1.irq_last);
+}
+
 /* spi0's interrupt is a level the controller derives from its own state;
  * sampling it here also counts its rising edges (irq_rises). */
 static void spi0_line(n88_t *m) {
@@ -259,6 +311,11 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         default:   break;
         }
     }
+    if (in_gpio(pa) && pa - N88_GPIO_PA >= N88_GPIOIC_STATUS &&
+        pa - N88_GPIO_PA < N88_GPIOIC_STATUS + 4u * N88_GPIOIC_GROUPS) {
+        m->mmio++;
+        return m->gpioic_status[(pa - N88_GPIO_PA - N88_GPIOIC_STATUS) >> 2];
+    }
     if (in_gpio(pa)) {
         /* A pure register-file read: the value the CPU last wrote to this
          * pin's config, reset 0. It drives no interrupt line here, so, like
@@ -270,6 +327,13 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
     if (pa == N88_UART0_PA + 0x10u) {           /* UTRSTAT: transmitter empty */
         m->mmio++;
         return 0x6u;
+    }
+    if (in_spi1(pa)) {
+        m->mmio++;
+        const uint32_t v = s5l_spi_read(&m->spi1, pa - N88_SPI1_PA);
+        gpio_lines(m);
+        irq_update(m);
+        return v;
     }
     if (in_spi0(pa)) {
         /* Not a pure read: RXDATA pops the receive FIFO, which can let the
@@ -354,10 +418,21 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         m->timer.ctrl = v & 1u;
     } else if (in_vic(pa)) {
         s5l_vic_write(&m->vic[(pa - N88_VIC_PA) >> 16], pa & 0xffffu, v);
+    } else if (in_gpio(pa) && pa - N88_GPIO_PA >= N88_GPIOIC_STATUS &&
+               pa - N88_GPIO_PA < N88_GPIOIC_STATUS + 4u * N88_GPIOIC_GROUPS) {
+        m->gpioic_status[(pa - N88_GPIO_PA - N88_GPIOIC_STATUS) >> 2] &= ~v;   /* W1C */
     } else if (in_gpio(pa)) {
         m->gpio[(pa - N88_GPIO_PA) >> 2] = v;   /* stored, read back verbatim */
         if (pa - N88_GPIO_PA == N88_SPI0_CS_GPIO)
             spi_nor_select(&m->nor, (v & 1u) == 0u);    /* active low */
+        if (pa - N88_GPIO_PA == N88_TOUCH_CS_PAD) s5l_mtz2_select_pin(&m->touch, pad_level(v));
+        if (pa - N88_GPIO_PA == N88_TOUCH_RESET_PAD) s5l_mtz2_reset_pin(&m->touch, pad_level(v));
+    } else if (in_spi1(pa)) {
+        s5l_spi_write(&m->spi1, pa - N88_SPI1_PA, v);
+        if (pa - N88_SPI1_PA == SPI_SETUP) {
+            cdma_retry(&m->cdma);
+            cdma_lines(m);
+        }
     } else if (in_spi0(pa)) {
         s5l_spi_write(&m->spi0, pa - N88_SPI0_PA, v);
     } else if (in_cdma(pa)) {
@@ -389,6 +464,7 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
         if (m->trace) m->trace(m->trace_ctx, pa, size, true, v, m->cpu.r[15]);
     }
     spi0_line(m);
+    gpio_lines(m);
     timer_update(m);
 }
 
@@ -1012,6 +1088,19 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
         s5l_spi_attach(&m->spi0, 0u, &nor_slave);
     }
     spi_nor_reset(&m->nor);
+    /* spi1 at version 1 with the touch controller at its only select, powered
+     * (its LDO is the PMU's) and held in reset until the driver releases it. */
+    s5l_spi_reset(&m->spi1);
+    s5l_spi_set_version(&m->spi1, 1u);
+    s5l_mtz2_reset(&m->touch);
+    {
+        s5l_spi_slave_t touch_slave;
+        s5l_mtz2_bind(&m->touch, &touch_slave);
+        s5l_spi_attach(&m->spi1, 0u, &touch_slave);
+    }
+    s5l_mtz2_power_pin(&m->touch, true);
+    memset(m->gpioic_status, 0, sizeof m->gpioic_status);
+    m->touch_atn_last = false;
     cdma_reset(&m->cdma);
     s5l_sha1_reset(&m->sha1);
     s5l8920_i2c_reset(&m->i2c0);

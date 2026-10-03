@@ -66,7 +66,10 @@
  *   Peripheral requests are served memory-to-peripheral only: the chain's
  *   octets go to the device whose FIFO is at +0x8 (cdma_set_peripheral), and
  *   the channel completes when the device takes them. A channel whose
- *   address no device claims stays running, counted in periph_unclaimed.
+ *   address no device claims, or whose device is not yet asking for data,
+ *   stays running, counted in periph_unclaimed, until cdma_retry(). spi1's
+ *   driver starts channel 18 before it sets the port's DMA bit (SETUP 0x4018,
+ *   then 0x4058), which on hardware is the request line the channel waits on.
  *
  * Not modelled: time (a request completes when it can run: a memory-to-
  * memory pair when its second channel starts, a peripheral one at once),
@@ -148,6 +151,10 @@ void cdma_free(cdma_t *d);
 void cdma_reset(cdma_t *d);
 /* Where peripheral requests deliver (NULL: nowhere; they stay running). */
 void cdma_set_peripheral(cdma_t *d, cdma_periph_fn fn, void *ctx);
+/* Offer every running peripheral request to its device again: for a device
+ * that was not ready to take it when the channel started (a FIFO whose DMA
+ * request is not yet enabled), call when that changes. */
+void cdma_retry(cdma_t *d);
 
 uint32_t cdma_read(cdma_t *d, uint32_t off);
 void     cdma_write(cdma_t *d, uint32_t off, uint32_t v);

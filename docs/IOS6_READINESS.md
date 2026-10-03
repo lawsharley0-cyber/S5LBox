@@ -852,7 +852,54 @@ writes, derived from lockdownd in docs/derivations.md 23.3; -a leaves it
 out). With it SpringBoard shows the **lock screen**: the clock, the Earth
 wallpaper and "slide to unlock" (92,133 lit pixels). The clock reads
 4:00, Wednesday December 31 -- 1969, the D1755's RTC registers being
-zero. Touch (the N1 on spi1) is next.
+zero.
+
+#### Touch, and the home screen (#56)
+
+The 3GS's touch controller (an N1, `multi-touch,n88` on spi1) is driven by
+the same kext as the 3G's Z2, AppleMultitouchSPI, through the same HBPP
+bootloader and report protocol; only its calibration registers
+(0x1000300C, 0x1000305C = 0x20, 0x10003058 = 6, 0x10003000 = 3) and
+version register (0x10003800) differ, and the 3G's `mtz2.c` serves it
+unchanged. What was new was the board around it:
+
+- **spi1** at 0x82100000 (line 0x1C), version 1, with the device at its
+  only select.
+- **The pins**, decoded like spi0's select: select 0x1300 (pad 0x260),
+  reset 0x1401 (pad 0x284). The pad mode matters: bits 1:0 = 1x drive bit
+  0 out, 0x make the pin an input the board pulls high, and the driver
+  releases the reset that way (0x12, then 0x10). Read as "bit 0 is the
+  level" it stayed in reset and the driver reported "Could not detect
+  HBPP".
+- **The firmware arrives by CDMA** (channel 18 into spi1's TXDATA), and the
+  driver starts the channel *before* it sets the port's DMA bit (SETUP
+  0x4018 -> 0x4058); on hardware the channel waits on the port's request.
+  With the transfer done at once, 53,892 octets were dropped at the FIFO.
+  A peripheral request now waits until its device takes it, and n88
+  offers it again when spi1's SETUP changes (`cdma_retry`).
+- **The GPIO interrupt controller**: status at pad block +0x800 + 4g,
+  write one to clear (AppleS5L8920XGPIOIC's handler, 0xc0673b94); a pad's
+  bit 4 masks its pin (the driver enables the attention line, interrupt
+  0xB4, with pad 0x2D0 = 0x20A); one VIC line, 0x5E.
+
+With them the driver detects HBPP, downloads 128 bytes of prox
+calibration, 256 of panel calibration and the 53,924-byte firmware
+`0x0066.bin` "in 106ms", runs the N1 calibration and execute, and
+interrogates the running part (0xEE wake, 0xE2, 0xE3, 0xE6, 0xE7).
+
+`boot3gs -D x0,y0,x1,y1,t` drags one finger (24 reports, 16 ms apart in
+guest time), and `-S t` takes a screenshot mid-run. A drag at 40 s found
+the touch already off ("disabled power" at 19.7 s: the idle lock screen's
+display timed out, and the touch with it). At 13 s, from (50,431) to
+(310,431), **the slider unlocks the phone**: by 15 s the screen is iPhone
+OS 3.1.3's **home screen** (Messages, Calendar, Photos, Camera, ...,
+Settings, iTunes, App Store, Compass; the dock's Phone, Mail, Safari and
+iPod) under the first-run "Edit Home Screen" tip, with a "ringer" HUD
+(the ringer switch is not modelled) and "No Service" (no modem). 111,269
+lit pixels against the lock screen's 92,133.
+
+Next: the buttons (home and hold, to wake a display that timed out, and
+the ringer switch), the RTC, and tapping into an app.
 
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 

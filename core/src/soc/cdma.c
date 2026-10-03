@@ -183,6 +183,13 @@ static void try_peripheral(cdma_t *d, unsigned n) {
     finish(d, n, false);
 }
 
+void cdma_retry(cdma_t *d) {
+    for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
+        const uint32_t csr = d->ch[n][CDMA_CSR / 4u];
+        if ((csr & CDMA_CSR_RUNNING) && !(csr & CDMA_CSR_M2M)) try_peripheral(d, n);
+    }
+}
+
 uint32_t cdma_read(cdma_t *d, uint32_t off) {
     if (off >= CDMA_SIZE || (off & 3u)) return 0u;
     const unsigned n = off >> 12, r = (off & 0xfffu) >> 2;
