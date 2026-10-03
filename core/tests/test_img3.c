@@ -264,6 +264,20 @@ static void test_decrypt_padded_tail(void) {
         CHECK(img3_decrypt_data_iv(&img, key, 128, iv, out, plain_len, &out_len) &&
               out_len == plain_len && memcmp(out, plain, plain_len) == 0,
               "a %u-byte payload's last block was not decrypted", plain_len);
+        /* Copying the tail instead leaves its stored ciphertext. */
+        out_len = 0;
+        CHECK(img3_decrypt_data_iv_tail(&img, key, 128, iv, out, plain_len, &out_len, false) &&
+              out_len == plain_len && memcmp(out, plain, plain_len & ~15u) == 0 &&
+              memcmp(out + (plain_len & ~15u), cipher + (plain_len & ~15u),
+                     plain_len & 15u) == 0,
+              "a copied %u-byte tail is the stored bytes", plain_len);
+        /* In place, as the app's importer decrypts: the tail must still chain
+         * from the prefix's last CIPHERTEXT block. */
+        out_len = 0;
+        CHECK(img3_decrypt_data_iv(&img, key, 128, iv, (uint8_t *)img.data, plain_len,
+                                   &out_len) &&
+              out_len == plain_len && memcmp(img.data, plain, plain_len) == 0,
+              "in place, a %u-byte payload's last block was not decrypted", plain_len);
     }
 }
 

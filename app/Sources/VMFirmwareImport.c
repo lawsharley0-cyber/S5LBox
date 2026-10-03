@@ -264,6 +264,29 @@ static const vm_fw_reference_t k_references[] = {
               0x86,0xcb,0x47,0x68,0x09,0x81,0xcf,0xb0,0x37,0x31,0xde,0x7b,
               0x55,0xd2,0x38,0xc9,0x42,0xeb,0x5e,0x82 }
         }
+    },
+    {
+        /* The iPhone 3GS's iPhone OS 3.1.3, as this importer produces it from
+         * the genuine IPSW with the published keys (the kernelcache's
+         * unaligned tail copied, as for the 3G; the device tree's decrypted),
+         * and as the 3GS machine boots it to the home screen
+         * (tools/n88_ios3.h). */
+        "iPhone2,1", "7E18",
+        { 7966720u, 42840u, 545771520u },
+        {
+            /* kernel.macho */
+            { 0x52,0x1d,0x38,0xd7,0xb7,0x31,0x20,0x09,0x57,0xaf,0x57,0x70,
+              0x64,0x49,0xa1,0xd0,0xdf,0xb4,0x41,0xb7,0x9a,0x9c,0xcb,0xd0,
+              0xbf,0xa7,0xe6,0xdd,0x31,0x28,0x7a,0x59 },
+            /* devicetree.bin */
+            { 0x66,0xfc,0xe4,0x92,0x20,0x86,0xa4,0x37,0x80,0xd4,0x79,0x61,
+              0x7d,0x04,0x25,0x24,0x63,0x4e,0x95,0xb3,0x2b,0x43,0x73,0xc5,
+              0x46,0x1e,0x41,0x12,0x7b,0x4c,0x5f,0xb4 },
+            /* rootfs.img */
+            { 0xca,0x9a,0xa4,0x44,0x03,0x45,0x65,0x49,0xc6,0xdf,0x68,0xee,
+              0x71,0xb3,0x6e,0x8f,0x1a,0x54,0xce,0x85,0x36,0xf7,0x05,0xbe,
+              0x27,0x06,0xf4,0x54,0xda,0x89,0x87,0x83 }
+        }
     }
 };
 
@@ -695,9 +718,14 @@ static void import_img3_artefact(run_t *r, vm_fw_artefact_t which,
             free(raw);
             return;
         }
+        /* The kernelcache's unaligned tail is copied, not decrypted: that is
+         * how the iPhone 3G's accepted kernel.macho was made, and its hash
+         * depends on it (img3.h). The device tree's tail is its last property
+         * (the 3GS's: 42840 bytes in a 42848-byte tag), so it is decrypted. */
         uint32_t got = 0;
-        if (!img3_decrypt_data_iv(&img, key->key, key->key_bits, key->iv,
-                                  (uint8_t *)img.data, img.data_len, &got)) {
+        if (!img3_decrypt_data_iv_tail(&img, key->key, key->key_bits, key->iv,
+                                       (uint8_t *)img.data, img.data_len, &got,
+                                       which != VM_FW_KERNEL)) {
             ar->state = VM_FW_STATE_FAILED;
             ar->reason = VM_FW_ERR_DECRYPT_FAILED;
             set_detail(ar->detail, sizeof ar->detail,

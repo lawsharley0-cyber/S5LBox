@@ -97,11 +97,25 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
  * device tree: 42840 bytes in a 42848-byte tag), and then the whole block is
  * decrypted and only `data_len` bytes kept, as iBoot does. A tag with no such
  * padding has its unaligned tail copied through verbatim. `out_len` receives
- * the number of bytes written.
+ * the number of bytes written. `out` may be img->data (decrypting in place).
  */
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
                           const uint8_t iv[16], uint8_t *out, size_t out_cap,
                           uint32_t *out_len);
+
+/*
+ * The same, choosing what happens to an unaligned tail: `decrypt_tail` false
+ * always copies it through verbatim, which is what the tools that produced
+ * the iPhone 3G's accepted kernel.macho did (docs/BOOT_CHAIN.md: its
+ * kernelcache's last block stays ciphertext, and unlzss reports the 42-byte
+ * zero-fill that is part of the accepted hash). A kernelcache's tail is
+ * compressed padding past the end of the kernel, so either choice boots; the
+ * accepted hash needs this one. A device tree's tail is its last property,
+ * so it must be decrypted.
+ */
+bool img3_decrypt_data_iv_tail(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                               const uint8_t iv[16], uint8_t *out, size_t out_cap,
+                               uint32_t *out_len, bool decrypt_tail);
 
 /* Human-readable status, for logs and the app UI. */
 const char *img3_strerror(img3_status_t st);

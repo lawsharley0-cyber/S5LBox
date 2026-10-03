@@ -83,7 +83,9 @@ static void *out_open(void *ctx, const char *name) {
     char path[1200];
     if (!safe_name(name)) return NULL;
     snprintf(path, sizeof path, "%s/%s", o->dir, name);
-    return fopen(path, "wb");
+    /* Read back as well as written: the root filesystem's disk image is
+     * staged here and then read through the decrypting reader. */
+    return fopen(path, "w+b");
 }
 static bool out_write(void *ctx, void *h, const uint8_t *d, size_t n) {
     (void)ctx;

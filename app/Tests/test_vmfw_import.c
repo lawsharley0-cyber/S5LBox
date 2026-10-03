@@ -1051,9 +1051,10 @@ void vmfw_test_import(vmfw_test_t *t) {
 
     /* ---------------- the iPhone 3GS with iPhone OS 3 ------------------ */
     /*
-     * 7E18 for the 3GS: its root filesystem is the 3G's kind of disk image,
-     * and the 3GS machine mounts it, so it is unpacked like the 3G's -- and,
-     * with no reference for this product, comes out unverified.
+     * iPhone OS 3 for the 3GS: its root filesystem is the 3G's kind of disk
+     * image, and the 3GS machine mounts it, so it is unpacked like the 3G's.
+     * 7C145 (3.1) has no reference, so it comes out unverified; 7E18 has one,
+     * which these synthetic files cannot match.
      */
     VMFW_T_SECTION(t, "import/iphone 3gs iphone os 3");
     {
@@ -1069,7 +1070,7 @@ void vmfw_test_import(vmfw_test_t *t) {
         spec.product_type = "iPhone2,1";
         spec.platform = "s5l8920x";
         spec.board = "n88ap";
-        spec.build = "7E18";
+        spec.build = "7C145";
         VMFW_T_CHECK(t, build_ipsw(&gs3, &spec), "built");
 
         vm_fw_keys_t keys;
@@ -1102,6 +1103,19 @@ void vmfw_test_import(vmfw_test_t *t) {
         char text[4096];
         vm_fw_report_render(&rep, text, sizeof text);
         VMFW_T_CHECK(t, strstr(text, "iPhone OS 3") != NULL, "the rendering says iPhone OS 3");
+
+        /* 7E18 is a reference build for the 3GS: bytes that are not the
+         * genuine ones are called what they are. */
+        static ipsw_t gs7e;
+        spec.build = "7E18";
+        VMFW_T_CHECK(t, build_ipsw(&gs7e, &spec), "built 7E18");
+        memset(&fs, 0, sizeof fs);
+        blob.data = gs7e.archive; blob.len = gs7e.len;
+        imp.size = gs7e.len;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_OK, "7E18 accepted");
+        VMFW_T_CHECK(t, rep.reference_build, "7E18 for the 3GS has reference hashes");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_KERNEL].state, VM_FW_STATE_MISMATCH,
+                    "and a kernel that is not the genuine one does not pass");
         vm_fw_keys_clear(&keys);
     }
 
