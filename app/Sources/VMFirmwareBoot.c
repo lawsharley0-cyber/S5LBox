@@ -1011,6 +1011,11 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
     vm_boot_options_reconcile_jailbreak(
         &report->options, &request,
         guest_install_committed || user_app_policy == VM_GUEST_INSTALL_PROBE_VALID);
+    /* The gate follows the policy just decided: with guest code signing
+     * relaxed, the kernel's page-fault signature kill is switched off as
+     * well, or an app whose signature no longer matches its code is killed
+     * at its first page even though AMFI let it start. */
+    ios3_bringup_gate_configure(&request, NULL);
 
     s5l_bringup_status_t status =
         s5l_bringup(machine, &request, boot->bridges, &report->bringup);
@@ -1064,8 +1069,11 @@ bool vm_firmware_boot_start(vm_firmware_boot_t *boot,
     if (restored && s5l_pcf50635_in_standby(&machine->pmu)) {
         uint32_t ram_base = machine->ram_base;
         uint32_t ram_size = machine->ram_size;
+        /* The rebuilt machine keeps the host's execution-backend choice. */
+        s5l8900_cpu_backend_t backend = s5l8900_get_cpu_backend(machine);
         s5l8900_free(machine);
-        if (!s5l8900_init(machine, ram_base, ram_size)) {
+        if (!s5l8900_init(machine, ram_base, ram_size) ||
+            !s5l8900_set_cpu_backend(machine, backend)) {
             free(kernel);
             free(tree);
             (void)file_block_close(boot->media);

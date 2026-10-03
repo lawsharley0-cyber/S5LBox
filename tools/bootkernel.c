@@ -52,6 +52,7 @@ static rootfs_work_entry_t *g_jb_entries = NULL;
 #include "sha256.h"
 #include "snapshot.h"
 #include "soc.h"
+#include "arm_ci.h"
 #if defined(S5LBOX_STATIC_A64_ENGINE)
 #include "a64_static.h"
 #include "vfp.h"
@@ -428,6 +429,7 @@ typedef struct {
     bool baseband;
     bool spi2;
     bool usb_otg;
+    bool amc;
     bool multitouch;
     bool framebuffer;
     bool iomfb_display;
@@ -516,6 +518,12 @@ static const boot_toggle_t BOOT_TOGGLES[] = {
       "8.73e9 instructions. Un-matching it costs boot progress -- daemons\n"
       "retry against absent USB -- but it is the only configuration observed\n"
       "to run past that panic." },
+    { "amc", NULL, NULL, true, BOOT_GROUP_HARDWARE, BOOT_FIELD(amc),
+      "leave /arm-io/amc matched (the default here, so recorded runs keep\n"
+      "their meaning). AppleAMC_r1 is the hardware AAC/MP3 decoder, and its\n"
+      "DSP is not modelled: every hardware decode fails its reset asserts and\n"
+      "produces no samples. --no-amc hides it, as the phone app does by\n"
+      "default, so the guest has only its software decoders to use." },
     { "multitouch", NULL, NULL, false, BOOT_GROUP_HARDWARE,
       BOOT_FIELD(multitouch),
       "leave /arm-io/spi1/multi-touch matched. OFF BY DEFAULT SINCE\n"
@@ -15539,7 +15547,7 @@ static bool springboard_target_trace_selfcheck(void) {
         closed->trap_number == 0u;
 
     springboard_pending_user_t mach_pending;
-    arm_cpu_t mach_cpu;
+    arm_cpu_t mach_cpu = {0};
     memset(&ring, 0, sizeof ring);
     memset(&mach_pending, 0, sizeof mach_pending);
     memset(&mach_cpu, 0, sizeof mach_cpu);
@@ -15989,7 +15997,7 @@ static bool springboard_target_trace_selfcheck(void) {
         ring.target_low_flow_first_valid &&
         ring.target_low_flow_first.at == 0u;
 
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     /*
      * Reuse the large trace scratch instead of putting a second 180+ KiB
      * instance in this startup selfcheck's stack frame. The ring assertions
@@ -33596,6 +33604,7 @@ static void boot_print_usage(FILE *stream, const char *argv0) {
             "          [--drag <at>:<x0>:<y0>:<x1>:<y1>[:<steps>[:<span>]]] ...\n"
             "          [--fast] [--run-api] [--frame-meter]\n"
             "          [--cpu-backend <interp|cached|ir|jit> | --cached-cpu | --ir-cpu | --jit-cpu]\n"
+            "          [--ci-verify] [--ci-stats]\n"
             "          [--interpreter-control | --compact-raw-control]\n"
             "          [--canonical-bus]\n"
             "          [--no-direct-ram-writes]\n"
@@ -33621,6 +33630,11 @@ static void boot_print_usage(FILE *stream, const char *argv0) {
             "  --fast  skip the expensive per-instruction trace block. This\n"
             "      changes host overhead, not emulated hardware; diagnostic\n"
             "      reports are intentionally reduced.\n"
+            "  --ci-verify  with the cached interpreter, re-read every cached\n"
+            "      block's instruction words before running it and rebuild on any\n"
+            "      difference (counted). Slow; a check that no guest write\n"
+            "      escaped invalidation. Implies --ci-stats.\n"
+            "  --ci-stats  print the cached interpreter's counters at exit.\n"
             "  --run-api  execute in the app's 100000-instruction\n"
             "      s5l8900_run() chunks and time only those chunks. This skips\n"
             "      every per-instruction host observer while retaining CPU,\n"
@@ -34181,6 +34195,7 @@ int main(int argc, char **argv) {
     memset(&external_raw_bridge, 0, sizeof external_raw_bridge);
     memset(&external_bridge_mux, 0, sizeof external_bridge_mux);
     s5l8900_cpu_backend_t cpu_backend_choice = S5L8900_CPU_BACKEND_INTERPRETER;
+    bool ci_verify = false, ci_stats = false;
 
     /* Walk the arguments one at a time: pair-stepping breaks as soon as a
      * single-argument flag like -a appears. */
@@ -34191,6 +34206,14 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--cached-cpu")) {
             cpu_backend_choice = S5L8900_CPU_BACKEND_CACHED_BLOCK;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ci-verify")) {
+            ci_verify = ci_stats = true;
+            continue;
+        }
+        if (!strcmp(argv[i], "--ci-stats")) {
+            ci_stats = true;
             continue;
         }
         if (!strcmp(argv[i], "--ir-cpu")) {
@@ -36614,6 +36637,12 @@ external_md_work_ready:
          */
         if (!want_usb_otg)
             dt_unmatch(dt, dt_n, "arm-io/usb-otg");
+        /* The hardware AAC/MP3 decoder. Its DSP is not modelled, so a matched
+         * AppleAMC_r1 takes every hardware decode and returns nothing; hidden,
+         * the guest's audio stack has only software decoders. docs/audio.md,
+         * "2026-09-24 The PCM path runs, and plays silence". */
+        if (!cfg.v.amc)
+            dt_unmatch(dt, dt_n, "arm-io/amc");
         /*
          * --jb-codesign's device-tree half. PE_i_can_has_debugger() reads
          * /chosen/debug-enabled, and the three boot-args tokens appended above
@@ -37158,6 +37187,8 @@ external_md_work_ready:
         bridge_config.ram_size = UINT64_C(128) << 20;
         bridge_config.ram = mach.ram;
         bridge_config.block = file_block_get(external_block_adapter);
+        bridge_config.ram_written = s5l8900_ram_written_callback;
+        bridge_config.ram_written_context = &mach;
         md_raw_bridge_config_t raw_config;
         memset(&raw_config, 0, sizeof raw_config);
         raw_config.site.pc = IOS3_KERNEL_PATCH_RAW_WATCHER_VA;
@@ -37176,6 +37207,8 @@ external_md_work_ready:
         raw_config.ram_size = UINT64_C(128) << 20;
         raw_config.ram = mach.ram;
         raw_config.block = file_block_get(external_block_adapter);
+        raw_config.ram_written = s5l8900_ram_written_callback;
+        raw_config.ram_written_context = &mach;
 
         if (!md_bridge_config_valid(&bridge_config) ||
             !md_raw_bridge_config_valid(&raw_config)) {
@@ -37381,11 +37414,22 @@ external_md_work_ready:
     vm_resolve();
     printf("\n");
 
-    s5l8900_set_cpu_backend(&mach, cpu_backend_choice);
+    if (!s5l8900_set_cpu_backend(&mach, cpu_backend_choice)) {
+        fprintf(stderr, "could not allocate the cached interpreter\n");
+        return 1;
+    }
     if (cpu_backend_choice != S5L8900_CPU_BACKEND_INTERPRETER) {
-        const char *bname = (cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached-block" :
-                            (cpu_backend_choice == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "ir-optimized" : "jit";
-        printf("cpu backend: %s\n", bname);
+        /* ir and jit are retired names for the same engine (soc.h). It is
+         * used only on the --run-api path: the diagnostic loop below calls
+         * arm_step() directly so it can observe every instruction. */
+        printf("cpu backend: cached interpreter%s%s\n",
+               cpu_backend_choice == S5L8900_CPU_BACKEND_CACHED_BLOCK
+                   ? "" : " (requested by a retired alias)",
+               ci_verify ? ", verify mode" : "");
+        arm_ci_set_verify(mach.ci, ci_verify);
+    } else if (ci_verify || ci_stats) {
+        fprintf(stderr, "--ci-verify/--ci-stats need --cpu-backend cached\n");
+        return 1;
     }
 
     arm_status_t st = ARM_OK;
@@ -38363,6 +38407,29 @@ external_md_work_ready:
                     vm_block_strerror(error->block_status));
         }
         fputc('\n', stderr);
+    }
+
+    if (ci_stats && mach.ci) {
+        arm_ci_stats_t cs;
+        char text[2048];
+        arm_ci_get_stats(mach.ci, &cs);
+        (void)arm_ci_describe_stats(&cs, mach.cpu.cycles, text, sizeof text);
+        printf("cached interpreter:\n%s", text);
+        printf("  stops: budget %" PRIu64 ", step %" PRIu64 ", event %" PRIu64
+               ", status %" PRIu64 "; slow memory translations %" PRIu64 "\n",
+               cs.stop[ARM_CI_STOP_BUDGET], cs.stop[ARM_CI_STOP_STEP],
+               cs.stop[ARM_CI_STOP_EVENT], cs.stop[ARM_CI_STOP_STATUS],
+               cs.mem_slow);
+        if (ci_verify)
+            printf("  verify: %" PRIu64 " stale block(s) caught%s\n",
+                   cs.verify_mismatch,
+                   cs.verify_mismatch ? "  <-- a guest write escaped invalidation" : "");
+    }
+    if (ci_stats || ci_verify) {
+        char text[4096];
+        (void)s5l_access_log_describe(mach.unmodelled, S5L_ACCESS_LOG, 16u,
+                                      text, sizeof text);
+        printf("recent unmodelled hardware accesses (most recent first):\n%s", text);
     }
 
     /* A terminal CPU status can end the run before a statically reachable

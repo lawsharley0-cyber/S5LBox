@@ -98,7 +98,7 @@ const char *vm_fw_strerror(vm_fw_status_t st) {
         case VM_FW_ERR_MANIFEST_TOO_BIG:     return "the manifest is implausibly large";
         case VM_FW_ERR_MANIFEST_MALFORMED:   return "the manifest will not parse";
         case VM_FW_ERR_MANIFEST_INCOMPLETE:  return "the manifest does not name the files this needs";
-        case VM_FW_ERR_UNSUPPORTED_DEVICE:   return "this firmware is for a device S5LBox does not emulate";
+        case VM_FW_ERR_UNSUPPORTED_DEVICE:   return "this firmware is for a device NEON does not emulate";
         case VM_FW_ERR_MEMBER_MISSING:       return "the archive is missing a member its own manifest names";
         case VM_FW_ERR_MEMBER_UNREADABLE:    return "a member could not be read out of the archive";
         case VM_FW_ERR_MEMBER_CHECKSUM:      return "a member's contents do not match the archive's own checksum";
@@ -240,6 +240,12 @@ typedef struct {
     uint8_t     sha256[VM_FW_ARTEFACT_COUNT][VM_FW_SHA256_LEN];
 } vm_fw_reference_t;
 
+/* An iPhone OS 3 build: 7A341 (3.0) through 7E18 (3.1.3), a 7 and a letter.
+ * iOS 4 and later are 8 and up. */
+bool vm_fw_build_is_iphone_os_3(const char *build) {
+    return build && build[0] == '7' && build[1] >= 'A' && build[1] <= 'Z';
+}
+
 static const vm_fw_reference_t k_references[] = {
     {
         "iPhone1,2", "7E18",
@@ -257,6 +263,29 @@ static const vm_fw_reference_t k_references[] = {
             { 0xc3,0x25,0x1e,0x7f,0x09,0x2c,0x93,0x9d,0x58,0x18,0xe9,0x20,
               0x86,0xcb,0x47,0x68,0x09,0x81,0xcf,0xb0,0x37,0x31,0xde,0x7b,
               0x55,0xd2,0x38,0xc9,0x42,0xeb,0x5e,0x82 }
+        }
+    },
+    {
+        /* The iPhone 3GS's iPhone OS 3.1.3, as this importer produces it from
+         * the genuine IPSW with the published keys (the kernelcache's
+         * unaligned tail copied, as for the 3G; the device tree's decrypted),
+         * and as the 3GS machine boots it to the home screen
+         * (tools/n88_ios3.h). */
+        "iPhone2,1", "7E18",
+        { 7966720u, 42840u, 545771520u },
+        {
+            /* kernel.macho */
+            { 0x52,0x1d,0x38,0xd7,0xb7,0x31,0x20,0x09,0x57,0xaf,0x57,0x70,
+              0x64,0x49,0xa1,0xd0,0xdf,0xb4,0x41,0xb7,0x9a,0x9c,0xcb,0xd0,
+              0xbf,0xa7,0xe6,0xdd,0x31,0x28,0x7a,0x59 },
+            /* devicetree.bin */
+            { 0x66,0xfc,0xe4,0x92,0x20,0x86,0xa4,0x37,0x80,0xd4,0x79,0x61,
+              0x7d,0x04,0x25,0x24,0x63,0x4e,0x95,0xb3,0x2b,0x43,0x73,0xc5,
+              0x46,0x1e,0x41,0x12,0x7b,0x4c,0x5f,0xb4 },
+            /* rootfs.img */
+            { 0xca,0x9a,0xa4,0x44,0x03,0x45,0x65,0x49,0xc6,0xdf,0x68,0xee,
+              0x71,0xb3,0x6e,0x8f,0x1a,0x54,0xce,0x85,0x36,0xf7,0x05,0xbe,
+              0x27,0x06,0xf4,0x54,0xda,0x89,0x87,0x83 }
         }
     }
 };
@@ -689,9 +718,14 @@ static void import_img3_artefact(run_t *r, vm_fw_artefact_t which,
             free(raw);
             return;
         }
+        /* The kernelcache's unaligned tail is copied, not decrypted: that is
+         * how the iPhone 3G's accepted kernel.macho was made, and its hash
+         * depends on it (img3.h). The device tree's tail is its last property
+         * (the 3GS's: 42840 bytes in a 42848-byte tag), so it is decrypted. */
         uint32_t got = 0;
-        if (!img3_decrypt_data_iv(&img, key->key, key->key_bits, key->iv,
-                                  (uint8_t *)img.data, img.data_len, &got)) {
+        if (!img3_decrypt_data_iv_tail(&img, key->key, key->key_bits, key->iv,
+                                       (uint8_t *)img.data, img.data_len, &got,
+                                       which != VM_FW_KERNEL)) {
             ar->state = VM_FW_STATE_FAILED;
             ar->reason = VM_FW_ERR_DECRYPT_FAILED;
             set_detail(ar->detail, sizeof ar->detail,
@@ -856,7 +890,7 @@ static void import_img3_artefact(run_t *r, vm_fw_artefact_t which,
                  r->rep->build);
     } else {
         snprintf(ar->detail, sizeof ar->detail,
-                 "Extracted %llu bytes. S5LBox has no reference hash for "
+                 "Extracted %llu bytes. NEON has no reference hash for "
                  "%s %s, so this is unpacked but unverified.",
                  (unsigned long long)ar->produced,
                  r->rep->product_type, r->rep->build);
@@ -1110,7 +1144,7 @@ static void import_root_filesystem(run_t *r, const vmfw_zip_entry_t *entry,
                  r->rep->product_type, r->rep->build);
     } else {
         snprintf(ar->detail, sizeof ar->detail,
-                 "Produced %llu bytes. S5LBox has no reference hash for "
+                 "Produced %llu bytes. NEON has no reference hash for "
                  "%s %s, so this is unpacked but unverified.",
                  (unsigned long long)ar->produced,
                  r->rep->product_type, r->rep->build);
@@ -1178,14 +1212,22 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     }
 
     /*
-     * The emulator is an S5L8900 machine. An IPSW for anything else will
-     * unpack into files its gate rejects, so the useful answer is the specific
-     * one: what this archive is FOR.
+     * The emulator's own machine is the S5L8900. The iPhone 3GS is the iOS 6
+     * preview machine, and only a caller with a separate place for its files
+     * takes it (vm_fw_import_t.accept_iphone_3gs). An IPSW for anything else
+     * will unpack into files nothing boots, so the useful answer is the
+     * specific one: what this archive is FOR.
      */
-    if (report->platform[0] && strcmp(report->platform, "s5l8900x") != 0) {
+    if (!report->platform[0] || strcmp(report->platform, "s5l8900x") == 0)
+        report->machine = VM_FW_MACHINE_S5L8900;
+    else if (strcmp(report->platform, "s5l8920x") == 0 &&
+             strcmp(report->product_type, "iPhone2,1") == 0)
+        report->machine = VM_FW_MACHINE_IPHONE_3GS;
+    if (report->machine == VM_FW_MACHINE_UNKNOWN ||
+        (report->machine == VM_FW_MACHINE_IPHONE_3GS && !cfg->accept_iphone_3gs)) {
         report->status = VM_FW_ERR_UNSUPPORTED_DEVICE;
         snprintf(report->detail, sizeof report->detail,
-                 "This is %s %s (%s, %s). S5LBox emulates the S5L8900 -- the "
+                 "This is %s %s (%s, %s). NEON emulates the S5L8900 -- the "
                  "iPhone 2G and 3G -- so this firmware will not run on it.",
                  report->product_type, report->build,
                  report->product_version[0] ? report->product_version : "?",
@@ -1200,6 +1242,21 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
         return report->status;
     }
 
+    if (cfg->identified && !cfg->identified(cfg->identified_ctx, report)) {
+        report->status = VM_FW_ERR_OUTPUT_REFUSED;
+        snprintf(report->detail, sizeof report->detail,
+                 "This is %s %s; there is nowhere to put its files.",
+                 report->product_type, report->build);
+        for (int i = 0; i < VM_FW_ARTEFACT_COUNT; i++) {
+            report->artefacts[i].state = VM_FW_STATE_FAILED;
+            report->artefacts[i].reason = VM_FW_ERR_OUTPUT_REFUSED;
+            set_detail(report->artefacts[i].detail,
+                       sizeof report->artefacts[i].detail,
+                       "Not attempted: no destination for this firmware.");
+        }
+        return report->status;
+    }
+
     r.ref = find_reference(report->product_type, report->build);
     report->reference_build = (r.ref != NULL);
 
@@ -1207,6 +1264,8 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
 
     /* Kernel. */
     vmfw_zip_entry_t entry;
+    /* Zeroed: MSVC cannot see that `have` guards every read (C4701). */
+    memset(&entry, 0, sizeof entry);
     bool have = false;
     if (man.kernel_member[0])
         have = (vmfw_zip_find(&r.zip, man.kernel_member, &entry) == VMFW_ZIP_OK);
@@ -1273,6 +1332,21 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     } else if (cancelled(&r)) {
         report->status = VM_FW_ERR_CANCELLED;
         return report->status;
+    } else if (report->machine == VM_FW_MACHINE_IPHONE_3GS &&
+               !vm_fw_build_is_iphone_os_3(report->build)) {
+        /* The iOS 6 preview boots its kernel to the root-device wait and
+         * mounts nothing, and iOS 6's disk image is a format this unpacker
+         * does not read yet -- so it is located and left in the archive
+         * rather than copied out (785 MB for 10B500) only to fail. iPhone OS
+         * 3 for the 3GS (7E18) is the same encrypted disk image as the 3G's,
+         * and that machine mounts it, so it is unpacked like the 3G's. */
+        vm_fw_artefact_report_t *ar = &report->artefacts[VM_FW_ROOT_FILESYSTEM];
+        ar->state = VM_FW_STATE_FOUND;
+        ar->member_size = entry.uncompressed_size;
+        set_detail(ar->member, sizeof ar->member, entry.name);
+        set_detail(ar->detail, sizeof ar->detail,
+                   "Located and left in the IPSW: the iPhone 3GS preview does "
+                   "not mount a root filesystem yet.");
     } else {
         import_root_filesystem(&r, &entry, cfg->keys);
     }
@@ -1357,6 +1431,10 @@ size_t vm_fw_report_render(const vm_fw_report_t *rep, char *out, size_t cap) {
              rep->member_count);
     else
         EMIT("  the manifest could not be read\n");
+    if (rep->machine == VM_FW_MACHINE_IPHONE_3GS)
+        EMIT(vm_fw_build_is_iphone_os_3(rep->build)
+                 ? "  for the iPhone 3GS machine (iPhone OS 3)\n"
+                 : "  for the iPhone 3GS machine (the iOS 6 preview)\n");
 
     if (rep->status != VM_FW_OK)
         EMIT("  STOPPED: %s\n", vm_fw_strerror(rep->status));

@@ -11,7 +11,7 @@
 //
 //  It leads with what it cannot do, because that is the larger half. Every
 //  payload in a 3.x IPSW is encrypted with a key that is not in the archive and
-//  cannot be worked out from it. S5LBox ships no keys, downloads none and
+//  cannot be worked out from it. NEON ships no keys, downloads none and
 //  computes none; where one is needed the screen names the artefact, says what
 //  kind of key it is, and offers a field for the user to paste their own. It
 //  names no source for one, and it never will.

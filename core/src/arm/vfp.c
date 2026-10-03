@@ -79,29 +79,33 @@
  *                      one case inside FZ that the host cannot answer; it is
  *                      detected and refused rather than guessed. See fz_out32.
  *
+ * NaN PROPAGATION is ARM's, not the host's: with DN clear, a signalling NaN
+ * wins over a quiet one regardless of operand order and is quieted by
+ * setting its top fraction bit, and otherwise the first operand wins. The
+ * host (x86 SSE, and arm64) prefers the first operand outright, so f32_do and
+ * f64_do pick the NaN themselves (FPProcessNaNs) rather than inherit that.
+ * This used to be listed below as a deviation; the Unicorn differential test
+ * (tools/unicorn_neon_diff.py) found it in a VNMLS and it was fixed.
+ *
  * KNOWN DEVIATIONS (all of them, deliberately listed)
- *   1. NaN PAYLOAD PROPAGATION ORDER. With DN clear, VFP propagates an input
- *      NaN: a signalling NaN wins over a quiet one regardless of operand order,
- *      and is quieted by setting its top fraction bit. The host (x86 SSE, and
- *      arm64) instead prefers the FIRST operand. So an operation with a quiet
- *      NaN in operand 1 and a signalling NaN in operand 2 yields the same
- *      CLASS of result (a quiet NaN) and the same IOC flag, but possibly a
- *      different payload. Nothing in a boot depends on a NaN payload; code
- *      that did would be relying on behaviour ARM itself documents as
- *      implementation-specific across its own cores. With DN set — which is
- *      how dyld runs — this deviation cannot be observed at all.
- *   2. FPINST / FPINST2 (the bounce registers) and MVFR0 / MVFR1 are not
- *      implemented and reading them traps. We never bounce, so FPINST has no
- *      truthful value; and we have no verified MVFR reading for VFP11, so
- *      answering would be inventing a feature advertisement. XNU 1357 reads
- *      neither.
- *   3. x87 hosts would double-round single-precision arithmetic. Every host
+ *   1. FPINST / FPINST2 (the bounce registers) are not implemented and
+ *      reading them traps: we never bounce, so they have no truthful value.
+ *      On the ARM1176 MVFR0 / MVFR1 trap too, because we have no verified
+ *      MVFR reading for VFP11 and answering would be inventing a feature
+ *      advertisement; XNU 1357 reads neither. The Cortex-A8 profile answers
+ *      them with Unicorn's Cortex-A8 values (arm.h, CORTEX_A8_MVFR0).
+ *   2. x87 hosts would double-round single-precision arithmetic. Every host
  *      this builds for (x86-64 with SSE, arm64) computes binary32 natively.
- *   4. FPSID reports ARM1176_FPSID (0x410120b4), inherited from the CP15
+ *   3. FPSID reports ARM1176_FPSID (0x410120b4), inherited from the CP15
  *      identity block in arm.h. The implementer, "VFPv2 subarchitecture" and
  *      part fields are certain; the variant/revision nibbles are not
  *      independently verified against an ARM1176JZF-S TRM here, and nothing in
- *      XNU 1357 branches on them.
+ *      XNU 1357 branches on them. The Cortex-A8 profile's FPSID, 0x410330c0,
+ *      is Unicorn's, with the same caveat about its low nibbles.
+ *   4. On the Cortex-A8 profile, a short-vector operation whose destination
+ *      partially overlaps a source, or that names d16-d31, is refused (see
+ *      vfp_short_vector_overlap and NO_D32_VECTOR). Short vectors are
+ *      deprecated in ARMv7 and nothing is known to use them there.
  *
  * HOW THE EXCEPTION FLAGS ARE SAMPLED
  *   From the host, via <fenv.h>: feclearexcept before the operation and
@@ -118,11 +122,26 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "vfp.h"
+#include "vfp_private.h"
 
 #include <fenv.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+/*
+ * vfp_ldst carries the whole load/store decode, and the ARMv7 register
+ * numbering pushed it past GCC's inlining limit: out of line it cost the
+ * VFP workload 1.6% more host instructions (cachegrind, cpubench --workload
+ * vfp). It has one caller, so forcing it back inline costs no code size.
+ */
+#if defined(_MSC_VER)
+#  define VFP_ALWAYS_INLINE __forceinline
+#elif defined(__clang__) || defined(__GNUC__)
+#  define VFP_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#  define VFP_ALWAYS_INLINE inline
+#endif
 
 /* ===================================================================== trap */
 
@@ -238,15 +257,15 @@ static inline bool snan64(uint64_t u) {
 
 /* ============================================ host arithmetic + flags ==== */
 
-typedef enum { OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_SQRT } fop_t;
+typedef vfp_op_t fop_t;
+#define OP_ADD  VFP_OP_ADD
+#define OP_SUB  VFP_OP_SUB
+#define OP_MUL  VFP_OP_MUL
+#define OP_DIV  VFP_OP_DIV
+#define OP_SQRT VFP_OP_SQRT
 
-/*
- * A private marker carried alongside the FPSCR exception bits. It is NOT an
- * FPSCR bit (6 is reserved on VFPv2) and never reaches FPSCR: seeing it means
- * flush-to-zero cannot be decided from the host's rounded result and the
- * instruction must trap. See fz_out32.
- */
-#define VFP_FZ_AMBIGUOUS (1u << 6)
+/* VFP_FZ_AMBIGUOUS, the flush-to-zero refusal marker, is in vfp_private.h
+ * because neon.c raises it too. */
 
 #define F32_MIN_NORMAL 0x00800000u
 #define F64_MIN_NORMAL 0x0010000000000000ull
@@ -293,7 +312,10 @@ static double fz_in64(double d, uint32_t *exc) {
 }
 static float fz_out32(float f, uint32_t *exc) {
     uint32_t u = f2u(f), mag = u & 0x7fffffffu;
-    if (mag != 0u && mag < F32_MIN_NORMAL) {
+    /* A zero the host underflowed to (UFC, so the exact result was not
+     * zero) is a tiny result too: flushed, so UFC without IXC. */
+    if ((mag != 0u && mag < F32_MIN_NORMAL) ||
+        (mag == 0u && (*exc & ARM_FPSCR_UFC))) {
         *exc = (*exc & ~ARM_FPSCR_IXC) | ARM_FPSCR_UFC;
         return u2f(u & 0x80000000u);
     }
@@ -302,7 +324,8 @@ static float fz_out32(float f, uint32_t *exc) {
 }
 static double fz_out64(double d, uint32_t *exc) {
     uint64_t u = d2u(d), mag = u & 0x7fffffffffffffffull;
-    if (mag != 0ull && mag < F64_MIN_NORMAL) {
+    if ((mag != 0ull && mag < F64_MIN_NORMAL) ||
+        (mag == 0ull && (*exc & ARM_FPSCR_UFC))) {
         *exc = (*exc & ~ARM_FPSCR_IXC) | ARM_FPSCR_UFC;
         return u2d(u & 0x8000000000000000ull);
     }
@@ -409,6 +432,38 @@ static uint32_t host_exceptions(void) {
 #endif
 
 /*
+ * The NaN an operation returns, when the host's answer was a NaN: ARM ARM
+ * FPProcessNaNs rather than the host's choice. A signalling NaN operand wins
+ * over a quiet one whatever the operand order, then the first operand wins,
+ * and the winner is quieted; with no NaN operand the operation created the
+ * NaN (0/0, inf-inf, 0*inf, sqrt of a negative) and the answer is the
+ * default NaN, which is positive, where x86 creates 0xffc00000. x86 and arm64
+ * both prefer the first operand outright, which is the payload difference
+ * tools/unicorn_neon_diff.py found. Only the value needs fixing: the host
+ * already raised invalid exactly when an operand was signalling, which is
+ * ARM's IOC rule. Called only for a NaN result, so the common path pays one
+ * quiet compare. VSQRT has one operand; `b` is then unused.
+ */
+static float nan_result32(fop_t op, float a, float b) {
+    const uint32_t ua = f2u(a), ub = f2u(b);
+    const bool bnan = op != OP_SQRT && b != b;
+    if (snan32(ua)) return u2f(ua | 0x00400000u);
+    if (bnan && snan32(ub)) return u2f(ub | 0x00400000u);
+    if (a != a) return a;
+    if (bnan) return b;
+    return u2f(F32_DEFAULT_NAN);
+}
+static double nan_result64(fop_t op, double a, double b) {
+    const uint64_t ua = d2u(a), ub = d2u(b);
+    const bool bnan = op != OP_SQRT && b != b;
+    if (snan64(ua)) return u2d(ua | 0x0008000000000000ull);
+    if (bnan && snan64(ub)) return u2d(ub | 0x0008000000000000ull);
+    if (a != a) return a;
+    if (bnan) return b;
+    return u2d(F64_DEFAULT_NAN);
+}
+
+/*
  * One rounding step, with its exception flags captured.
  *
  * The volatile staging is load-bearing, twice over. It anchors the arithmetic
@@ -439,15 +494,18 @@ static float f32_do(fop_t op, float a, float b, uint32_t fpscr, uint32_t *exc) {
              * Operation: IOC must be set and the result is the Default
              * NaN. The host's sqrt does not reliably raise FE_INVALID
              * for this, so raise it explicitly rather than depending on
-             * a libm detail. -0 and NaN both compare false here, which
-             * is correct: sqrt(-0) is -0 and quiet NaNs propagate.  */
-            if (x < 0.0f) e |= ARM_FPSCR_IOC;
+             * a libm detail. isless, not "<": "<" is a SIGNALLING
+             * comparison (comiss on x86, fcmpe on arm64), and asked of a
+             * quiet NaN it raises the host's invalid flag, which is how
+             * sqrt of a quiet NaN used to come back with IOC. */
+            if (isless(x, 0.0f)) e |= ARM_FPSCR_IOC;
             r = sqrtf(x);
             break;
     }
     vr = r;
     e |= host_exceptions();
     r  = vr;
+    if (r != r) r = nan_result32(op, a, b);
     if (fpscr & ARM_FPSCR_FZ) r = fz_out32(r, &e);
     *exc |= e;
     return dn_out32(r, fpscr);
@@ -468,19 +526,14 @@ static double f64_do(fop_t op, double a, double b, uint32_t fpscr, uint32_t *exc
         case OP_MUL: r = x * y;   break;
         case OP_DIV: r = x / y;   break;
         default:
-            /* VSQRT of a negative operand other than -0 is an Invalid
-             * Operation: IOC must be set and the result is the Default
-             * NaN. The host's sqrt does not reliably raise FE_INVALID
-             * for this, so raise it explicitly rather than depending on
-             * a libm detail. -0 and NaN both compare false here, which
-             * is correct: sqrt(-0) is -0 and quiet NaNs propagate.  */
-            if (x < 0.0) e |= ARM_FPSCR_IOC;
+            if (isless(x, 0.0)) e |= ARM_FPSCR_IOC;   /* see f32_do */
             r = sqrt(x);
             break;
     }
     vr = r;
     e |= host_exceptions();
     r  = vr;
+    if (r != r) r = nan_result64(op, a, b);
     if (fpscr & ARM_FPSCR_FZ) r = fz_out64(r, &e);
     *exc |= e;
     return dn_out64(r, fpscr);
@@ -534,6 +587,36 @@ static uint32_t fp_to_int(double v, bool is_signed, bool round_to_zero,
     return (uint32_t)r;
 }
 
+/*
+ * ARM ARM FPToFixed with round_zero: the value scaled by 2^frac, truncated,
+ * and saturated to a `size`-bit integer, returned sign- or zero-extended to
+ * 32 bits. The same flag rules as fp_to_int: NaN gives 0 and IOC, saturation
+ * gives IOC and not IXC. The scaling is exact (a power of two, at most 2^32,
+ * applied in binary64 to a value that was binary32 or binary64), so the only
+ * rounding is the truncation.
+ */
+static uint32_t fp_to_fixed(double v, unsigned size, unsigned frac,
+                            bool is_signed, uint32_t *exc) {
+    double r;
+    if (v != v) { *exc |= ARM_FPSCR_IOC; return 0; }
+    v = ldexp(v, (int)frac);
+    r = trunc(v);
+    if (is_signed) {
+        const double hi = ldexp(1.0, (int)size - 1);
+        if (r >= hi)  { *exc |= ARM_FPSCR_IOC; return (uint32_t)(int32_t)(hi - 1.0); }
+        if (r < -hi)  { *exc |= ARM_FPSCR_IOC; return (uint32_t)(int32_t)-hi; }
+        if (r != v) *exc |= ARM_FPSCR_IXC;
+        return (uint32_t)(int32_t)r;
+    }
+    {
+        const double hi = ldexp(1.0, (int)size);
+        if (r >= hi)  { *exc |= ARM_FPSCR_IOC; return (uint32_t)(hi - 1.0); }
+        if (r < 0.0)  { *exc |= ARM_FPSCR_IOC; return 0u; }
+        if (r != v) *exc |= ARM_FPSCR_IXC;
+        return (uint32_t)r;
+    }
+}
+
 /* The four comparison flags, ARM ARM FPCompare. Note these land in FPSCR, not
  * CPSR: the guest moves them across with "VMRS APSR_nzcv, FPSCR". */
 static uint32_t cmp_flags_ordered(int order) {
@@ -548,15 +631,28 @@ static uint32_t cmp_flags_ordered(int order) {
 /* ================================================== register numbering ==== */
 
 /*
- * The D/N/M bits (23:22 is D, 7 is N, 5 is M) are the LOW bit of a
+ * The D/N/M bits (bit 22 is D, 7 is N, 5 is M) are the LOW bit of a
  * single-precision register number and the HIGH bit of a double-precision one.
- * VFPv2 has only d0-d15, so a set high bit names a register the ARM1176 does
- * not have; refusing is the only truthful answer, and it is also the one that
- * catches a decode mistake of ours instead of aliasing it onto d0-d15.
+ * VFPv2 has only d0-d15, so on the ARM1176 a set high bit names a register
+ * the part does not have; refusing is the only truthful answer, and it is
+ * also the one that catches a decode mistake of ours instead of aliasing it
+ * onto d0-d15. The Cortex-A8's VFPv3-D32 has d16-d31, and there the bit is
+ * simply the top of the register number (DREG).
  */
 #define BIT(i)   ((insn >> (i)) & 1u)
 #define FIELD(hi) ((insn >> (hi)) & 0xfu)
 #define SREG(f4, lo) (((f4) << 1) | (lo))
+#define DREG(f4, hi) (((hi) << 4) | (f4))
+#define NO_D32 "d16-d31 do not exist on VFPv2"
+
+/* d16-d31 exist: VFPv3-D32, the ARMv7 profiles. */
+static inline bool vfp_d32(const arm_cpu_t *c) { return arm_arch_is_v7(c->arch); }
+
+/* Short vectors over d16-d31. The ARM1176 cannot name them, and where the
+ * architecture puts the Cortex-A8's bank boundaries up there is not something
+ * this file has a reading for, so a short-vector double-precision operation
+ * that touches one is refused rather than given a guessed bank layout. */
+#define NO_D32_VECTOR "short vectors over d16-d31 are not modelled"
 
 /* ------------------------------------------------ legacy short vectors --
  *
@@ -633,6 +729,31 @@ static unsigned vfp_short_vector_reg(const vfp_short_vector_t *shape,
            ((reg + lane * shape->stride) & shape->bank_mask);
 }
 
+/*
+ * True when a later element reads a register an earlier element of the same
+ * instruction writes: destination and source vectors that overlap other than
+ * exactly. The architecture leaves that UNPREDICTABLE, and the two plausible
+ * answers differ (this unit reads every operand before writing any result;
+ * an element-by-element machine would feed the new value forward). The
+ * ARMv7 profiles refuse it, per this file's fail-closed rule. The ARM1176
+ * keeps the read-everything-first answer it has always given, because
+ * iPhone OS 3 runs on it and refusing there is a behaviour change nothing
+ * has yet called for. `rm_used` is false for the one-operand forms.
+ */
+static bool vfp_short_vector_overlap(const vfp_short_vector_t *shape,
+                                     unsigned rd, unsigned rn, bool rn_used,
+                                     unsigned rm, bool rm_used) {
+    for (unsigned i = 0; i < shape->count; i++) {
+        const unsigned d = vfp_short_vector_reg(shape, rd, i, false);
+        for (unsigned j = i + 1u; j < shape->count; j++) {
+            if (rn_used && vfp_short_vector_reg(shape, rn, j, false) == d) return true;
+            if (rm_used && vfp_short_vector_reg(shape, rm, j, true) == d) return true;
+        }
+    }
+    return false;
+}
+#define OVERLAP_WHY "short-vector destination partially overlaps a source: UNPREDICTABLE"
+
 /* ================================================= load / store group ==== *
  *
  * cond 110 P U D W L Rn Vd 101 sz imm8   (ARM ARM A7.6, "Extension register
@@ -647,8 +768,9 @@ static unsigned vfp_short_vector_reg(const vfp_short_vector_t *shape,
  * and increment-after writeback forms with Rn == sp, and fall out of this
  * decode for free. _vfp_switch's VLDMIA r1!, {s0-s31} is the 0b01x11 row.
  */
-static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
-                             const vfp_bus_t *bus) {
+static VFP_ALWAYS_INLINE arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc,
+                                               uint32_t insn,
+                                               const vfp_bus_t *bus) {
     bool     P = BIT(24), U = BIT(23), D = BIT(22), W = BIT(21), L = BIT(20);
     unsigned rn = FIELD(16), vd = FIELD(12);
     bool     dbl = BIT(8);
@@ -664,7 +786,13 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
      * UNPREDICTABLE and we will not guess which of the two plausible
      * behaviours a given core picked. */
     if (rn == 15u) {
-        if (W || !P) return vfp_trap(pc, insn, "PC as a writeback/VLDM base is UNPREDICTABLE");
+        /* ARMv7 does define VLDM/VSTM IA from the PC without writeback in
+         * ARM state (deprecated); in Thumb, and on the ARM1176, it stays
+         * refused. */
+        const bool v7_arm_ia = !P && !W && arm_arch_is_v7(c->arch) &&
+                               (c->cpsr & ARM_CPSR_T) == 0u;
+        if ((W || !P) && !v7_arm_ia)
+            return vfp_trap(pc, insn, "PC as a writeback/VLDM base is UNPREDICTABLE");
         base = pc + 8u;                                    /* Align(PC,4)    */
     } else {
         base = c->r[rn];
@@ -674,7 +802,8 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
     if (P && !W) {
         addr = U ? base + imm8 * 4u : base - imm8 * 4u;
         if (dbl) {
-            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            if (D && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            vd = DREG(vd, D);
             if (L) {
                 uint32_t lo = bus->read32(c, addr);
                 if (c->abort_pending) return ARM_OK;
@@ -703,8 +832,8 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
     if (imm8 == 0u) return vfp_trap(pc, insn, "VLDM/VSTM with an empty register list");
 
     if (dbl) {
-        if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-        first = vd;
+        if (D && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+        first = DREG(vd, D);
         count = imm8 / 2u;
         /*
          * An ODD imm8 is the deprecated VFPv2 FLDMX/FSTMX format: it moves
@@ -714,8 +843,12 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
          * extra word reads as ignored and writes as zero, which is within what
          * the architecture leaves UNKNOWN.
          */
-        if (first + count > 16u)
-            return vfp_trap(pc, insn, "register list runs past d15");
+        if (count == 0u || count > 16u)
+            return vfp_trap(pc, insn,
+                "VLDM/VSTM of no doubles, or of more than 16, is UNPREDICTABLE");
+        if (first + count > (vfp_d32(c) ? 32u : 16u))
+            return vfp_trap(pc, insn, vfp_d32(c) ? "register list runs past d31"
+                                                 : "register list runs past d15");
     } else {
         first = SREG(vd, D);
         count = imm8;
@@ -756,8 +889,13 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
      * really does span imm8*4 bytes, so a list that straddles a page boundary
      * must fault the same way hardware would — but its value is architecturally
      * UNKNOWN, so it is discarded on load and written as zero on store.
+     *
+     * ARMv7 is different: its VLDM/VSTM pseudocode moves imm8 DIV 2
+     * doublewords and never touches the extra word, which only the
+     * writeback covers. The Cortex-A8 profile follows that (and so does
+     * Unicorn's Cortex-A8, against which it was compared).
      */
-    if (dbl && (imm8 & 1u)) {
+    if (dbl && (imm8 & 1u) && !arm_arch_is_v7(c->arch)) {
         if (L) (void)bus->read32(c, addr + count * 8u);
         else   bus->write32(c, addr + count * 8u, 0u);
         if (c->abort_pending) return ARM_OK;
@@ -777,8 +915,112 @@ static arm_status_t vfp_ldst(arm_cpu_t *c, uint32_t pc, uint32_t insn,
  *
  * The cp11 word transfers are VFPv2 instructions on VFP11, despite modern
  * disassemblers spelling them with the same lane syntax used by NEON. Only
- * the 32-bit low/high halves exist here; the 8/16-bit scalar forms are NEON.
+ * the 32-bit low/high halves exist there; the 8/16-bit scalar forms and VDUP
+ * are Advanced SIMD, which only the ARMv7 profiles have (vfp_xfer_simd).
  */
+
+/*
+ * ARMv7 Advanced SIMD in the cp11 MCR/MRC space (ARM ARM A7.8):
+ *   cond 1110 0 opc1<1:0> 0 Vd Rt 1011 D opc2<1:0> 1 0000   VMOV Dd[x], Rt
+ *   cond 1110 U opc1<1:0> 1 Vn Rt 1011 N opc2<1:0> 1 0000   VMOV Rt, Dn[x]
+ *   cond 1110 1 B Q 0     Vd Rt 1011 D 0 E 1 0000          VDUP Qd/Dd, Rt
+ * opc1:opc2 is 1xxx for a byte (index opc1<0>:opc2), 0xx1 for a halfword
+ * (index opc1<0>:opc2<1>); the word form is VFP's and is handled above.
+ */
+static arm_status_t vfp_xfer_simd(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    const bool L = BIT(20);
+    const unsigned rt = FIELD(12), dn = DREG(FIELD(16), BIT(7));
+    const uint32_t r = c->r[rt];
+
+    if ((insn & 0xfu) != 0u)
+        return vfp_trap(pc, insn, "reserved bits set in an Advanced SIMD scalar transfer");
+    if (rt == 15u)
+        return vfp_trap(pc, insn, "PC as a scalar transfer register is UNPREDICTABLE");
+
+    if (!L && BIT(23)) {                                        /* VDUP */
+        const unsigned be = (BIT(22) << 1) | BIT(5);
+        const bool q = BIT(21);
+        uint64_t v;
+        if (BIT(6) || be == 3u)
+            return vfp_trap(pc, insn, "UNDEFINED VDUP (core register) encoding");
+        if (q && (dn & 1u))
+            return vfp_trap(pc, insn, "VDUP to an odd-numbered Q register is UNDEFINED");
+        if (be == 0u)      v = (uint64_t)r * 0x0000000100000001ull;
+        else if (be == 1u) v = (uint64_t)(r & 0xffffu) * 0x0001000100010001ull;
+        else               v = (uint64_t)(r & 0xffu) * 0x0101010101010101ull;
+        vfp_set_d(c, dn, v);
+        if (q) vfp_set_d(c, dn + 1u, v);
+        return ARM_OK;
+    }
+
+    const unsigned opc1 = (insn >> 21) & 3u, opc2 = (insn >> 5) & 3u;
+    unsigned esize, index;
+    if (opc1 & 2u)      { esize = 8u;  index = ((opc1 & 1u) << 2) | opc2; }
+    else if (opc2 & 1u) { esize = 16u; index = ((opc1 & 1u) << 1) | (opc2 >> 1); }
+    else return vfp_trap(pc, insn, "UNDEFINED Advanced SIMD scalar transfer");
+
+    const unsigned shift = index * esize;
+    const uint64_t mask = ((1ull << esize) - 1u) << shift;
+    uint64_t d = vfp_get_d(c, dn);
+    if (L) {
+        uint32_t e = (uint32_t)((d & mask) >> shift);
+        if (!BIT(23))                                         /* U == 0: signed */
+            e = esize == 8u ? (uint32_t)(int32_t)(int8_t)e
+                            : (uint32_t)(int32_t)(int16_t)e;
+        c->r[rt] = e;
+    } else {
+        d = (d & ~mask) | (((uint64_t)r << shift) & mask);
+        vfp_set_d(c, dn, d);
+    }
+    return ARM_OK;
+}
+
+/*
+ * VMRS / VMSR on the ARMv7 profiles. Every register but FPSCR is privileged
+ * (Unicorn's Cortex-A8 refuses them all in User mode, FPSID included, where
+ * VFPv2 let User mode read FPSID); MVFR0 and MVFR1 exist; a VMSR to FPSID is
+ * ignored rather than refused; and FPEXC keeps only EN. That last is QEMU's
+ * Cortex-A8 as Unicorn 2.1.4 reads it back: the A8 has no floating-point
+ * exception trapping (MVFR0[15:12] is 0), so EX, which reports a bounced
+ * instruction, has nothing to report.
+ */
+static arm_status_t vfp_sysreg_v7(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    const bool L = BIT(20);
+    const unsigned vn = FIELD(16), rt = FIELD(12);
+
+    if (vn != 1u && (c->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR)
+        return vfp_guest_undefined("VFP system registers other than FPSCR are privileged");
+    if (L) {
+        uint32_t v;
+        if (rt == 15u && vn != 1u)
+            return vfp_trap(pc, insn,
+                "Rt=PC is defined only for VMRS APSR_nzcv, FPSCR");
+        switch (vn) {
+            case 0: v = CORTEX_A8_FPSID; break;
+            case 1: v = c->vfp_fpscr;    break;
+            case 6: v = CORTEX_A8_MVFR1; break;
+            case 7: v = CORTEX_A8_MVFR0; break;
+            case 8: v = c->vfp_fpexc;    break;
+            default:
+                return vfp_trap(pc, insn,
+                    "VMRS of a VFP system register this unit does not implement "
+                    "(FPINST/FPINST2)");
+        }
+        if (rt == 15u) c->cpsr = (c->cpsr & 0x0fffffffu) | (v & 0xf0000000u);
+        else           c->r[rt] = v;
+        return ARM_OK;
+    }
+    if (rt == 15u) return vfp_trap(pc, insn, "PC as a VMSR source is UNPREDICTABLE");
+    switch (vn) {
+        case 0: return ARM_OK;                            /* FPSID: ignored */
+        case 1: c->vfp_fpscr = c->r[rt] & ARM_FPSCR_WMASK_V7; return ARM_OK;
+        case 8: c->vfp_fpexc = c->r[rt] & ARM_FPEXC_EN;       return ARM_OK;
+        default:
+            return vfp_trap(pc, insn,
+                "VMSR of a VFP system register this unit does not implement");
+    }
+}
+
 static arm_status_t vfp_xfer32(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     unsigned opc1 = (insn >> 21) & 7u;
     bool     L    = BIT(20);
@@ -795,25 +1037,35 @@ static arm_status_t vfp_xfer32(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         return ARM_OK;
     }
 
-    if (cp11 && opc1 <= 1u) {                       /* VMOV Dn word <-> Rt   */
-        unsigned sn;
-        if (BIT(7)) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-        if ((insn & 0x0000006fu) != 0u)
-            return vfp_trap(pc, insn,
-                "not a VFPv2 32-bit double-register word transfer");
+    if (cp11 && opc1 <= 1u && (insn & 0x0000006fu) == 0u) { /* Dn word <-> Rt */
+        unsigned dn;
+        uint64_t d;
+        if (BIT(7) && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
         if (rt == 15u) return vfp_trap(pc, insn, "PC as VMOV core register is UNPREDICTABLE");
-        sn = SREG(vn, opc1);                        /* Dn[31:0]/[63:32] */
-        if (L) c->r[rt] = vfp_get_s(c, sn);
-        else   vfp_set_s(c, sn, c->r[rt]);
+        dn = DREG(vn, BIT(7));
+        d = vfp_get_d(c, dn);
+        if (L) {
+            c->r[rt] = (uint32_t)(d >> (opc1 * 32u));     /* Dn[31:0]/[63:32] */
+        } else {
+            d = opc1 ? (d & 0x00000000ffffffffull) | ((uint64_t)c->r[rt] << 32)
+                     : (d & 0xffffffff00000000ull) | c->r[rt];
+            vfp_set_d(c, dn, d);
+        }
         return ARM_OK;
     }
 
-    if (cp11)
+    if (cp11) {
+        if (arm_arch_is_v7(c->arch)) return vfp_xfer_simd(c, pc, insn);
+        if (opc1 <= 1u)
+            return vfp_trap(pc, insn,
+                "not a VFPv2 32-bit double-register word transfer");
         return vfp_trap(pc, insn, "Advanced SIMD scalar transfer (no NEON on VFP11)");
+    }
     if (opc1 != 7u)
         return vfp_trap(pc, insn, "UNDEFINED VFPv2 32-bit core-register transfer");
     if ((insn & 0x000000efu) != 0u)
         return vfp_trap(pc, insn, "reserved bits set in VMRS/VMSR");
+    if (arm_arch_is_v7(c->arch)) return vfp_sysreg_v7(c, pc, insn);
     if (vn == 8u && (c->cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR)
         return vfp_guest_undefined("FPEXC is privileged");
     if (vn == 0u && !vfp_enabled(c) &&
@@ -871,13 +1123,18 @@ static arm_status_t vfp_xfer64(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     bool     L   = BIT(20), dbl = BIT(8), M = BIT(5);
     unsigned rt2 = FIELD(16), rt = FIELD(12), vm = insn & 0xfu;
 
-    if ((insn & 0x000000c0u) != 0u)
-        return vfp_trap(pc, insn, "reserved bits set in VMOV (two core registers)");
+    /* Bits 7:6 are 00 and bit 4 is 1; bit 4 clear is UNDEFINED, not this
+     * instruction (the Unicorn differential test found it accepted). */
+    if ((insn & 0x000000d0u) != 0x00000010u)
+        return vfp_trap(pc, insn, "UNDEFINED VMOV (two core registers) encoding");
     if (rt == 15u || rt2 == 15u)
         return vfp_trap(pc, insn, "PC as a VMOV core register is UNPREDICTABLE");
+    if (L && rt == rt2)
+        return vfp_trap(pc, insn, "VMOV to one core register twice is UNPREDICTABLE");
 
     if (dbl) {
-        if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+        if (M && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+        vm = DREG(vm, M);
         if (L) {
             uint64_t v = vfp_get_d(c, vm);
             c->r[rt]  = (uint32_t)v;
@@ -908,10 +1165,7 @@ enum {
     A_VMLA, A_VMLS, A_VNMLS, A_VNMLA, A_VMUL, A_VNMUL, A_VADD, A_VSUB, A_VDIV
 };
 
-#define FZ_AMBIGUOUS_WHY                                                      \
-    "flush-to-zero cannot be decided: the exact result straddles the smallest " \
-    "normal, and the architecture tests it before rounding while the host " \
-    "reports it after"
+#define FZ_AMBIGUOUS_WHY VFP_FZ_AMBIGUOUS_WHY
 
 /* The three-operand arithmetic group: opc1 (bits 23,21,20) selects the family
  * and opc3<0> (bit 6) the variant. Bit 22 is D, not part of the opcode. */
@@ -934,16 +1188,19 @@ static arm_status_t vfp_dp_arith(arm_cpu_t *c, uint32_t pc, uint32_t insn,
             break;
         default:
             return vfp_trap(pc, insn,
-                "VFPv4 fused multiply-accumulate; the VFP11 has no FMA");
+                "VFPv4 fused multiply-accumulate; neither the VFP11 nor the "
+                "Cortex-A8 has FMA");
     }
 
     bad = c->vfp_fpscr & MODE_ROUNDING;
     if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
 
     if (dbl) {
-        if (BIT(22) || BIT(7) || BIT(5))
-            return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-        rd = FIELD(12); rn = FIELD(16); rm = insn & 0xfu;
+        if ((BIT(22) || BIT(7) || BIT(5)) && !vfp_d32(c))
+            return vfp_trap(pc, insn, NO_D32);
+        rd = DREG(FIELD(12), BIT(22));
+        rn = DREG(FIELD(16), BIT(7));
+        rm = DREG(insn & 0xfu, BIT(5));
     } else {
         rd = SREG(FIELD(12), BIT(22));
         rn = SREG(FIELD(16), BIT(7));
@@ -951,6 +1208,11 @@ static arm_status_t vfp_dp_arith(arm_cpu_t *c, uint32_t pc, uint32_t insn,
     }
     if (!vfp_short_vector_shape(c->vfp_fpscr, dbl, rd, &shape, &why))
         return vfp_trap(pc, insn, why);
+    if (dbl && shape.vector && ((rd | rn | rm) & 16u))
+        return vfp_trap(pc, insn, NO_D32_VECTOR);
+    if (shape.vector && arm_arch_is_v7(c->arch) &&
+        vfp_short_vector_overlap(&shape, rd, rn, true, rm, true))
+        return vfp_trap(pc, insn, OVERLAP_WHY);
 
     if (dbl) {
         uint32_t fs = c->vfp_fpscr;
@@ -1020,6 +1282,108 @@ static arm_status_t vfp_dp_arith(arm_cpu_t *c, uint32_t pc, uint32_t insn,
 }
 
 /*
+ * VMOV (immediate), VFPv3: cond 1110 1D11 imm4H Vd 101 sz (0)0(0)0 imm4L.
+ * The constant is ARM ARM VFPExpandImm: sign, then an exponent of NOT(b6)
+ * followed by copies of b6 and imm8<5:4>, then imm8<3:0> at the top of the
+ * fraction. It is a short-vector operation like VMOV (register): each element
+ * of a vector destination receives the constant.
+ */
+static arm_status_t vfp_vmov_imm(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    const bool dbl = BIT(8);
+    const uint32_t imm8 = (FIELD(16) << 4) | (insn & 0xfu);
+    const uint32_t b6 = (imm8 >> 6) & 1u;
+    vfp_short_vector_t shape;
+    const char *why = NULL;
+    unsigned rd;
+
+    if ((insn & 0x000000a0u) != 0u)
+        return vfp_trap(pc, insn, "reserved bits set in VMOV (immediate)");
+    rd = dbl ? DREG(FIELD(12), BIT(22)) : SREG(FIELD(12), BIT(22));
+    if (!vfp_short_vector_shape(c->vfp_fpscr, dbl, rd, &shape, &why))
+        return vfp_trap(pc, insn, why);
+    if (dbl && shape.vector && (rd & 16u))
+        return vfp_trap(pc, insn, NO_D32_VECTOR);
+    if (dbl) {
+        const uint64_t v = ((uint64_t)(imm8 >> 7) << 63) | ((uint64_t)(b6 ^ 1u) << 62)
+                         | ((b6 ? 0xffull : 0ull) << 54)
+                         | ((uint64_t)(imm8 & 0x3fu) << 48);
+        for (unsigned lane = 0; lane < shape.count; lane++)
+            vfp_set_d(c, vfp_short_vector_reg(&shape, rd, lane, false), v);
+    } else {
+        const uint32_t v = ((imm8 >> 7) << 31) | ((b6 ^ 1u) << 30)
+                         | ((b6 ? 0x1fu : 0u) << 25) | ((imm8 & 0x3fu) << 19);
+        for (unsigned lane = 0; lane < shape.count; lane++)
+            vfp_set_s(c, vfp_short_vector_reg(&shape, rd, lane, false), v);
+    }
+    return ARM_OK;
+}
+
+/*
+ * VCVT between floating point and fixed point, VFPv3:
+ *   cond 1110 1D11 1 op 1 U Vd 101 sf sx 1 i 0 imm4
+ * One register is both source and destination. sx picks a 16- or 32-bit
+ * fixed-point value, and frac_bits = size - imm4:i. To fixed point rounds
+ * toward zero and saturates (FPToFixed); from fixed point rounds as
+ * FPSCR.RMode says (FixedToFP), which vfp_execute has already put on the
+ * host. Scalar only: short vectors do not apply to conversions.
+ */
+static arm_status_t vfp_cvt_fixed(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
+    const unsigned opc2 = FIELD(16);
+    const bool to_fixed = (opc2 & 4u) != 0u, is_unsigned = (opc2 & 1u) != 0u;
+    const bool dbl = BIT(8);
+    const unsigned size = BIT(7) ? 32u : 16u;
+    const unsigned imm5 = ((insn & 0xfu) << 1) | BIT(5);
+    const unsigned reg = dbl ? DREG(FIELD(12), BIT(22)) : SREG(FIELD(12), BIT(22));
+    uint32_t exc = 0, bad;
+
+    if (imm5 > size)
+        return vfp_trap(pc, insn,
+            "VCVT fixed-point with fewer than zero fraction bits is UNPREDICTABLE");
+    bad = c->vfp_fpscr & MODE_ROUNDING;
+    if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
+
+    if (to_fixed) {
+        double v;
+        uint32_t r;
+        if (dbl) {
+            v = u2d(vfp_get_d(c, reg));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) v = fz_in64(v, &exc);
+        } else {
+            float f = u2f(vfp_get_s(c, reg));
+            if (c->vfp_fpscr & ARM_FPSCR_FZ) f = fz_in32(f, &exc);
+            v = (double)f;
+        }
+        r = fp_to_fixed(v, size, size - imm5, !is_unsigned, &exc);
+        if (dbl) vfp_set_d(c, reg, is_unsigned ? (uint64_t)r
+                                               : (uint64_t)(int64_t)(int32_t)r);
+        else     vfp_set_s(c, reg, r);
+    } else {
+        const uint32_t raw = dbl ? (uint32_t)vfp_get_d(c, reg) : vfp_get_s(c, reg);
+        int64_t iv;
+        double exact;
+        if (size == 16u) iv = is_unsigned ? (int64_t)(raw & 0xffffu)
+                                          : (int64_t)(int16_t)raw;
+        else             iv = is_unsigned ? (int64_t)raw : (int64_t)(int32_t)raw;
+        /* Exact in binary64: at most 32 significant bits, scaled by a power
+         * of two no smaller than 2^-32. A zero is +0, as FixedToFP says. */
+        exact = ldexp((double)iv, -(int)(size - imm5));
+        if (dbl) {
+            vfp_set_d(c, reg, d2u(exact));
+        } else {
+            volatile float vr;
+            {   volatile double vs = exact; double x;
+                host_exceptions_clear();
+                x = vs; vr = (float)x;
+                exc |= host_exceptions();
+            }
+            vfp_set_s(c, reg, f2u(vr));
+        }
+    }
+    c->vfp_fpscr |= exc;
+    return ARM_OK;
+}
+
+/*
  * The "other" group: opc1 == 1x11 with opc3<0> == 1, keyed by opc2 (bits
  * 19:16) and opc3 (bits 7:6). This is where the unary operations, the
  * comparisons and every conversion live.
@@ -1045,13 +1409,18 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
 
         if (dbl) {
-            if (D || M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-            rd = vd; rm = vm;
+            if ((D || M) && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            rd = DREG(vd, D); rm = DREG(vm, M);
         } else {
             rd = SREG(vd, D); rm = SREG(vm, M);
         }
         if (!vfp_short_vector_shape(c->vfp_fpscr, dbl, rd, &shape, &why))
             return vfp_trap(pc, insn, why);
+        if (dbl && shape.vector && ((rd | rm) & 16u))
+            return vfp_trap(pc, insn, NO_D32_VECTOR);
+        if (shape.vector && arm_arch_is_v7(c->arch) &&
+            vfp_short_vector_overlap(&shape, rd, 0u, false, rm, true))
+            return vfp_trap(pc, insn, OVERLAP_WHY);
         if (dbl) {
             uint64_t result[4];
             for (unsigned lane = 0; lane < shape.count; lane++) {
@@ -1104,8 +1473,8 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             return vfp_trap(pc, insn, "VCMP #0.0 with a non-zero Vm field");
 
         if (dbl) {
-            if (D || M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-            rd = vd; rm = vm;
+            if ((D || M) && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            rd = DREG(vd, D); rm = DREG(vm, M);
         } else {
             rd = SREG(vd, D); rm = SREG(vm, M);
         }
@@ -1152,8 +1521,8 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             volatile float vr;
             float r;
             double s;
-            if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-            s = u2d(vfp_get_d(c, vm));
+            if (M && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            s = u2d(vfp_get_d(c, DREG(vm, M)));
             if (c->vfp_fpscr & ARM_FPSCR_FZ) s = fz_in64(s, &exc);
             {   volatile double vs = s; double x;
                 host_exceptions_clear();
@@ -1167,7 +1536,7 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         } else {                                     /* VCVT.F64.F32        */
             volatile double vr;
             float s;
-            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
+            if (D && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
             s = u2f(vfp_get_s(c, SREG(vm, M)));
             if (c->vfp_fpscr & ARM_FPSCR_FZ) s = fz_in32(s, &exc);
             {   volatile float vs = s; float x;
@@ -1177,7 +1546,7 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
             }
             /* Widening a binary32 into a binary64 can never produce a
              * denormal, so there is no output flush to consider here. */
-            vfp_set_d(c, vd, d2u(dn_out64(vr, c->vfp_fpscr)));
+            vfp_set_d(c, DREG(vd, D), d2u(dn_out64(vr, c->vfp_fpscr)));
         }
         c->vfp_fpscr |= exc;
         return ARM_OK;
@@ -1203,8 +1572,8 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
 
         raw = vfp_get_s(c, SREG(vm, M));
         if (dbl) {
-            if (D) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-            vfp_set_d(c, vd, d2u(top ? (double)(int32_t)raw : (double)raw));
+            if (D && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            vfp_set_d(c, DREG(vd, D), d2u(top ? (double)(int32_t)raw : (double)raw));
         } else {
             double exact = top ? (double)(int32_t)raw : (double)raw;
             volatile float vr;
@@ -1240,8 +1609,8 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
         if (bad) return vfp_trap(pc, insn, mode_complaint(bad));
 
         if (dbl) {
-            if (M) return vfp_trap(pc, insn, "d16-d31 do not exist on VFPv2");
-            v = u2d(vfp_get_d(c, vm));
+            if (M && !vfp_d32(c)) return vfp_trap(pc, insn, NO_D32);
+            v = u2d(vfp_get_d(c, DREG(vm, M)));
             if (c->vfp_fpscr & ARM_FPSCR_FZ) v = fz_in64(v, &exc);
         } else {
             float s = u2f(vfp_get_s(c, SREG(vm, M)));
@@ -1257,9 +1626,12 @@ static arm_status_t vfp_dp_other(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     }
 
     case 2u: case 3u:
-        return vfp_trap(pc, insn, "VCVTB/VCVTT half-precision; VFPv3 only");
+        return vfp_trap(pc, insn,
+            "VCVTB/VCVTT half precision; neither the VFP11 nor the Cortex-A8 "
+            "has the half-precision extension");
     case 10u: case 11u: case 14u: case 15u:
-        return vfp_trap(pc, insn, "VCVT fixed-point; VFPv3 only");
+        if (!vfp_d32(c)) return vfp_trap(pc, insn, "VCVT fixed-point; VFPv3 only");
+        return vfp_cvt_fixed(c, pc, insn);
     default:
         return vfp_trap(pc, insn, "UNDEFINED VFP data-processing opcode");
     }
@@ -1269,9 +1641,193 @@ static arm_status_t vfp_dp(arm_cpu_t *c, uint32_t pc, uint32_t insn) {
     unsigned op = (BIT(23) << 2) | (BIT(21) << 1) | BIT(20);
     if (op == 7u) {
         if (BIT(6)) return vfp_dp_other(c, pc, insn);
-        return vfp_trap(pc, insn, "VMOV (immediate); VFPv3 only");
+        if (!vfp_d32(c)) return vfp_trap(pc, insn, "VMOV (immediate); VFPv3 only");
+        return vfp_vmov_imm(c, pc, insn);
     }
     return vfp_dp_arith(c, pc, insn, op);
+}
+
+/* =============================== the cached interpreter's scalar path ==
+ *
+ * vfp_dp_arith and vfp_dp_other with shape.count == 1, decoded once. The
+ * decode accepts exactly the encodings those two execute (the same field
+ * extraction, the same d16-d31 and VCMP #0 refusals); the execution gate
+ * sends everything that is not the plain scalar case -- a trap enable, a
+ * directed rounding mode, any LEN or STRIDE, VFP not usable -- back to
+ * vfp_execute. test_ci_diff runs both against each other.
+ */
+bool vfp_fast_decode_dp(uint32_t insn, unsigned *form, bool *dbl,
+                        unsigned *d, unsigned *n, unsigned *m) {
+    if ((insn & 0x0f000e10u) != 0x0e000a00u) return false;          /* CDP */
+    const bool wide = BIT(8), alt = BIT(6);
+    const unsigned op = (BIT(23) << 2) | (BIT(21) << 1) | BIT(20);
+    unsigned f;
+    if (op <= 4u) {
+        static const uint8_t pick[5][2] = {
+            { VFP_FAST_MLA,  VFP_FAST_MLS },  { VFP_FAST_NMLS, VFP_FAST_NMLA },
+            { VFP_FAST_MUL,  VFP_FAST_NMUL }, { VFP_FAST_ADD,  VFP_FAST_SUB },
+            { VFP_FAST_DIV,  0xffu },
+        };
+        f = pick[op][alt];
+        if (f == 0xffu) return false;
+        if (wide) {
+            if (BIT(22) || BIT(7) || BIT(5)) return false;
+            *d = FIELD(12); *n = FIELD(16); *m = insn & 0xfu;
+        } else {
+            *d = SREG(FIELD(12), BIT(22));
+            *n = SREG(FIELD(16), BIT(7));
+            *m = SREG(insn & 0xfu, BIT(5));
+        }
+    } else if (op == 7u && alt) {
+        const unsigned opc2 = FIELD(16), vd = FIELD(12), vm = insn & 0xfu;
+        const bool top = BIT(7), D = BIT(22), M = BIT(5);
+        switch (opc2) {
+            case 0u: f = top ? VFP_FAST_ABS : VFP_FAST_CPY; break;
+            case 1u: f = top ? VFP_FAST_SQRT : VFP_FAST_NEG; break;
+            case 4u: f = top ? VFP_FAST_CMPE : VFP_FAST_CMP; break;
+            case 5u:
+                if (vm != 0u || M) return false;       /* VCMP #0.0, Vm != 0 */
+                f = top ? VFP_FAST_CMPEZ : VFP_FAST_CMPZ;
+                break;
+            default: return false;
+        }
+        if (wide) {
+            if (D || M) return false;
+            *d = vd; *m = vm;
+        } else {
+            *d = SREG(vd, D); *m = SREG(vm, M);
+        }
+        *n = 0u;
+    } else {
+        return false;
+    }
+    *form = f;
+    *dbl = wide;
+    return true;
+}
+
+bool vfp_fast_dp(arm_cpu_t *c, unsigned form, bool dbl,
+                 unsigned d, unsigned n, unsigned m) {
+    const uint32_t fs = c->vfp_fpscr;
+    if (!vfp_usable(c) ||
+        (fs & (ARM_FPSCR_ENABLES | ARM_FPSCR_RMODE | ARM_FPSCR_LEN | ARM_FPSCR_STRIDE)))
+        return false;
+    uint32_t exc = 0;
+
+    if (form >= VFP_FAST_CMP) {                     /* vfp_dp_other, case 4/5 */
+        const bool zero = form >= VFP_FAST_CMPZ;
+        const bool signal_any = form == VFP_FAST_CMPE || form == VFP_FAST_CMPEZ;
+        int order;
+        bool nan_op, snan_op;
+        if (dbl) {
+            uint64_t ua = vfp_get_d(c, d);
+            uint64_t ub = zero ? 0ull : vfp_get_d(c, m);
+            double a = u2d(ua), b = u2d(ub);
+            if (fs & ARM_FPSCR_FZ) { a = fz_in64(a, &exc); b = fz_in64(b, &exc); }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan64(ua) || (!zero && snan64(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        } else {
+            uint32_t ua = vfp_get_s(c, d);
+            uint32_t ub = zero ? 0u : vfp_get_s(c, m);
+            float a = u2f(ua), b = u2f(ub);
+            if (fs & ARM_FPSCR_FZ) { a = fz_in32(a, &exc); b = fz_in32(b, &exc); }
+            nan_op  = (a != a) || (b != b);
+            snan_op = snan32(ua) || (!zero && snan32(ub));
+            order = nan_op ? 2 : (a == b ? 0 : (a < b ? -1 : 1));
+        }
+        if (snan_op || (signal_any && nan_op)) exc |= ARM_FPSCR_IOC;
+        c->vfp_fpscr = (fs & ~ARM_FPSCR_NZCV) | cmp_flags_ordered(order) | exc;
+        return true;
+    }
+
+    if (dbl) {
+        uint64_t result;
+        if (form >= VFP_FAST_CPY) {                 /* vfp_dp_other, case 0/1 */
+            const uint64_t s = vfp_get_d(c, m);
+            if (form == VFP_FAST_CPY)      result = s;
+            else if (form == VFP_FAST_ABS) result = d2u(fabs64(u2d(s)));
+            else if (form == VFP_FAST_NEG) result = d2u(fneg64(u2d(s)));
+            else result = d2u(f64_do(OP_SQRT, u2d(s), 0.0, fs, &exc));
+        } else {                                    /* vfp_dp_arith */
+            double x = u2d(vfp_get_d(c, n)), y = u2d(vfp_get_d(c, m)), r;
+            switch (form) {
+                case VFP_FAST_ADD:  r = f64_do(OP_ADD, x, y, fs, &exc); break;
+                case VFP_FAST_SUB:  r = f64_do(OP_SUB, x, y, fs, &exc); break;
+                case VFP_FAST_MUL:  r = f64_do(OP_MUL, x, y, fs, &exc); break;
+                case VFP_FAST_NMUL: r = fneg64(f64_do(OP_MUL, x, y, fs, &exc)); break;
+                case VFP_FAST_DIV:  r = f64_do(OP_DIV, x, y, fs, &exc); break;
+                default: {
+                    double acc = u2d(vfp_get_d(c, d));
+                    double p = f64_do(OP_MUL, x, y, fs, &exc);
+                    if (form == VFP_FAST_MLS  || form == VFP_FAST_NMLA) p = fneg64(p);
+                    if (form == VFP_FAST_NMLA || form == VFP_FAST_NMLS) acc = fneg64(acc);
+                    r = f64_do(OP_ADD, acc, p, fs, &exc);
+                    break;
+                }
+            }
+            result = d2u(r);
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return false;
+        vfp_set_d(c, d, result);
+    } else {
+        uint32_t result;
+        if (form >= VFP_FAST_CPY) {
+            const uint32_t s = vfp_get_s(c, m);
+            if (form == VFP_FAST_CPY)      result = s;
+            else if (form == VFP_FAST_ABS) result = f2u(fabs32(u2f(s)));
+            else if (form == VFP_FAST_NEG) result = f2u(fneg32(u2f(s)));
+            else result = f2u(f32_do(OP_SQRT, u2f(s), 0.0f, fs, &exc));
+        } else {
+            float x = u2f(vfp_get_s(c, n)), y = u2f(vfp_get_s(c, m)), r;
+            switch (form) {
+                case VFP_FAST_ADD:  r = f32_do(OP_ADD, x, y, fs, &exc); break;
+                case VFP_FAST_SUB:  r = f32_do(OP_SUB, x, y, fs, &exc); break;
+                case VFP_FAST_MUL:  r = f32_do(OP_MUL, x, y, fs, &exc); break;
+                case VFP_FAST_NMUL: r = fneg32(f32_do(OP_MUL, x, y, fs, &exc)); break;
+                case VFP_FAST_DIV:  r = f32_do(OP_DIV, x, y, fs, &exc); break;
+                default: {
+                    float acc = u2f(vfp_get_s(c, d));
+                    float p = f32_do(OP_MUL, x, y, fs, &exc);
+                    if (form == VFP_FAST_MLS  || form == VFP_FAST_NMLA) p = fneg32(p);
+                    if (form == VFP_FAST_NMLA || form == VFP_FAST_NMLS) acc = fneg32(acc);
+                    r = f32_do(OP_ADD, acc, p, fs, &exc);
+                    break;
+                }
+            }
+            result = f2u(r);
+        }
+        if (exc & VFP_FZ_AMBIGUOUS) return false;
+        vfp_set_s(c, d, result);
+    }
+    c->vfp_fpscr = fs | exc;
+    return true;
+}
+
+/* ================================================ shared with neon.c ==== *
+ * See vfp_private.h. Thin wrappers, so the Advanced SIMD unit rounds, flushes
+ * and saturates through exactly the code the VFP does. */
+void vfp_begin(void) { g_reason = NULL; }
+arm_status_t vfp_refuse(uint32_t pc, uint32_t insn, const char *why) {
+    return vfp_trap(pc, insn, why);
+}
+uint32_t vfp_std_f32(vfp_op_t op, uint32_t a, uint32_t b, uint32_t *exc) {
+    return f2u(f32_do(op, u2f(a), u2f(b), VFP_STANDARD_FPSCR, exc));
+}
+uint32_t vfp_std_flush32(uint32_t a, uint32_t *exc) {
+    return f2u(fz_in32(u2f(a), exc));
+}
+uint32_t vfp_std_round32(double exact, uint32_t *exc) {
+    volatile double vs = exact;
+    volatile float vr;
+    double x;
+    host_exceptions_clear();
+    x = vs; vr = (float)x;
+    *exc |= host_exceptions();
+    return f2u(vr);
+}
+uint32_t vfp_std_to_fixed32(double v, unsigned frac, bool is_signed, uint32_t *exc) {
+    return fp_to_fixed(v, 32u, frac, is_signed, exc);
 }
 
 /* ============================================================ entry ====== */
@@ -1338,10 +1894,15 @@ static arm_status_t vfp_execute_inner(arm_cpu_t *c, uint32_t pc, uint32_t insn,
      */
     if (!vfp_cpacr_permits(c)) return ARM_UNDEFINED;
     if (!vfp_enabled(c)) {
-        /* VMRS/VMSR share one pattern; bit 20 (L) is left out of the mask. */
+        /* VMRS/VMSR share one pattern; bit 20 (L) is left out of the mask.
+         * ARMv7 adds VMRS of MVFR1 (6) and MVFR0 (7) to what stays
+         * accessible, as Unicorn's Cortex-A8 does. */
         bool is_sysreg = (insn & 0x0fe00f10u) == 0x0ee00a10u;
         unsigned crn = FIELD(16);
-        if (!is_sysreg || (crn != 0u && crn != 8u)) return ARM_UNDEFINED;
+        bool id_read = BIT(20) && (crn == 6u || crn == 7u) &&
+                       arm_arch_is_v7(c->arch);
+        if (!is_sysreg || (crn != 0u && crn != 8u && !id_read))
+            return ARM_UNDEFINED;
     }
 
     /* VFP 32-bit register transfer: MCR/MRC on cp10/cp11. */

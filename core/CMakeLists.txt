@@ -18,15 +18,10 @@ endif()
 # This same static library is what the iOS app links against.
 add_library(emucore STATIC
     src/arm/arm_interp.c
-    src/arm/arm_profile.c
-    src/arm/arm_block_decoder.c
-    src/arm/arm_block_cache.c
-    src/arm/arm_block_exec.c
-    src/arm/arm_ir_lifter.c
-    src/arm/arm_ir_opt.c
-    src/arm/arm_ir_cache.c
-    src/arm/arm_ir_exec.c
+    src/arm/arm_ci.c
+    src/arm/arm_ci_decode.c
     src/arm/vfp.c
+    src/arm/neon.c
     src/arm/a64_static_engine.c
     src/mmu.c
     src/snapshot.c
@@ -46,6 +41,13 @@ add_library(emucore STATIC
     src/soc/wm8991.c
     src/soc/i2s.c
     src/soc/spi.c
+    src/soc/spi_nor.c
+    src/soc/cdma.c
+    src/soc/m2clcd.c
+    src/soc/s5l_sha1.c
+    src/soc/s5l8920_i2c.c
+    src/soc/s5l8920_dart.c
+    src/soc/s5l8920_dsim.c
     src/soc/gpioic.c
     src/soc/buttons.c
     src/soc/mtz2.c
@@ -55,6 +57,7 @@ add_library(emucore STATIC
     src/soc/nand.c
     src/soc/storage.c
     src/soc/machine.c
+    src/soc/n88.c
     src/firmware/img3.c
     src/firmware/aes.c
     src/firmware/loader.c
@@ -62,6 +65,7 @@ add_library(emucore STATIC
     src/firmware/lzss.c
     src/firmware/macho.c
     src/firmware/ksyms.c
+    src/firmware/guest_profile.c
     src/boot/bringup.c
     # The host's PPP peer (docs/networking.md §10, N2). It belongs in emucore
     # rather than in a host-tool target for the reason the header states: it has
@@ -95,7 +99,7 @@ if(NOT MSVC)
     # each rounding step behind a volatile store, so this flag is a second
     # belt rather than the only one — but a last-bit difference in a float is
     # exactly the silent wrongness this core refuses to ship.
-    set_source_files_properties(src/arm/vfp.c PROPERTIES
+    set_source_files_properties(src/arm/vfp.c src/arm/neon.c PROPERTIES
         COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 
@@ -207,6 +211,14 @@ add_executable(test_arm tests/test_arm.c)
 target_link_libraries(test_arm PRIVATE emucore)
 add_test(NAME arm_interp COMMAND test_arm)
 
+add_executable(test_armv7 tests/test_armv7.c)
+target_link_libraries(test_armv7 PRIVATE emucore)
+add_test(NAME armv7 COMMAND test_armv7)
+
+add_executable(test_n88 tests/test_n88.c)
+target_link_libraries(test_n88 PRIVATE emucore)
+add_test(NAME n88 COMMAND test_n88)
+
 add_executable(test_vfp tests/test_vfp.c)
 target_link_libraries(test_vfp PRIVATE emucore)
 add_test(NAME vfp COMMAND test_vfp)
@@ -238,6 +250,25 @@ add_test(NAME wm8991_codec_and_i2s COMMAND test_wm8991)
 add_executable(test_spi tests/test_spi.c)
 target_link_libraries(test_spi PRIVATE emucore)
 add_test(NAME s5l8900_spi COMMAND test_spi)
+
+add_executable(test_spi_nor tests/test_spi_nor.c)
+target_link_libraries(test_spi_nor PRIVATE emucore)
+add_test(NAME spi_nor COMMAND test_spi_nor)
+
+add_executable(test_cdma tests/test_cdma.c)
+target_link_libraries(test_cdma PRIVATE emucore)
+add_test(NAME cdma_aes COMMAND test_cdma)
+
+add_executable(test_m2clcd tests/test_m2clcd.c)
+target_link_libraries(test_m2clcd PRIVATE emucore)
+add_test(NAME m2clcd COMMAND test_m2clcd)
+
+add_executable(test_s5l_sha1 tests/test_s5l_sha1.c)
+target_link_libraries(test_s5l_sha1 PRIVATE emucore)
+add_test(NAME s5l_sha1 COMMAND test_s5l_sha1)
+add_executable(test_s5l8920_i2c tests/test_s5l8920_i2c.c)
+target_link_libraries(test_s5l8920_i2c PRIVATE emucore)
+add_test(NAME s5l8920_i2c_dart_dsim COMMAND test_s5l8920_i2c)
 
 add_executable(test_gpioic tests/test_gpioic.c)
 target_link_libraries(test_gpioic PRIVATE emucore)
@@ -377,6 +408,15 @@ add_executable(test_vmguest
 target_include_directories(test_vmguest PRIVATE ../app/Sources)
 target_link_libraries(test_vmguest PRIVATE emucore)
 add_test(NAME app_vmguest_bridge COMMAND test_vmguest)
+
+# The Full Test Report's kext dump names the kernel functions a driver calls;
+# finding those references is plain C over the kext's bytes.
+add_executable(test_vmdriverdump
+    ../app/Tests/test_vmdriverdump.c
+    ../app/Sources/VMDriverDump.c
+)
+target_include_directories(test_vmdriverdump PRIVATE ../app/Sources)
+add_test(NAME app_vmdriverdump COMMAND test_vmdriverdump)
 
 # Frame telemetry is kept in portable C so its cross-thread counter and the
 # intentionally sampled change definition are host-tested. The Objective-C
@@ -1142,6 +1182,71 @@ else()
         -Wall -Wextra -Werror -pedantic)
 endif()
 
+# The iOS 6.1.6 (10B500) kernel gate for the iPhone 3GS machine: the same
+# fail-closed shape as the iPhone OS 3 one above, for the four patches that let
+# the memory-disk bridge serve its root filesystem (tools/ios6_kernel_patch.h).
+add_library(host_ios6_kernel_patch STATIC ../tools/ios6_kernel_patch.c)
+target_include_directories(host_ios6_kernel_patch PUBLIC ../tools include)
+target_link_libraries(host_ios6_kernel_patch
+    PUBLIC host_guest_patch
+    PRIVATE emucore)
+set_target_properties(host_ios6_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_ios6_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_ios6_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_ios6_kernel_patch tests/test_ios6_kernel_patch.c)
+target_link_libraries(test_ios6_kernel_patch PRIVATE host_ios6_kernel_patch emucore)
+add_test(NAME ios6_kernel_patch COMMAND test_ios6_kernel_patch)
+
+# The iPhone OS 3.1.3 (7E18) kernel gate for the iPhone 3GS machine: the three
+# patches the memory-disk bridge needs, nothing else
+# (tools/ios3_n88_kernel_patch.h).
+add_library(host_ios3_n88_kernel_patch STATIC ../tools/ios3_n88_kernel_patch.c)
+target_include_directories(host_ios3_n88_kernel_patch PUBLIC ../tools include)
+target_link_libraries(host_ios3_n88_kernel_patch
+    PUBLIC host_guest_patch
+    PRIVATE emucore)
+set_target_properties(host_ios3_n88_kernel_patch PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_ios3_n88_kernel_patch PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_ios3_n88_kernel_patch PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_ios3_n88_kernel_patch tests/test_ios3_n88_kernel_patch.c)
+target_link_libraries(test_ios3_n88_kernel_patch PRIVATE host_ios3_n88_kernel_patch emucore)
+add_test(NAME ios3_n88_kernel_patch COMMAND test_ios3_n88_kernel_patch)
+
+# iPhone OS 3.1.3 on the iPhone 3GS machine: the boot recipe boot3gs measured,
+# shared with the app (tools/n88_ios3.h).
+add_library(host_n88_ios3 STATIC ../tools/n88_ios3.c)
+target_include_directories(host_n88_ios3 PUBLIC ../tools include)
+target_link_libraries(host_n88_ios3
+    PUBLIC host_ios3_n88_kernel_patch host_rootfs_work
+    PRIVATE emucore)
+set_target_properties(host_n88_ios3 PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_n88_ios3 PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_n88_ios3 PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_n88_ios3 tests/test_n88_ios3.c)
+target_link_libraries(test_n88_ios3 PRIVATE host_n88_ios3 emucore)
+add_test(NAME n88_ios3 COMMAND test_n88_ios3 ${CMAKE_CURRENT_BINARY_DIR})
+
 # The gate as a bring-up hook: one adapter, shared by the desktop test below
 # and by the iOS app, so a kernel is authorized by the same code in both.
 add_library(host_ios3_bringup_gate STATIC ../tools/ios3_bringup_gate.c)
@@ -1415,26 +1520,6 @@ add_test(NAME app_option_mirror
             -DVMOPTIONS=$<TARGET_FILE:test_vmoptions>
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_option_mirror.cmake)
 
-add_executable(test_profiler tests/test_profiler.c)
-target_link_libraries(test_profiler PRIVATE emucore)
-add_test(NAME cpu_profiler COMMAND test_profiler)
-
-add_executable(test_cached_interp tests/test_cached_interp.c)
-target_link_libraries(test_cached_interp PRIVATE emucore)
-add_test(NAME cpu_cached_interp COMMAND test_cached_interp)
-
-add_executable(test_block_cache tests/test_block_cache.c)
-target_link_libraries(test_block_cache PRIVATE emucore)
-add_test(NAME cpu_block_cache COMMAND test_block_cache)
-
-add_executable(test_ir tests/test_ir.c)
-target_link_libraries(test_ir PRIVATE emucore)
-add_test(NAME cpu_ir COMMAND test_ir)
-
-add_executable(test_fastmem tests/test_fastmem.c)
-target_link_libraries(test_fastmem PRIVATE emucore)
-add_test(NAME cpu_fastmem COMMAND test_fastmem)
-
 # snapboot is the snapshot acceptance harness: it boots to a checkpoint, saves,
 # and can restore into a fresh process. Comparing snapshot bytes alone is not
 # enough — a field the format never stores is absent from both sides and
@@ -1460,9 +1545,65 @@ add_executable(insnbench ../tools/insnbench.c)
 target_link_libraries(insnbench PRIVATE emucore)
 target_compile_definitions(insnbench PRIVATE INSNBENCH_BUILD_TYPE="$<CONFIG>")
 
+# Compiled guest workloads (bench/guest, docs/PERFORMANCE_BASELINE_PLAN.md
+# section 5). The guest images are committed as a generated header, so this
+# needs no ARM toolchain; workloads.c is ALSO compiled for the host, where it
+# computes the checksum every guest run must reproduce. Float contraction and
+# type-based aliasing are off for that host copy for the same reason they are
+# off for the guest build: the two must mean exactly the same thing.
+add_library(guest_bench STATIC ../tools/guest_bench.c ../bench/guest/workloads.c)
+target_link_libraries(guest_bench PUBLIC emucore)
+target_include_directories(guest_bench PUBLIC ../tools)
+if(NOT MSVC)
+    set_source_files_properties(../bench/guest/workloads.c PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off;-fno-strict-aliasing")
+endif()
+
+add_executable(cpubench ../tools/cpubench.c)
+target_link_libraries(cpubench PRIVATE guest_bench)
+
+# Cached interpreter vs reference interpreter on random instruction sequences
+# (every architectural bit compared). The argument is cases per ISA; run it
+# with a larger count locally after any engine change.
+add_executable(test_ci_diff tests/test_ci_diff.c)
+target_link_libraries(test_ci_diff PRIVATE emucore)
+add_test(NAME cached_interpreter_differential COMMAND test_ci_diff 10000)
+add_executable(test_ci_translation tests/test_ci_translation.c)
+target_link_libraries(test_ci_translation PRIVATE emucore)
+add_test(NAME cached_interpreter_translation COMMAND test_ci_translation)
+add_executable(test_guest_profile tests/test_guest_profile.c)
+target_link_libraries(test_guest_profile PRIVATE emucore)
+add_test(NAME guest_profile COMMAND test_guest_profile)
+
+add_executable(test_ci_timeline tests/test_ci_timeline.c)
+target_link_libraries(test_ci_timeline PRIVATE emucore)
+add_test(NAME cached_interpreter_timeline COMMAND test_ci_timeline)
+add_executable(test_ci_diagnostics tests/test_ci_diagnostics.c)
+target_link_libraries(test_ci_diagnostics PRIVATE emucore)
+add_test(NAME cached_interpreter_diagnostics COMMAND test_ci_diagnostics)
+
+add_executable(test_guest_workloads tests/test_guest_workloads.c)
+target_link_libraries(test_guest_workloads PRIVATE guest_bench)
+add_test(NAME guest_workloads COMMAND test_guest_workloads)
+
+# The committed images must match their sources. Checking needs only Python
+# (it compares input digests); regenerating needs Clang + lld.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME guest_images_current
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gen_guest_bench.py --check)
+endif()
+
 # Not a product tool and not part of the CI test matrix: a single-instruction
 # arm_step() probe, one test case per stdin line, driven by an external
 # differential script (Unicorn or any other independent reference) rather
 # than by anything in this repo. See tools/arm_diff_probe.c.
 add_executable(arm_diff_probe ../tools/arm_diff_probe.c)
 target_link_libraries(arm_diff_probe PRIVATE emucore)
+
+# iPhone 3GS / iOS 6 bring-up research harness: runs the user's kernelcache on
+# a bare Cortex-A8 machine and logs every device access (tools/boot3gs.c).
+add_executable(boot3gs ../tools/boot3gs.c)
+target_link_libraries(boot3gs PRIVATE emucore host_ios6_kernel_patch host_ios3_n88_kernel_patch host_file_block host_audio_capture
+    host_rootfs_work host_n88_ios3)

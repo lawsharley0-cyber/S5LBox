@@ -501,6 +501,49 @@ static void test_i2s_stores_the_seven_and_shows_the_rest(void) {
     s5l_i2s_reset(NULL);
 }
 
+static void test_i2s_describe_shows_storage_and_strays(void) {
+    s5l_i2s_t i2s;
+    s5l_i2s_reset(&i2s);
+    s5l_i2s_write(&i2s, 0x08u, 6u);
+    s5l_i2s_write(&i2s, 0x3cu, 1u);
+    (void)s5l_i2s_read(&i2s, 0x38u);
+    char text[512];
+    size_t n = s5l_i2s_describe(&i2s, "i2s0", text, sizeof text);
+    CHECK(n == strlen(text), "length");
+    CHECK(strstr(text, "i2s0: +0x00=0x00000000 +0x04=0x00000000 +0x08=0x00000006") != NULL &&
+          strstr(text, "+0x3c=0x00000001") != NULL, "storage:\n%s", text);
+    CHECK(strstr(text, "1 reads, 2 writes, 1/0 to other offsets at +0x38") != NULL,
+          "counts:\n%s", text);
+    CHECK(strstr(text, "TX FIFO stores 0, frames to host 0") != NULL,
+          "FIFO stores:\n%s", text);
+    CHECK(strstr(text, "frame clock stopped, 0 frames; TX FIFO 0/64 bytes") != NULL,
+          "frame clock:\n%s", text);
+    char tiny[12];
+    n = s5l_i2s_describe(&i2s, "i2s0", tiny, sizeof tiny);
+    CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
+}
+
+static void test_codec_describe_lists_written_registers(void) {
+    s5l_wm8991_t codec;
+    s5l_wm8991_reset(&codec);
+    char text[512];
+    size_t n = s5l_wm8991_describe(&codec, text, sizeof text);
+    CHECK(n == strlen(text) && strstr(text, "written registers: none") != NULL,
+          "empty codec:\n%s", text);
+    codec.regs[0x0b] = 0x01c0u; codec.written[0x0b] = 1u;
+    codec.regs[0x1c] = 0x0179u; codec.written[0x1c] = 1u;
+    codec.reg_writes = 2u;
+    n = s5l_wm8991_describe(&codec, text, sizeof text);
+    CHECK(strstr(text, "2 register writes") != NULL &&
+          strstr(text, "R0b=01c0 R1c=0179") != NULL &&
+          strstr(text, "R00=") == NULL, "written registers:\n%s", text);
+    char tiny[10];
+    n = s5l_wm8991_describe(&codec, tiny, sizeof tiny);
+    CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
+    CHECK(s5l_wm8991_describe(NULL, text, sizeof text) == 0u && text[0] == 0,
+          "NULL codec");
+}
+
 /* -------------------------------------------------------- the machine --- */
 
 static void test_machine_routes_the_codec_and_both_windows(void) {
@@ -702,6 +745,8 @@ int main(void) {
     test_unwritten_registers_are_visible_and_bounded();
     test_reset_is_total();
     test_i2s_stores_the_seven_and_shows_the_rest();
+    test_i2s_describe_shows_storage_and_strays();
+    test_codec_describe_lists_written_registers();
     test_machine_routes_the_codec_and_both_windows();
     test_snapshot_carries_the_codec_and_windows();
     test_snapshot_rejects_impossible_codec_state();

@@ -46,6 +46,12 @@ const char *img3_strerror(img3_status_t st) {
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
                           const uint8_t iv[16], uint8_t *out, size_t out_cap,
                           uint32_t *out_len) {
+    return img3_decrypt_data_iv_tail(img, key, key_bits, iv, out, out_cap, out_len, true);
+}
+
+bool img3_decrypt_data_iv_tail(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                               const uint8_t iv[16], uint8_t *out, size_t out_cap,
+                               uint32_t *out_len, bool decrypt_tail) {
     if (!img || !img->data || !img->kbag.present || img->kbag.malformed ||
         !key || !out || !iv || key_bits != img->kbag.key_bits ||
         out_cap < img->data_len) return false;
@@ -53,14 +59,34 @@ bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bi
     aes_ctx_t ctx;
     if (!aes_init(&ctx, key, key_bits)) return false;
 
-    /* Real payloads are not always a whole number of blocks; CBC covers the
-     * aligned prefix and the remainder is passed through unchanged. */
+    /* Real payloads are not always a whole number of blocks. CBC covers the
+     * aligned prefix; a tail whose block the tag's padding completes is
+     * ciphertext too and is decrypted whole, and only a tail with no room
+     * for its block is passed through unchanged. */
     uint32_t whole = img->data_len & ~(AES_BLOCK_SIZE - 1u);
     uint32_t tail  = img->data_len - whole;
+    const bool tail_is_cipher =
+        decrypt_tail && tail && (uint64_t)whole + AES_BLOCK_SIZE <= img->data_room;
+
+    /* The tail block chains from the last ciphertext block of the prefix.
+     * Taken before the prefix is decrypted: a caller decrypting in place
+     * (out == img->data, as the app's importer does) has overwritten it with
+     * plaintext by then, and chaining from that turns the tail -- the device
+     * tree's last property -- into garbage. */
+    uint8_t chain[AES_BLOCK_SIZE];
+    if (tail_is_cipher)
+        memcpy(chain, whole ? img->data + whole - AES_BLOCK_SIZE : iv, AES_BLOCK_SIZE);
 
     if (whole && !aes_cbc_decrypt(&ctx, iv, img->data, out, whole))
         return false;
-    if (tail) memcpy(out + whole, img->data + whole, tail);
+    if (tail_is_cipher) {
+        uint8_t block[AES_BLOCK_SIZE];
+        if (!aes_cbc_decrypt(&ctx, chain, img->data + whole, block, AES_BLOCK_SIZE))
+            return false;
+        memcpy(out + whole, block, tail);
+    } else if (tail) {
+        memcpy(out + whole, img->data + whole, tail);
+    }
 
     if (out_len) *out_len = img->data_len;
     return true;
@@ -135,8 +161,9 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out) {
 
         switch (magic) {
             case IMG3_TAG_DATA:
-                out->data     = d;
-                out->data_len = data_len;
+                out->data      = d;
+                out->data_len  = data_len;
+                out->data_room = total_len - IMG3_TAG_HEADER;
                 break;
             case IMG3_TAG_KBAG:
                 if (!out->kbag.present) parse_kbag(d, data_len, &out->kbag);

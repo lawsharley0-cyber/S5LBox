@@ -930,11 +930,11 @@ static void test_both_controllers_are_declared_wake_sources(void) {
           "rediscover", found);
 
     /*
-     * And both answer NEVER, which is a claim about this model and not a
-     * placeholder: a transfer completes inside the tick that the enabling store
-     * dirties, so there is never one in flight when a core reaches WFI. The day
-     * transfers are paced against a peripheral request line, this assertion is
-     * the one that must change first.
+     * And with nothing in flight both answer NEVER: a transfer completes inside
+     * the tick that the enabling store dirties, so there is never one in flight
+     * when a core reaches WFI. The one exception is a channel feeding an I2S
+     * TX FIFO, which its frame clock paces; test_audio_dma.c pins the edge
+     * such a channel names.
      */
     s5l8900_t m;
     CHECK(s5l8900_init(&m, 0u, 1u << 16), "init failed");
@@ -1041,8 +1041,44 @@ static void test_snapshot_rejects_an_impossible_channel(void) {
     s5l8900_free(&dst);
 }
 
+/* The report's summary: every refusal counter and each programmed channel,
+ * decoded from the channel's own bits, and a buffer too small stays
+ * terminated. Literal offsets as elsewhere in this file. */
+static void test_describe_names_the_state_a_report_needs(void) {
+    s5l_pl080_t d;
+    s5l_pl080_reset(&d);
+    char text[2048];
+    size_t n = s5l_pl080_describe(&d, "dmac0", text, sizeof text);
+    CHECK(n == strlen(text) && strstr(text, "dmac0: config 0x00000000 (written 0 times"),
+          "empty controller:\n%s", text);
+    CHECK(strstr(text, "no channel has a register set") != NULL, "empty channels:\n%s", text);
+
+    s5l_pl080_write(&d, 0x030, 1u);
+    /* Channel 5: src, dst, lli, ctrl, then cfg = enable | dst periph 9 |
+     * flow 1 (memory to peripheral) | ITC. */
+    s5l_pl080_write(&d, 0x100 + 5u * 0x20u + 0x00u, 0x09634000u);
+    s5l_pl080_write(&d, 0x100 + 5u * 0x20u + 0x04u, 0x3ca00010u);
+    s5l_pl080_write(&d, 0x100 + 5u * 0x20u + 0x0cu, 0x80000400u);
+    s5l_pl080_write(&d, 0x100 + 5u * 0x20u + 0x10u, 0x00008000u | (1u << 11) | (9u << 6) | 1u);
+    d.refused_width = 3u;
+    n = s5l_pl080_describe(&d, "dmac0", text, sizeof text);
+    CHECK(strstr(text, "config 0x00000001 (written 1 times, first 0x00000001)") != NULL,
+          "config line:\n%s", text);
+    CHECK(strstr(text, "width 3") != NULL, "refusal counter:\n%s", text);
+    CHECK(strstr(text, "ch5 src 0x09634000 dst 0x3ca00010") != NULL &&
+          strstr(text, "(enabled, flow 1, src periph 0, dst periph 9)") != NULL,
+          "channel decode:\n%s", text);
+    CHECK(strstr(text, "ch0 ") == NULL, "unprogrammed channel listed:\n%s", text);
+
+    char tiny[16];
+    n = s5l_pl080_describe(&d, "dmac0", tiny, sizeof tiny);
+    CHECK(n == strlen(tiny) && n < sizeof tiny, "truncation");
+    CHECK(s5l_pl080_describe(NULL, "x", tiny, sizeof tiny) == 0u && tiny[0] == '\0', "null device");
+}
+
 int main(void) {
     printf("S5LBox PL080 DMA controller tests\n");
+    test_describe_names_the_state_a_report_needs();
     test_the_register_map_is_the_drivers_own();
     test_reset_is_total();
     test_the_active_bit_is_read_only_and_reads_zero();

@@ -140,7 +140,7 @@ static double   u2d(uint64_t u){ double d;  memcpy(&d,&u,8); return d; }
  * that still looks like a plausible float.
  */
 static void test_s_d_aliasing(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
 
     vfp_set_s(&c, 6, 0x12345678u);       /* low  word of d3 */
     vfp_set_s(&c, 7, 0x9abcdef0u);       /* high word of d3 */
@@ -166,7 +166,7 @@ static void test_s_d_aliasing(void) {
  * this exact word must move 128 bytes and advance r1 by 128.
  */
 static void test_vldmia_writeback_the_vfp_switch_form(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = { VFP_LS(0,1,0,1,1, 1, 0, 0, 32) };
     CHECK(prog[0] == 0xecb10a20u, "encoding 0x%08x", prog[0]);
 
@@ -181,7 +181,7 @@ static void test_vldmia_writeback_the_vfp_switch_form(void) {
 /* And the other half of a context switch: VSTMIA writes the same 32 words
  * back, so a store-then-load round trip must be the identity. */
 static void test_vstmia_vldmia_round_trip(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VFP_LS(0,1,0,1,0, 1, 0, 0, 32),      /* VSTMIA r1!, {s0-s31} */
         VFP_LS(0,1,0,1,1, 2, 0, 0, 32),      /* VLDMIA r2!, {s0-s31} */
@@ -203,7 +203,7 @@ static void test_vstmia_vldmia_round_trip(void) {
  * order. If the word order inside a double were wrong this is where it shows.
  */
 static void test_double_list_matches_single_list(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VFP_LS(0,1,0,0,0, 1, 0, 1, 4),       /* VSTMIA r1, {d0-d1}  */
         VFP_LS(0,1,0,0,0, 2, 0, 0, 4),       /* VSTMIA r2, {s0-s3}  */
@@ -220,7 +220,7 @@ static void test_double_list_matches_single_list(void) {
 
 /* VPUSH/VPOP are the DB-writeback and IA-writeback forms with Rn == sp. */
 static void test_vpush_vpop(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VFP_LS(1,0,0,1,0, 13, 0, 1, 4),      /* VPUSH {d0-d1} */
         VFP_LS(0,1,0,1,1, 13, 2, 1, 4),      /* VPOP  {d2-d3} */
@@ -242,7 +242,7 @@ static void test_vpush_vpop(void) {
 }
 
 static void test_vldr_vstr(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VFP_LS(1,1,0,0,1, 1, 0, 0, 2),       /* VLDR s0, [r1,#8]  */
         VFP_LS(1,0,0,0,1, 1, 0, 1, 2),       /* VLDR d0, [r1,#-8] */
@@ -264,7 +264,7 @@ static void test_vldr_vstr(void) {
 
 /* A list running past s31 or d15 names registers this part does not have. */
 static void test_overlong_lists_trap(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t over_s[] = { VFP_LS(0,1,1,0,1, 1, 0, 0, 32) };  /* s1..s32  */
     uint32_t over_d[] = { VFP_LS(0,1,0,0,1, 1, 15, 1, 4) };  /* d15..d16 */
     uint32_t empty[]  = { VFP_LS(0,1,0,0,1, 1, 0, 0, 0) };   /* empty list */
@@ -276,7 +276,7 @@ static void test_overlong_lists_trap(void) {
 /* ================================================ system registers ======== */
 
 static void test_vmrs_vmsr(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VMRS(0, 0),                          /* VMRS r0, FPSID */
         VMSR(1, 2),                          /* VMSR FPSCR, r2 */
@@ -293,13 +293,13 @@ static void test_vmrs_vmsr(void) {
 }
 
 static void test_fpsid_is_read_only(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = { VMSR(0, 0) };        /* VMSR FPSID, r0 */
     CHECK(run(&c, prog, 1, 1) == ARM_UNDEFINED, "VMSR FPSID was accepted");
 }
 
 static void test_system_register_privilege(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t read_fpsid[]  = { VMRS(0, 0) };
     uint32_t write_fpscr[] = { VMSR(1, 1), VMRS(2, 1) };
     uint32_t read_fpexc[]  = { VMRS(0, 8) };
@@ -374,7 +374,7 @@ static void test_system_register_privilege(void) {
  * Undefined vector.
  */
 static void test_fpexc_en_gates_the_other_registers(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t read_fpexc[] = { VMRS(0, 8) };
     uint32_t read_fpsid[] = { VMRS(0, 0) };
     uint32_t read_fpscr[] = { VMRS(0, 1) };
@@ -421,7 +421,7 @@ static void test_fpexc_en_gates_the_other_registers(void) {
 /* ================================================== core transfers ======== */
 
 static void test_vmov_core_registers(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VMOV_S_R(5, 0),                      /* VMOV s5, r0      */
         VMOV_R_S(1, 5),                      /* VMOV r1, s5      */
@@ -452,7 +452,7 @@ static void test_vmov_core_registers(void) {
  * instructions are VFPv2 and are used by the original armv6 libm.
  */
 static void test_vmov_double_register_words(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         VMOV_DWORD_R(7, 1, 4),              /* FMDHR d7, r4 */
         VMOV_DWORD_R(7, 0, 5),              /* FMDLR d7, r5 */
@@ -552,7 +552,7 @@ static void test_vmov_double_register_words(void) {
  * this d6 value is an internal temporary in Apple's block.
  */
 static void test_ios313_libm_fmod_return_block(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         0xee274b10u,                         /* FMDHR d7, r4          */
         0xee070b10u,                         /* FMDLR d7, r0          */
@@ -652,7 +652,7 @@ static void set_f64(arm_cpu_t *c, unsigned n, double v){ vfp_set_d(c, n, d2u(v))
 static double get_f64(const arm_cpu_t *c, unsigned n)  { return u2d(vfp_get_d(c, n)); }
 
 static void test_single_precision_arithmetic(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         DP_S(0,1,1,0, 4,0,1),                /* VADD.F32 s4, s0, s1 */
         DP_S(0,1,1,1, 5,0,1),                /* VSUB.F32 s5, s0, s1 */
@@ -674,7 +674,7 @@ static void test_single_precision_arithmetic(void) {
 }
 
 static void test_double_precision_arithmetic(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         DP_D(0,1,1,0, 4,0,1),                /* VADD.F64 d4, d0, d1 */
         DP_D(1,0,0,0, 5,0,1),                /* VDIV.F64 d5, d0, d1 */
@@ -698,7 +698,7 @@ static void test_double_precision_arithmetic(void) {
  * level meter opens, so keep the real word as well as the general bank tests.
  */
 static void test_short_vector_arithmetic(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* VMUL.F32 s20,s4,s0: Fn advances even though it is in bank zero, while
      * Fm in bank zero is a scalar broadcast. */
@@ -820,7 +820,7 @@ static void test_short_vector_arithmetic(void) {
 }
 
 static void test_short_vector_unary_and_scalar_only(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     /* A two-operand source in bank zero is broadcast to the whole vector. */
     {
@@ -871,7 +871,7 @@ static void test_short_vector_unary_and_scalar_only(void) {
 }
 
 static void test_invalid_short_vector_shapes_halt_without_writes(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t smul[] = { DP_S(0,1,0,0, 8,16,24) };
     uint32_t dmul[] = { DP_D(0,1,0,0, 4,8,12) };
 
@@ -904,7 +904,7 @@ static void test_invalid_short_vector_shapes_halt_without_writes(void) {
  * halfway-plus-epsilon case where the product's lost bits change the sum.
  */
 static void test_vmla_is_not_fused(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = { DP_S(0,0,0,0, 2,0,1) };   /* VMLA.F32 s2,s0,s1 */
     float a = 1.0f + 1.0f/16777216.0f;       /* 1 + 2^-24 is not representable; */
     volatile float product, sum;             /* the host rounds it to 1.0f      */
@@ -938,7 +938,7 @@ static void test_vmla_is_not_fused(void) {
 }
 
 static void test_vabs_vneg_vmov_are_sign_bit_operations(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         UN_S(0,0, 1,0),                      /* VMOV.F32 s1, s0 */
         UN_S(0,1, 2,0),                      /* VABS.F32 s2, s0 */
@@ -970,7 +970,7 @@ static void test_vabs_vneg_vmov_are_sign_bit_operations(void) {
 /* ============================================ NaN, infinity, flags ======== */
 
 static void test_infinity_and_nan(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t div[] = { DP_S(1,0,0,0, 2,0,1) };    /* VDIV.F32 s2,s0,s1 */
 
     /* 1.0 / 0.0 -> +inf, DZC. */
@@ -1037,7 +1037,7 @@ static void test_infinity_and_nan(void) {
  * moves them across, and testing both together is the only way to catch an
  * implementation that wrote the wrong register. */
 static void test_vcmp_writes_fpscr_not_cpsr(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         UN_S(4,0, 0,1),                      /* VCMP.F32 s0, s1     */
         0xeef1fa10u,                         /* VMRS APSR_nzcv, FPSCR */
@@ -1093,7 +1093,7 @@ static void test_vcmp_writes_fpscr_not_cpsr(void) {
 }
 
 static void test_vcmp_with_zero(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = { UN_S(5,0, 0,0) };                /* VCMP.F32 s0, #0.0 */
     CHECK(prog[0] == 0xeeb50a40u, "VCMP.F32 s0,#0 = 0x%08x", prog[0]);
     set_f32(&c, 0, -3.0f);
@@ -1110,7 +1110,7 @@ static void test_vcmp_with_zero(void) {
 /* ================================================== conversions ========== */
 
 static void test_conversions(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = {
         UN_S(8,1, 2,0),                      /* VCVT.F32.S32 s2, s0 */
         UN_S(8,0, 4,0),                      /* VCVT.F32.U32 s4, s0 */
@@ -1328,7 +1328,7 @@ static void test_ios313_corefoundation_vfp_helpers(void) {
         { 0x00000000u, "zero" },
         { 0xffffffffu, "UINT32_MAX" },
     };
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
 
     CHECK(fix_u32[1] == UN_S_FROM_D(12,1, 15,7),
           "shared-cache VCVT.U32.F64 encoding = 0x%08x", fix_u32[1]);
@@ -1398,7 +1398,7 @@ static void test_ios313_corefoundation_vfp_helpers(void) {
  * plausible-looking wrong answer was easy to produce.
  */
 static void test_unimplemented_encodings_still_halt(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     struct { uint32_t insn; const char *what; } cases[] = {
         /* d16-d31: VFPv2 has 16 doubles, and the D bit that would name d16 is
          * SBZ. Folding it back onto d0 would corrupt an unrelated register. */
@@ -1431,6 +1431,8 @@ static void test_unimplemented_encodings_still_halt(void) {
         /* VFP system registers we do not implement. */
         { VMRS(0, 7),                        "VMRS r0, MVFR0" },
         { VMRS(0, 9),                        "VMRS r0, FPINST" },
+        /* VMOV r0, r1, d0 needs bit 4 set; clear, it is UNDEFINED. */
+        { 0xec510b00u,                       "VMOV (two core registers) with bit 4 clear" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
         uint32_t p[1]; p[0] = cases[i].insn;
@@ -1447,7 +1449,7 @@ static void test_unimplemented_encodings_still_halt(void) {
  * must not.
  */
 static void test_fpscr_mode_handling(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t add[] = { DP_S(0,1,1,0, 2,0,1) };   /* VADD.F32 s2,s0,s1 */
     uint32_t mov[] = { UN_S(0,0, 1,0) };         /* VMOV.F32 s1,s0    */
 
@@ -1524,7 +1526,7 @@ static void test_fpscr_mode_handling(void) {
  * becomes zero of the result's sign with UFC set.
  */
 static void test_flush_to_zero(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t mul[] = { DP_S(0,1,0,0, 2,0,1) };   /* VMUL.F32 s2, s0, s1 */
     uint32_t add[] = { DP_S(0,1,1,0, 2,0,1) };   /* VADD.F32 s2, s0, s1 */
 
@@ -1574,10 +1576,9 @@ static void test_flush_to_zero(void) {
           c.vfp_fpscr & 0x9fu);
 }
 
-/* Default-NaN mode replaces every NaN result with the one default quiet NaN,
- * which also makes the NaN-payload deviation documented in vfp.c unobservable. */
+/* Default-NaN mode replaces every NaN result with the one default quiet NaN. */
 static void test_default_nan(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     uint32_t add[] = { DP_S(0,1,1,0, 2,0,1) };   /* VADD.F32 s2, s0, s1 */
 
     vfp_reset(&c); c.vfp_fpscr = ARM_FPSCR_DN;
@@ -1607,11 +1608,94 @@ static void test_default_nan(void) {
     }
 }
 
+/*
+ * NaN propagation is ARM's FPProcessNaNs, not the host's: a signalling NaN
+ * wins whatever its position and is quieted, otherwise the first operand's NaN
+ * wins; and a NaN the operation itself creates is the POSITIVE default NaN.
+ * x86 and arm64 both prefer the first operand and x86 creates 0xffc00000, so
+ * every case below failed before vfp.c chose the NaN itself. Found by
+ * tools/unicorn_neon_diff.py; the expected values are Unicorn's Cortex-A8.
+ */
+static void test_nan_propagation_is_arms(void) {
+    arm_cpu_t c = {0};
+    uint32_t add[]  = { DP_S(0,1,1,0, 2,0,1) };    /* VADD.F32 s2, s0, s1  */
+    uint32_t div[]  = { DP_S(1,0,0,0, 2,0,1) };    /* VDIV.F32 s2, s0, s1  */
+    uint32_t nmul[] = { DP_S(0,1,0,1, 2,0,1) };    /* VNMUL.F32 s2, s0, s1 */
+    uint32_t sq[]   = { UN_S(1,1, 2,0) };          /* VSQRT.F32 s2, s0     */
+    uint32_t muld[] = { DP_D(0,1,0,0, 2,0,1) };    /* VMUL.F64 d2, d0, d1  */
+
+    vfp_reset(&c);                          /* quiet first, signalling second */
+    vfp_set_s(&c, 0, 0x7fc11111u); vfp_set_s(&c, 1, 0x7f822222u);
+    CHECK(run(&c, add, 1, 1) == ARM_OK && vfp_get_s(&c, 2) == 0x7fc22222u &&
+          (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN + sNaN = %08x fpscr %08x, want the quieted sNaN 7fc22222 and IOC",
+          vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* signalling first */
+    vfp_set_s(&c, 0, 0xff811111u); vfp_set_s(&c, 1, 0x7fc22222u);
+    run(&c, add, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc11111u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sNaN + qNaN = %08x, want ffc11111 and IOC", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* two quiet NaNs: the first, no IOC */
+    vfp_set_s(&c, 0, 0x7fc11111u); vfp_set_s(&c, 1, 0xffc22222u);
+    run(&c, add, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc11111u && !(c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN + qNaN = %08x fpscr %08x", vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* 0/0 creates the default NaN */
+    vfp_set_s(&c, 0, 0u); vfp_set_s(&c, 1, 0u);
+    run(&c, div, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc00000u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "0/0 = %08x, want 7fc00000", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* VNMUL negates the created NaN */
+    vfp_set_s(&c, 0, 0u); vfp_set_s(&c, 1, 0x7f800000u);
+    run(&c, nmul, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc00000u,
+          "-(0 * inf) = %08x, want ffc00000", vfp_get_s(&c, 2));
+
+    vfp_reset(&c);                          /* sqrt(qNaN): propagated, NO IOC */
+    vfp_set_s(&c, 0, 0xffc33333u);
+    run(&c, sq, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0xffc33333u && !(c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sqrt(qNaN) = %08x fpscr %08x; a signalling compare used to raise IOC",
+          vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* sqrt(-1): created, IOC */
+    set_f32(&c, 0, -1.0f);
+    run(&c, sq, 1, 1);
+    CHECK(vfp_get_s(&c, 2) == 0x7fc00000u && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "sqrt(-1) = %08x fpscr %08x", vfp_get_s(&c, 2), c.vfp_fpscr);
+
+    vfp_reset(&c);                          /* double precision, same rule */
+    vfp_set_d(&c, 0, 0x7ff8000000011111ull); vfp_set_d(&c, 1, 0xfff0000000022222ull);
+    run(&c, muld, 1, 1);
+    CHECK(vfp_get_d(&c, 2) == 0xfff8000000022222ull && (c.vfp_fpscr & ARM_FPSCR_IOC),
+          "qNaN * sNaN (f64) = %016llx", (unsigned long long)vfp_get_d(&c, 2));
+}
+
+/* Flush-to-zero sees the result before rounding; a product the host rounds
+ * all the way to zero was still a tiny nonzero result, so FZ flushes it: UFC
+ * alone, not the IXC the host reports. Also found by the Unicorn test. */
+static void test_flush_to_zero_of_a_result_the_host_rounded_to_zero(void) {
+    arm_cpu_t c = {0};
+    uint32_t mul[] = { DP_S(0,1,0,0, 2,0,1) };   /* VMUL.F32 s2, s0, s1 */
+    vfp_reset(&c); c.vfp_fpscr = ARM_FPSCR_FZ;
+    vfp_set_s(&c, 0, 0x0d800000u);               /* 2^-100 */
+    vfp_set_s(&c, 1, 0x8d800000u);               /* -2^-100 */
+    CHECK(run(&c, mul, 1, 1) == ARM_OK, "VMUL refused");
+    CHECK(vfp_get_s(&c, 2) == 0x80000000u, "2^-100 * -2^-100 = %08x, want -0",
+          vfp_get_s(&c, 2));
+    CHECK((c.vfp_fpscr & 0x9fu) == ARM_FPSCR_UFC,
+          "flags %02x, want UFC alone", c.vfp_fpscr & 0x9fu);
+}
+
 /* A VLDM whose list crosses into unmapped memory must abort like an LDM. The
  * flat test bus never faults, so this checks the plumbing instead: a load that
  * runs is a load that reached vfp_bus, and the abort latch stays clear. */
 static void test_ldm_uses_the_translating_bus(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     uint32_t prog[] = { VFP_LS(0,1,0,0,1, 1, 0, 1, 8) };  /* VLDMIA r1, {d0-d3} */
     for (unsigned i = 0; i < 8; i++) m_w32(NULL, 0x7000u + i*4u, 0x5a5a0000u + i);
     c.r[1] = 0x7000;
@@ -1638,10 +1722,12 @@ static void fault_first_w32(arm_cpu_t *c, uint32_t va, uint32_t v) {
     c->abort_fsr = ARM_FSR_PAGE_TRANSLATION | (1u << 11);
     c->abort_far = va;
 }
-static const vfp_bus_t g_fault_first_bus = { fault_first_r32, fault_first_w32 };
+static const vfp_bus_t g_fault_first_bus = {
+    .read32 = fault_first_r32, .write32 = fault_first_w32,
+};
 
 static void test_double_transfers_stop_after_the_first_abort(void) {
-    arm_cpu_t c;
+    arm_cpu_t c = {0};
     static const uint32_t insns[] = {
         VFP_LS(1,1,0,0,1, 1,0,1,0),            /* VLDR   d0,[r1]   */
         VFP_LS(0,1,0,0,1, 1,0,1,2),            /* VLDMIA r1,{d0}  */
@@ -1671,7 +1757,7 @@ static void test_double_transfers_stop_after_the_first_abort(void) {
 
 /* Conditional execution applies to VFP like everything else. */
 static void test_condition_codes_apply(void) {
-    arm_cpu_t c; vfp_reset(&c);
+    arm_cpu_t c = {0}; vfp_reset(&c);
     /* ADDEQ-style: make the VADD NE, then set Z so it is skipped. */
     uint32_t prog[] = { (DP_S(0,1,1,0, 2,0,1) & 0x0fffffffu) | 0x10000000u };
     set_f32(&c, 0, 1.0f); set_f32(&c, 1, 2.0f); set_f32(&c, 2, 99.0f);
@@ -1727,6 +1813,8 @@ int main(void) {
     test_fpscr_mode_handling();
     test_flush_to_zero();
     test_default_nan();
+    test_nan_propagation_is_arms();
+    test_flush_to_zero_of_a_result_the_host_rounded_to_zero();
     test_ldm_uses_the_translating_bus();
     test_double_transfers_stop_after_the_first_abort();
     test_condition_codes_apply();

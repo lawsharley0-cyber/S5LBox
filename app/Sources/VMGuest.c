@@ -598,7 +598,7 @@ bool vm_guest_install(s5l8900_t *m) {
     emitter_t e = { blob, 0 };
 
     static const char banner[] =
-        "S5LBox: S5L8900 running on this device.\r\n"
+        "NEON: S5L8900 running on this device.\r\n"
         "ARMv6 interpreter -> system bus -> guest DRAM.\r\n"
         "Painting a 320x480 32bpp framebuffer.\r\n";
     static const char msg[] = "guest: frame ";

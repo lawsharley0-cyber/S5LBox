@@ -876,7 +876,7 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     NSString *message = self.guestInstallRequest
         ? @"For a new install, this downloads exact, pinned iPhone OS 3 "
            @"packages from the publisher's archive and replaces only the "
-           @"selected virtual machine's writable disk. S5LBox does not bundle "
+           @"selected virtual machine's writable disk. NEON does not bundle "
            @"the packages. A compatible older Cydia machine is instead copied "
            @"to expand it to 2 GiB and, when needed, repair the exact known "
            @"legacy Cydia executable permissions without redownloading or "
@@ -1024,32 +1024,37 @@ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [self presentViewController:picker animated:YES completion:nil];
 }
 
+/* "ir", "micro-op" and "jit" are settings saved by builds that offered tiers
+ * which no longer exist; the core runs them on the cached interpreter. */
 - (NSString *)describeCpuBackend:(NSString *)backend {
     if ([backend isEqualToString:@"cached"] || [backend isEqualToString:@"block"] || [backend isEqualToString:@"cached-block"])
-        return @"Cached Blocks (Fastmem)";
-    if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"])
-        return @"Micro-Op IR (Optimized)";
-    if ([backend isEqualToString:@"jit"])
-        return @"ARM64 Native JIT";
-    return @"Reference Interpreter (Safe)";
+        return @"Cached Interpreter";
+    if ([backend isEqualToString:@"ir"] || [backend isEqualToString:@"micro-op"] ||
+        [backend isEqualToString:@"jit"])
+        return @"Cached Interpreter (from an older setting)";
+    return @"Standard";
 }
 
 - (void)chooseCpuBackendAt:(NSIndexPath *)indexPath inTable:(UITableView *)tableView {
     NSString *current = [_settings cpuBackend];
     NSString *message =
-        @"Choose CPU execution tier for the S5L8900 ARM CPU. "
-        @"Reference Interpreter provides 100% compliant execution. "
-        @"Cached Blocks and Micro-Op IR provide substantial speedups on device.";
+        @"Both backends execute the same ARM semantics. The cached interpreter "
+        @"predecodes guest code into blocks and runs anything unusual through "
+        @"the reference interpreter's own code. Standard is the reference "
+        @"interpreter plus, in this build, the compact build-time AArch64 engine "
+        @"where it applies. On an iPhone, over full boots, the cached interpreter "
+        @"ran about twice as many guest instructions per second (209 and 234 M "
+        @"against 115 M), so it is the default. Standard stays available for "
+        @"comparison. Performance & Sound Details shows the counters. Applies at "
+        @"the next start.";
     UIAlertController *picker = [UIAlertController
         alertControllerWithTitle:@"CPU Execution Backend"
                          message:message
                   preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSDictionary<NSString *, NSString *> *> *backends = @[
-        @{ @"id": @"interp", @"name": @"Reference Interpreter (Safe, Exact)" },
-        @{ @"id": @"cached", @"name": @"Cached Blocks (Fastmem Dispatcher)" },
-        @{ @"id": @"ir",     @"name": @"Micro-Op IR (Optimized Pipeline)" },
-        @{ @"id": @"jit",    @"name": @"ARM64 Native JIT" },
+        @{ @"id": @"cached", @"name": @"Cached Interpreter (default)" },
+        @{ @"id": @"interp", @"name": @"Standard" },
     ];
 
     __weak VMSettingsViewController *weakSelf = self;

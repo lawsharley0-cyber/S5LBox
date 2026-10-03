@@ -409,7 +409,7 @@ static void expect_halt_error(md_raw_bridge_error_code_t code,
 }
 
 static void test_read_write_and_exact_uio_commit(void) {
-    arm_cpu_t before;
+    arm_cpu_t before = {0};
     uint8_t expected[32];
     size_t i;
 
@@ -1739,8 +1739,8 @@ static void test_exact_gate_and_configuration(void) {
 }
 
 static void test_exact_svc_pair_redirect_and_halt_rollback(void) {
-    arm_cpu_t before;
-    arm_cpu_t normalized;
+    arm_cpu_t before = {0};
+    arm_cpu_t normalized = {0};
     arm_status_t status;
 
     fixture_init();

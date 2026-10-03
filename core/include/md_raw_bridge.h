@@ -73,6 +73,14 @@ typedef struct {
     const vm_block_t *block;
     vm_block_cancel_fn cancelled;
     void *cancel_context;
+    /*
+     * Optional: told after the bridge writes guest RAM directly (not through
+     * the bus), with the physical address and length written. The machine
+     * uses it to invalidate cached-interpreter code the data replaced
+     * (s5l8900_note_ram_write). NULL is valid and means nobody needs to know.
+     */
+    void (*ram_written)(void *context, uint64_t pa, uint64_t length);
+    void *ram_written_context;
 } md_raw_bridge_config_t;
 
 typedef struct {

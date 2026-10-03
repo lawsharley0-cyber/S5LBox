@@ -380,7 +380,7 @@ static void expect_error(fixture_t *fixture,
 
 static void test_success_and_cpu_immutability(void) {
     fixture_t fixture;
-    arm_cpu_t before;
+    arm_cpu_t before = {0};
     uint8_t source_copy[32];
     size_t i;
 
@@ -749,7 +749,7 @@ static void test_real_ram_base_translation_and_bulk_offsets(void) {
     const uint32_t l1_address = ttbr0 + ((stack_va >> 20) << 2);
     fixture_t fixture;
     md_bridge_config_t config;
-    arm_cpu_t before;
+    arm_cpu_t before = {0};
 
     fixture_init(&fixture);
     set_request(&fixture, MD_BRIDGE_DIRECTION_READ,
@@ -1111,7 +1111,7 @@ static void test_saturating_statistics(void) {
 
 static void test_arm_step_success_and_error(void) {
     fixture_t fixture;
-    arm_cpu_t before;
+    arm_cpu_t before = {0};
     arm_status_t status;
     uint64_t failures_before;
 
@@ -1184,8 +1184,8 @@ static void test_arm_step_success_and_error(void) {
 static void test_exact_patched_thumb_pair(void) {
     fixture_t fixture;
     md_bridge_config_t config;
-    arm_cpu_t before;
-    arm_cpu_t normalized;
+    arm_cpu_t before = {0};
+    arm_cpu_t normalized = {0};
     arm_status_t status;
 
     fixture_init(&fixture);

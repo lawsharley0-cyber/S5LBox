@@ -43,6 +43,12 @@
 #define ARM_CPSR_I (1u << 7)  /* IRQ disable  */
 #define ARM_CPSR_F (1u << 6)  /* FIQ disable  */
 #define ARM_CPSR_T (1u << 5)  /* Thumb state  */
+/* ARMv7 execution-state bits besides T: ITSTATE is IT[7:2] = CPSR[15:10] and
+ * IT[1:0] = CPSR[26:25]; J is CPSR[24]. On the ARM1176 these are reserved and
+ * nothing here reads them. MSR cannot write them on ARMv7 and MRS reads them
+ * as zero; exception entry clears IT and SPSR carries it across a handler. */
+#define ARM_CPSR_IT_MASK 0x0600fc00u
+#define ARM_CPSR_J (1u << 24)
 #define ARM_CPSR_MODE_MASK 0x1fu
 
 /* CP15 c1 system control register (SCTLR) bits we act on. */
@@ -56,6 +62,7 @@
 #define ARM_SCTLR_U (1u << 22)  /* ARMv6 unaligned half/word support */
 #define ARM_SCTLR_EE (1u << 25) /* CPSR.E value taken on exception entry */
 #define ARM_SCTLR_FA (1u << 29) /* force extended-descriptor access flag */
+#define ARM_SCTLR_TE (1u << 30) /* ARMv7: exceptions are taken in Thumb state */
 /*
  * XP: extended page tables. Clear, the MMU reads the ARMv5-compatible
  * descriptor layout, where a small page carries four sets of subpage AP bits
@@ -73,6 +80,17 @@
 #define ARM1176_CACHE_TYPE 0x1d152152u
 /* VFP11 identity register as reported by the ARM1176JZF-S. */
 #define ARM1176_FPSID      0x410120b4u
+/*
+ * The Cortex-A8's VFPv3/Advanced SIMD identity registers. Read from Unicorn
+ * 2.1.4's Cortex-A8 model with VMRS (its values are QEMU's, taken from ARM's
+ * Cortex-A8 TRM); they are not a reading from an iPhone 3GS. MVFR0 advertises
+ * 32 D registers, VFPv3 single and double, divide, square root, short vectors
+ * and all rounding modes, and NO exception trapping; MVFR1 advertises Advanced
+ * SIMD integer, single-precision float and load/store, and no half precision.
+ */
+#define CORTEX_A8_FPSID    0x410330c0u
+#define CORTEX_A8_MVFR0    0x11110222u
+#define CORTEX_A8_MVFR1    0x00011111u
 
 /*
  * FPEXC, the VFP exception register. Only EN matters here: it is the switch
@@ -135,6 +153,75 @@
 #define ARM1176_ID_ISAR3   0x01102131u
 #define ARM1176_ID_ISAR4   0x00000141u
 #define ARM1176_ID_ISAR5   0x00000000u
+
+/*
+ * The Cortex-A8's CP15 identification block (ARM_ARCH_V7_A8).
+ *
+ * Unless noted, each value was read with MRC from Unicorn 2.1.4's Cortex-A8
+ * model, which is QEMU's, which took them from ARM's Cortex-A8 TRM. None is a
+ * reading from an iPhone 3GS. MIDR in particular is r0p0; the 3GS's revision
+ * is not known here. iOS 6's kernel reads MIDR once (0x8007dc8c), overwrites
+ * its architecture field with 8, and uses only the implementer (0x41) and
+ * the part number (0xc08) from it: 0x8008db94 maps part 0xc08 to its
+ * Cortex-A8 CPU family constant. The revision is never consulted there.
+ *
+ * Three deliberate differences from that model, each the same kind of choice
+ * ARM1176_ID_DFR0 above makes, reporting what this emulator implements:
+ *   ID_PFR0  0x1031 there. ThumbEE ([15:12] = 1) is not implemented here, so
+ *            0x0031: ARM, Thumb-2, no Jazelle state, no ThumbEE.
+ *   ID_PFR1  0x11 there. The Security Extensions ([7:4] = 1) are not
+ *            implemented here (no Monitor mode, no SMC, no SCR, no banked
+ *            registers, no VBAR), so 0x01. TTBCR's PD0 and PD1 are kept all
+ *            the same, as the ARM1176 path keeps them (exec_cp15_v7).
+ *   ID_DFR0  0x400 there: v7 memory-mapped debug, which is not implemented.
+ */
+#define CORTEX_A8_MIDR     0x410fc080u
+#define CORTEX_A8_CTR      0x82048004u  /* ARMv7 format, 64-byte lines */
+#define CORTEX_A8_ID_PFR0  0x00000031u
+#define CORTEX_A8_ID_PFR1  0x00000001u
+#define CORTEX_A8_ID_DFR0  0x00000000u
+#define CORTEX_A8_ID_AFR0  0x00000000u
+#define CORTEX_A8_ID_MMFR0 0x31100003u
+#define CORTEX_A8_ID_MMFR1 0x20000000u
+#define CORTEX_A8_ID_MMFR2 0x01202000u
+#define CORTEX_A8_ID_MMFR3 0x00000011u
+#define CORTEX_A8_ID_ISAR0 0x00101111u
+#define CORTEX_A8_ID_ISAR1 0x12112111u
+#define CORTEX_A8_ID_ISAR2 0x21232031u
+#define CORTEX_A8_ID_ISAR3 0x11112131u
+#define CORTEX_A8_ID_ISAR4 0x00111142u
+#define CORTEX_A8_ID_ISAR5 0x00000000u
+/*
+ * The cache hierarchy. Unicorn's model has 16 KB L1 caches and no L2
+ * (CLIDR 0x0a000003), which is not the 3GS: iOS 6's own kernel cleans and
+ * invalidates its data caches by set and way with the geometry written into
+ * the loops (0x800862ec and 0x8007c248): level 1, 128 sets of 4 ways of
+ * 64-byte lines (32 KB); level 2, 512 sets of 8 ways of 64-byte lines
+ * (256 KB). The values below encode exactly that, in the ARMv7 CCSIDR layout
+ * (NumSets-1 [27:13], Associativity-1 [12:3], LineSize [2:0] = log2(words)-2).
+ * The write-policy bits [31:28] are Unicorn's: 0xe on the L1 data cache, 0x2
+ * on the instruction cache and 0xf on the L2 (its "no L2" placeholder). The
+ * instruction cache is given the data cache's geometry; iOS 6's kernel never
+ * selects it (its only CSSELR writes select level 1 data and level 2).
+ * CLIDR is Unicorn's with level 2 added as a unified cache (Ctype2 = 4).
+ */
+#define CORTEX_A8_CLIDR      0x0a000023u
+#define CORTEX_A8_CCSIDR_L1D 0xe00fe01au
+#define CORTEX_A8_CCSIDR_L1I 0x200fe01au
+#define CORTEX_A8_CCSIDR_L2  0xf03fe03au
+/*
+ * SCTLR on an ARMv7 VMSA core without the Security, Multiprocessing or
+ * Virtualization Extensions (ARMv7-A ARM, SCTLR): these bits read as one
+ * whatever is written (bits 3-6, 16, 18, U and XP), and these read as zero
+ * (31, NMFI 27 which is read-only and 0 here, 26, 20, 19, HA 17, 15, SW 10,
+ * and the legacy B, S and R, 7-9). The reset value is the read-as-one set,
+ * which is also what Unicorn's Cortex-A8 resets to. Unicorn does not enforce
+ * either set on a write; it stores what it is given.
+ */
+#define ARM_V7_SCTLR_RAO 0x00c50078u
+#define ARM_V7_SCTLR_RAZ 0x8c1a8780u
+/* ACTLR's reset value on Unicorn's Cortex-A8: L2EN (bit 1) set. */
+#define CORTEX_A8_ACTLR_RESET 0x00000002u
 
 /* ARMv6 fault status codes (FSR[3:0]); FSR[7:4] carries the domain. */
 #define ARM_FSR_ALIGNMENT           0x1u
@@ -332,6 +419,12 @@ typedef struct arm_cp15 {
     uint32_t tpidrurw;    /* c13,c0,2 user read/write */
     uint32_t tpidruro;    /* c13,c0,3 user read-only  */
     uint32_t tpidrprw;    /* c13,c0,4 privileged only */
+    /* ARMv7 (Cortex-A8) only. The ARM1176 has none of these, so they stay
+     * zero on it and a snapshot, which only holds an ARM1176, does not store
+     * them. */
+    uint32_t par;         /* c7,c4,0  physical address (ATS result) */
+    uint32_t csselr;      /* p15,2,c0,c0,0 cache size selection    */
+    uint32_t l2auxcr;     /* p15,1,c9,c0,2 A8 L2 auxiliary control */
 } arm_cp15_t;
 
 /*
@@ -349,8 +442,26 @@ typedef struct arm_cp15 {
  */
 typedef enum {
     ARM_ARCH_V6_ARM1176 = 0,  /* S5L8900 / iPhone OS 3 -- the current target */
-    ARM_ARCH_V7_SWIFT   = 1   /* S5L8950X / iPhone 5, ARMv7s -- roadmap P2   */
+    ARM_ARCH_V7_SWIFT   = 1,  /* S5L8950X / iPhone 5, ARMv7s -- roadmap P2   */
+    ARM_ARCH_V7_A8      = 2   /* S5L8920 / iPhone 3GS, Cortex-A8 ARMv7-A --
+                                 the iOS 6 target (docs/IOS6_READINESS.md)  */
 } arm_arch_t;
+
+/*
+ * Ask these, never compare the enum's order. The values are not a ladder: the
+ * Cortex-A8 is ARMv7-A without the integer divider, so "SWIFT or later" would
+ * hand it SDIV/UDIV it does not have.
+ *
+ *   ARMv7 (either core):  Thumb-2, the IT block, MOVW/MOVT, bitfield ops,
+ *                         barriers, CPSR execution-state bits.
+ *   hardware divide:      SDIV/UDIV, ARM and Thumb. Swift only.
+ */
+static inline bool arm_arch_is_v7(arm_arch_t a) {
+    return a != ARM_ARCH_V6_ARM1176;
+}
+static inline bool arm_arch_has_divide(arm_arch_t a) {
+    return a == ARM_ARCH_V7_SWIFT;
+}
 
 /*
  * Direct-mapped, power of two so the index is a mask rather than a modulo.
@@ -413,9 +524,14 @@ typedef struct arm_cpu {
      * onto these, not a separate bank: dN is the pair (vfp_s[2N], vfp_s[2N+1])
      * with the LOW-order word first. Keeping one array and deriving dN from it
      * is what makes the aliasing impossible to get wrong — there is no second
-     * copy that could drift. There is no d16-d31 on this part; see vfp.c.
+     * copy that could drift.
+     *
+     * Words 32-63 are d16-d31, which exist only on the ARMv7 profiles (VFPv3
+     * D32 with Advanced SIMD, where qN is the pair d2N, d2N+1). They have no
+     * single-precision names. The ARM1176 has no d16-d31, so vfp.c refuses
+     * every encoding that would name one there and these words stay zero.
      */
-    uint32_t vfp_s[32];
+    uint32_t vfp_s[64];
 
     /*
      * THE TRANSLATION CACHE, and why the model went without one for so long.
@@ -482,6 +598,13 @@ typedef struct arm_cpu {
     uint32_t fetch_blk;    /* the 1 KB-aligned VA it covers                   */
     uint32_t fetch_gen;    /* the tlb_gen it was resolved under               */
     bool     fetch_priv;   /* and the privilege, which changes permission     */
+    /* Incremented by arm_reset() and by a snapshot restore, never cleared.
+     * Both set tlb_gen back to 1, so a cache that lives OUTSIDE this struct
+     * and is keyed by tlb_gen (the cached interpreter's host TLBs) cannot
+     * tell a pre-reset generation from a post-reset one by tlb_gen alone.
+     * Host-derived and not snapshotted; it occupies padding, so the struct
+     * size is unchanged. */
+    uint32_t reset_epoch;
     /*
      * THE DATA-READ BLOCK CACHE — the same trick as the fetch cache above,
      * applied to the other half of §6.1 of docs/dynarec.md.
@@ -604,6 +727,24 @@ uint32_t arm_mmu_translate(arm_cpu_t *cpu, uint32_t va, arm_access_t acc,
 bool arm_fetch_cache_try_refill(arm_cpu_t *cpu, uint32_t va, bool priv);
 
 /*
+ * An ARMv7 address translation operation (ATS1CPR/CPW/CUR/CUW: CP15 c7,c8,
+ * opc2 0-3): the translation a data access of this kind would get, as the
+ * value it leaves in PAR. No abort is taken and no fault register changes,
+ * and the TLB is neither read nor filled; the result is a fresh walk.
+ *
+ * PAR, short-descriptor format (ARMv7-A ARM, PAR):
+ *   success  PA[31:12] in [31:12], SS [1] set for a supersection (then only
+ *            PA[31:24] is given and [23:12] are zero: no 40-bit addresses
+ *            here), F [0] clear. The memory-attribute fields [11:2] are zero:
+ *            this machine models no memory types, and Unicorn's Cortex-A8
+ *            reports none either. iOS 6 clears [11:0] before use (0x80088eb0).
+ *   fault    F [0] set, FS[3:0] in [4:1], FS[4] in [5], ExT in [6]: the DFSR
+ *            bits the access would have reported, without domain or WnR.
+ * With the MMU off it is the flat mapping, VA[31:12].
+ */
+uint32_t arm_mmu_ats(arm_cpu_t *cpu, uint32_t va, bool write, bool priv);
+
+/*
  * Drop every cached translation. Call this wherever the guest does something
  * that could change what a walk would return: CP15 c8 maintenance (which is
  * what the architecture requires of it), a TTBR/TTBCR/DACR/SCTLR write, or a
@@ -611,6 +752,12 @@ bool arm_fetch_cache_try_refill(arm_cpu_t *cpu, uint32_t va, bool priv);
  * flushing less is a stale mapping that surfaces days later as a wild store.
  */
 void     arm_mmu_tlb_flush(arm_cpu_t *cpu);
+/* Perform the translation-register check every walk performs first: if SCTLR,
+ * TTBR0/1, TTBCR, DACR or CONTEXTIDR changed by a route that did not flush
+ * (direct host mutation, snapshot restore), flush now and re-stamp. A caller
+ * that caches translations of its own (the cached interpreter) calls this
+ * before trusting them. No effect with the MMU off. */
+void     arm_mmu_sync_stamp(arm_cpu_t *cpu);
 
 /* Which bank a CPSR mode value selects (USR and SYS share ARM_BANK_USR). */
 arm_bank_t arm_bank_of_mode(uint32_t mode);

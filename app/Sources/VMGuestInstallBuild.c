@@ -140,7 +140,7 @@ static vm_guest_install_build_status_t build_rootfs_refusal(
     if (status == ROOTFS_WORK_HFS_INVALID && rootfs &&
         strstr(rootfs->detail, "not cleanly unmounted") != NULL) {
         build_detail(detail, detail_capacity,
-                     "Guest-disk maintenance needs a clean guest shutdown. Reopen this machine, hold Power, slide to power off, wait until the guest halts, return to Machines, and try again. S5LBox will not guess-repair this unjournaled HFS disk.");
+                     "Guest-disk maintenance needs a clean guest shutdown. Reopen this machine, hold Power, slide to power off, wait until the guest halts, return to Machines, and try again. NEON will not guess-repair this unjournaled HFS disk.");
         return VM_GUEST_INSTALL_BUILD_ERR_STORAGE_NOT_CLEAN;
     }
     build_detail(detail, detail_capacity,

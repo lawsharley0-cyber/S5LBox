@@ -98,6 +98,25 @@ jobs:
           fi
           "$bin" --insns 20000000 --reps 5
 
+      # Reference vs cached interpreter on the compiled guest workloads
+      # (docs/BENCHMARK_RESULTS.md). A MEASUREMENT, NOT A GATE, for the reasons
+      # above -- except that cpubench exits non-zero when a guest result is
+      # wrong or the two backends end in different architectural states, and
+      # that correctness failure stays visible here. Scaled down (--div 4,
+      # one repetition) to about a minute per runner; the ratio column, not
+      # the absolute rate, is what a shared runner can support.
+      - name: CPU engine A/B (measurement, not a gate)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          bin="$(find build -type f \( -name cpubench -o -name cpubench.exe \) | head -n 1)"
+          if [ -z "$bin" ]; then
+            echo "cpubench was not built" >&2
+            exit 1
+          fi
+          "$bin" --backend interp,cached --reps 1 --div 4 --mode user,svc
+
       # JIT executability. A MEASUREMENT, NOT A GATE — for the same reason as
       # the step above: it reports a host POLICY, and asserting one would make
       # this a test of the runner rather than of the code. ctest already gates
@@ -351,6 +370,11 @@ jobs:
     # code that can address anything, so run the whole suite under the address
     # and undefined-behaviour sanitizers. These are unavailable on the Windows
     # dev machine, which makes this job the real safety net.
+    #
+    # Uninitialised locals are filled with 0xFE bytes rather than whatever the
+    # stack held. A test that forgets to zero an arm_cpu_t then gets an ARMv7
+    # `arch` every time, here, instead of only on the runners whose stack
+    # happens to be dirty (the macOS static-engine job found one that way).
     name: asan + ubsan
     runs-on: ubuntu-latest
     steps:
@@ -362,7 +386,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DS5LBOX_JIT=ON \
             -DS5LBOX_STATIC_A64_ENGINE=ON \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -ftrivial-auto-var-init=pattern"
 
       - name: Build
         run: cmake --build build-san

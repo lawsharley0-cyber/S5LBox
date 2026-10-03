@@ -33,6 +33,7 @@
 #import "EmulatorViewController.h"
 #import "VMButtonBar.h"
 #import "VMEngine.h"
+#import "VMN88Engine.h"
 #import "VMConsoleViewController.h"
 #import "VMFramebufferView.h"
 #import "VMGuest.h"
@@ -62,6 +63,7 @@ extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 // Scrollback kept in the console. The guest prints one short line per frame
 // forever, so this cannot be unbounded.
 static const NSUInteger kConsoleScrollback = 12000;
+static const NSUInteger kReportConsoleLines = 40;
 
 /*
  * iOS 26 added UINavigationController's content-wide interactive pop gesture
@@ -174,6 +176,11 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     BOOL               _consoleDirty;
 
     VMEngine          *_engine;
+    /* The iPhone 3GS preview machine's engine, used instead of _engine (which
+     * stays nil, so every S5L8900 feature is inert) when this machine carries
+     * the iPhone 3GS device record. */
+    VMN88Engine       *_n88;
+    BOOL               _isIPhone3GS;
     CADisplayLink     *_link;
     uint8_t           *_frame;        // main thread's copy of the guest's pixels
     NSUInteger         _ticks;
@@ -278,6 +285,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 - (void)viewDidLoad {
     [super viewDidLoad];
     _checkpointBackgroundTask = UIBackgroundTaskInvalid;
+    _isIPhone3GS =
+        [[VMInstanceStore sharedStore] isIPhone3GSInstanceWithID:self.instanceID];
     self.view.backgroundColor = [UIColor blackColor];
 
     /* Machines benefits from a large browsing title; the running guest does
@@ -390,7 +399,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [self.view addSubview:_toolbar];
     [self refreshRunControls];
 
-    [self append:@"S5LBox  ·  on-device self-test"];
+    [self append:@"NEON  ·  on-device self-test"];
     [self append:@"================================\n"];
     [self reportEnvironment];
     [self append:@"\n-- emulated S5L8900 --"];
@@ -444,8 +453,40 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         [self appDidEnterBackground:nil];
 }
 
+/*
+ * The iPhone 3GS: iPhone OS 3.1.3 from this machine's own root filesystem,
+ * with touch and the buttons, or the iOS 6 preview's boot log, by the
+ * firmware imported (VMN88Engine.h); its screen is presented in -tick:. A
+ * refusal goes to the console, because this runs before the screen is on a
+ * window and an alert would be lost.
+ */
+- (void)launchIPhone3GS {
+    [_n88 stop];
+    _n88 = nil;
+    NSString *folder = self.instanceID.length
+        ? [[VMInstanceStore sharedStore] directoryForInstanceWithID:self.instanceID]
+        : nil;
+    VMN88Engine *engine = [[VMN88Engine alloc] initWithMachineDirectory:folder];
+    NSString *why = nil;
+    if (![engine startWithError:&why]) {
+        [self appendConsole:[engine takePendingConsoleText]];
+        [self append:[@"[neon] " stringByAppendingString:
+                         why ?: @"the machine could not be started"]];
+        [self refreshRunControls];
+        return;
+    }
+    _n88 = engine;
+    [self appendConsole:[_n88 takePendingConsoleText]];
+    [self applyPauseState];
+    [self refreshRunControls];
+}
+
 - (void)launchEngine {
     if (!_frame) return;
+    if (_isIPhone3GS) {
+        [self launchIPhone3GS];
+        return;
+    }
 
     _engine = [[VMEngine alloc] initWithInstanceID:self.instanceID];
     if (![_engine start]) {
@@ -514,6 +555,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_link invalidate];
     [_engine stop];
+    [_n88 stop];
     free(_frame);
 }
 
@@ -580,6 +622,9 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * state left to serialize. Leaving is still safe and must not trap the
      * user behind a save button that can never succeed. */
     if (!_engine || ![_engine isRunning]) {
+        /* The iPhone 3GS saves no checkpoint: stopping flushes and closes its
+         * root filesystem, as pulling a battery would leave it. */
+        [_n88 stop];
         [self.navigationController popViewControllerAnimated:YES];
         return;
     }
@@ -680,6 +725,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                      : backgroundPause ? @"background"
                                        : nil;
     [_engine setPaused:paused reason:reason];
+    [_n88 setPaused:paused];
 
     /*
      * The link stops only when the app is hidden — NOT when the machine is
@@ -703,8 +749,9 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
  * tapped, so a machine that stopped on its own — a halt, or a reached
  * instruction cap — is shown as stopped without anything having to notice. */
 - (void)refreshRunControls {
-    const BOOL showPlay = (_engine == nil) || [_engine isPaused] ||
-                          ![_engine isRunning];
+    const BOOL showPlay = _isIPhone3GS
+        ? (_n88 == nil || [_n88 isPaused] || ![_n88 isRunning])
+        : ((_engine == nil) || [_engine isPaused] || ![_engine isRunning]);
     if (_toolbarBuilt && showPlay == _toolbarShowsPlay) return;
     _toolbarShowsPlay = showPlay;
     _toolbarBuilt = YES;
@@ -766,8 +813,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     /* A halted machine cannot resume because its s5l8900_t is gone. Older
      * builds silently routed Play through Reset, disguising a terminal stop as
      * a failed resume and destroying the evidence. Ask before a fresh boot. */
-    if (!_engine || ![_engine isRunning]) {
-        NSString *state = _engine ? [_engine statusDescription] : @"no machine";
+    const BOOL alive = _isIPhone3GS ? (_n88 && [_n88 isRunning])
+                                    : (_engine && [_engine isRunning]);
+    if (!alive) {
+        NSString *state = _isIPhone3GS
+            ? (_n88 ? [_n88 statusLine] : @"not started")
+            : (_engine ? [_engine statusDescription] : @"no machine");
         NSString *message = [NSString stringWithFormat:
             @"The machine cannot resume because it is %@. Restarting performs "
              "a fresh boot; it does not continue the stopped CPU state.", state];
@@ -791,7 +842,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
     /* Play clears a stale lifecycle pause in one tap instead of layering a new
      * user pause on top of an engine which is already suspended. */
-    _userPaused = ![_engine isPaused];
+    _userPaused = _isIPhone3GS ? ![_n88 isPaused] : ![_engine isPaused];
     [self applyPauseState];
     [self refreshStatusLine];
 }
@@ -804,6 +855,19 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * Its final publication — the last of the guest's output, and the engine's
      * own "stopped" line — happens on a thread whose only reader is about to
      * be dropped, so anything not collected here is lost. */
+    if (_isIPhone3GS) {
+        /* Stop (which flushes and closes this machine's root filesystem, if it
+         * has one), then boot again. */
+        [self appendConsole:[_n88 takePendingConsoleText]];
+        [_n88 stop];
+        [self appendConsole:[_n88 takePendingConsoleText]];
+        _n88 = nil;
+        _userPaused = NO;
+        [self append:@"\n[neon] reset: booting the iPhone 3GS again"];
+        [self launchEngine];
+        [self refreshStatusLine];
+        return;
+    }
     [self appendConsole:[_engine takePendingConsoleText]];
     [self append:@"\n[vm] reset requested; waiting for the old machine"];
 
@@ -1012,9 +1076,20 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 #pragma mark - Phone controls
 
+/* A button for whichever machine this screen runs. */
+- (BOOL)sendButton:(VMButton)button pressed:(BOOL)pressed {
+    return _isIPhone3GS ? [_n88 setButton:button pressed:pressed]
+                        : [_engine setButton:button pressed:pressed];
+}
+
+- (BOOL)machineButtonHeld:(VMButton)button {
+    return _isIPhone3GS ? [_n88 isButtonPressed:button]
+                        : [_engine isButtonPressed:button];
+}
+
 - (void)phoneShell:(VMPhoneShellView *)shell button:(VMButton)button pressed:(BOOL)pressed {
     (void)shell;
-    [_engine setButton:button pressed:pressed];
+    [self sendButton:button pressed:pressed];
 }
 
 - (void)phoneShellShowControls:(VMPhoneShellView *)shell {
@@ -1041,8 +1116,9 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     UIAlertController *menu = [UIAlertController
         alertControllerWithTitle:@"iPhone Controls"
         message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    const BOOL machinePaused = _isIPhone3GS ? [_n88 isPaused] : [_engine isPaused];
     [menu addAction:[UIAlertAction actionWithTitle:
-        ([_engine isPaused] ? @"Resume" : @"Pause")
+        (machinePaused ? @"Resume" : @"Pause")
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf playPauseTapped:nil];
         }]];
@@ -1084,18 +1160,32 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf showPerformanceReport];
         }]];
+    [menu addAction:[UIAlertAction actionWithTitle:@"Save Full Test Report"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [weakSelf saveFullTestReport];
+        }]];
     for (NSNumber *key in @[@(VMButtonVolumeUp), @(VMButtonVolumeDown)]) {
         [menu addAction:[UIAlertAction actionWithTitle:[VMEngine nameForButton:key.unsignedIntegerValue]
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
                 EmulatorViewController *vc = weakSelf;
                 if (!vc) return;
-                VMEngine *engine = vc->_engine;
                 VMButton button = (VMButton)key.unsignedIntegerValue;
-                [engine setButton:button pressed:YES];
+                [vc sendButton:button pressed:YES];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                    dispatch_get_main_queue(), ^{ [engine setButton:button pressed:NO]; });
+                    dispatch_get_main_queue(), ^{ [weakSelf sendButton:button pressed:NO]; });
             }]];
     }
+    /* The ringer is a two-position slider, not a key: it stays where it is put.
+     * AppleM68Buttons only reports a change, so until it has been moved once
+     * the guest has never been told which position it is in. */
+    BOOL silent = [self machineButtonHeld:VMButtonRingerSilent];
+    [menu addAction:[UIAlertAction actionWithTitle:
+        (silent ? @"Ring/Silent Switch: Silent (switch to Ring)"
+                : @"Ring/Silent Switch: Ring (switch to Silent)")
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            EmulatorViewController *vc = weakSelf;
+            if (vc) [vc sendButton:VMButtonRingerSilent pressed:!silent];
+        }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Settings"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf settingsTapped:nil];
@@ -1169,8 +1259,20 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)showPerformanceReport {
-    [self setPerformanceVisible:YES];
+/* The last `count` lines of the collected console, whole lines only. */
+- (NSString *)consoleTail:(NSUInteger)count {
+    NSString *text = [_consoleText copy];
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSUInteger end = lines.count;
+    while (end && lines[end - 1].length == 0) end--;
+    NSUInteger start = end > count ? end - count : 0;
+    NSString *tail = [[lines subarrayWithRange:NSMakeRange(start, end - start)]
+                      componentsJoinedByString:@"\n"];
+    return tail.length ? tail : @"(nothing printed yet)";
+}
+
+/* The Performance & Sound text, without the console tail. */
+- (NSString *)performanceReportText {
     vm_frame_telemetry_snapshot_t state;
     vm_frame_telemetry_snapshot(&state);
     double seconds = state.scanout_last_host_ns > state.scanout_first_host_ns
@@ -1187,7 +1289,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
          "Measured window: %.1f s\nChanged scanouts: %llu\nLayer submissions: %llu\n"
          "Guest time / wall time: %.2fx (approximate)\n"
          "Longest scanout interval: %.1f ms\nScanout gaps >100 ms: %llu\n"
-         "Average image work: %.2f ms\n\n%@\n\n"
+         "Average image work: %.2f ms\n\n%@\n\n%@\n"
          "Layer submissions are not measured on-screen FPS. Start Show Performance, use the guest for 60 seconds, then reopen this report. Guest time is instruction-based, not cycle accurate.",
         host.machine, UIDevice.currentDevice.systemVersion, revision,
         [_engine statusLine] ?: @"No machine", seconds,
@@ -1196,13 +1298,130 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
         state.scanout_max_attempt_gap_ns / 1e6,
         (unsigned long long)state.scanout_attempt_gaps_over_100ms,
         state.layer_attempts ? (double)state.layer_total_work_ns / state.layer_attempts / 1e6 : 0,
-        [_engine audioStatusDescription] ?: @"Audio status unavailable"];
+        [_engine audioStatusDescription] ?: @"Audio status unavailable",
+        [_engine diagnosticsDescription] ?: @"Diagnostics unavailable"];
+    return report;
+}
+
+- (void)showPerformanceReport {
+    [self setPerformanceVisible:YES];
+    NSString *report = [self performanceReportText];
+    /* The guest console is where the kernel says why it stopped a process
+     * (a code-signing kill, for one), and it is collected even when the
+     * console view is hidden, so the report carries its tail. */
+    [self appendConsole:[_engine takePendingConsoleText]];
+    report = [report stringByAppendingFormat:@"\n\nGuest console, last %lu lines (open the app that fails, then this report):\n%@",
+              (unsigned long)kReportConsoleLines, [self consoleTail:kReportConsoleLines]];
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Performance & Sound"
         message:report preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"Copy Report" style:UIAlertActionStyleDefault
         handler:^(__unused UIAlertAction *action) { UIPasteboard.generalPasteboard.string = report; }]];
+    VMEngine *engine = _engine;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy Audio Driver Code" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) {
+            UIPasteboard.generalPasteboard.string = [engine audioDriverExcerpt] ?: @"No machine";
+        }]];
+    /* Each copy closes one profile window and opens the next, so the way to
+     * profile one activity is: copy (discard), do it, copy again. */
+    __weak EmulatorViewController *weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Copy Guest Profile" style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *action) {
+            if (!engine) {
+                UIPasteboard.generalPasteboard.string = @"No machine";
+                return;
+            }
+            [engine guestProfileReportWithCompletion:^(NSString *profile) {
+                UIPasteboard.generalPasteboard.string = profile;
+                EmulatorViewController *strongSelf = weakSelf;
+                if (!strongSelf || strongSelf.presentedViewController) return;
+                UIAlertController *copied = [UIAlertController alertControllerWithTitle:@"Guest Profile Copied"
+                    message:[@"A new profile window starts now.\n\n" stringByAppendingString:profile]
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [copied addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
+                [strongSelf presentViewController:copied animated:YES completion:nil];
+            }];
+        }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+/*
+ * EVERYTHING ONE TEST SESSION CAN TELL US, in one file: the Performance &
+ * Sound text, which machine and graphics mode this is, the whole console
+ * scrollback, the guest profile since the last copy, and the whole audio
+ * kext with the kernel functions it calls. Written to Documents/Reports (the
+ * Files app shows it under NEON) and offered to the share sheet; nothing is
+ * sent anywhere unless the user sends it.
+ */
+- (void)saveFullTestReport {
+    VMEngine *engine = _engine;
+    if (!engine) return;
+    [self appendConsole:[engine takePendingConsoleText]];
+    NSString *machine = @"(unknown machine)";
+    NSString *graphics = nil;
+    VMInstanceStore *store = [VMInstanceStore sharedStore];
+    for (NSUInteger i = 0; i < store.count; i++) {
+        NSDictionary *row = [store instanceAtIndex:i];
+        if (![row[@"id"] isEqual:self.instanceID]) continue;
+        machine = row[@"name"] ?: machine;
+        graphics = [store graphicsSummaryForInstanceWithID:self.instanceID];
+    }
+    NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+    stamp.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    stamp.dateFormat = @"yyyy-MM-dd'T'HH-mm-ss";
+    NSString *when = [stamp stringFromDate:[NSDate date]];
+    NSMutableString *full = [NSMutableString stringWithFormat:
+        @"NEON full test report %@\nMachine: %@ (%@)\n\n=== PERFORMANCE & SOUND ===\n%@\n\n=== GUEST CONSOLE (all kept lines) ===\n%@\n\n",
+        when, machine, graphics ?: @"graphics not recorded",
+        [self performanceReportText], [self consoleTail:NSUIntegerMax]];
+
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Saving Test Report"
+        message:@"Naming the guest profile and the audio driver. This takes a few seconds."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:working animated:YES completion:nil];
+    __weak EmulatorViewController *weakSelf = self;
+    [engine guestProfileReportWithCompletion:^(NSString *profile) {
+        [full appendFormat:@"=== GUEST PROFILE ===\n%@\n\n", profile];
+        [engine audioDriverDumpWithCompletion:^(NSString *audio) {
+            [full appendFormat:@"=== %@", audio];
+            EmulatorViewController *vc = weakSelf;
+            if (!vc) return;
+            NSString *documents = NSSearchPathForDirectoriesInDomains(
+                NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: NSTemporaryDirectory();
+            NSString *dir = [documents stringByAppendingPathComponent:@"Reports"];
+            NSString *path = [dir stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"NEON-test-%@.txt", when]];
+            NSError *error = nil;
+            BOOL saved = [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                    withIntermediateDirectories:YES attributes:nil error:&error] &&
+                [full writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error];
+            void (^finish)(void) = ^{
+                if (!saved) {
+                    UIPasteboard.generalPasteboard.string = full;
+                    UIAlertController *failed = [UIAlertController alertControllerWithTitle:@"Report Not Saved"
+                        message:[NSString stringWithFormat:@"%@\n\nThe report was copied to the clipboard instead.",
+                                 error.localizedDescription ?: @"The file could not be written."]
+                        preferredStyle:UIAlertControllerStyleAlert];
+                    [failed addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                    [vc presentViewController:failed animated:YES completion:nil];
+                    return;
+                }
+                UIActivityViewController *share = [[UIActivityViewController alloc]
+                    initWithActivityItems:@[ [NSURL fileURLWithPath:path] ] applicationActivities:nil];
+                /* iPad presents this as a popover and throws without an anchor. */
+                share.popoverPresentationController.sourceView = vc.view;
+                share.popoverPresentationController.sourceRect =
+                    CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
+                [vc presentViewController:share animated:YES completion:nil];
+            };
+            /* The progress alert may not have been shown (something else was
+             * on screen); dismissing it then would never call back. */
+            if (working.presentingViewController)
+                [working dismissViewControllerAnimated:YES completion:finish];
+            else
+                finish();
+        }];
+    }];
 }
 
 #pragma mark - Presentation
@@ -1228,8 +1447,20 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
                         height:fbH
                         stride:fbStride
                           argb:argb];
+    /* The iPhone 3GS preview publishes iBoot's framebuffer (VMN88Engine.h). */
+    if (_frame && [_n88 copyFrameInto:_frame
+                             capacity:VM_FB_BYTES
+                                width:&fbW
+                               height:&fbH
+                               stride:&fbStride])
+        [_screen presentPixels:_frame
+                         width:fbW
+                        height:fbH
+                        stride:fbStride
+                          argb:NO];
 
     [self appendConsole:[_engine takePendingConsoleText]];
+    [self appendConsole:[_n88 takePendingConsoleText]];
     [self flushConsole];
 
     // The status line reads as noise if it changes 30 times a second.
@@ -1272,7 +1503,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     /* One source for the machine's state: the engine. It reports "paused"
      * itself now, so prefixing "paused" here as well would produce
      * "paused · running", which is a contradiction rather than a status. */
-    NSString *machine = _engine ? ([_engine statusLine] ?: @"?") : @"no machine";
+    NSString *machine = _n88 ? [_n88 statusLine]
+                      : _engine ? ([_engine statusLine] ?: @"?") : @"no machine";
 
     /* The touch path's own account of itself. "Delivered" here means the
      * emulated controller ACCEPTED the report — not that the guest acted on
@@ -1421,9 +1653,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _touchX = x;
     _touchY = y;
 
-    // Returns NO today, and the status line says so. Routed through the engine
-    // anyway so there is exactly one place that will start returning YES.
-    [_engine sendTouchAtGuestX:x y:y phase:phase];
+    // The iPhone 3GS takes it from the screen to its touch controller; the
+    // S5L8900 engine queues it the same way.
+    if (_isIPhone3GS)
+        [_n88 sendTouchAtGuestX:x y:y phase:phase];
+    else
+        [_engine sendTouchAtGuestX:x y:y phase:phase];
     [self refreshStatusLine];
 }
 
@@ -1437,7 +1672,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * to the board's five switches. A NO here means it was not even queued —
      * the machine is not running, or the queue was full of edges that must not
      * be coalesced away — and never that the guest ignored it. */
-    [_engine setButton:button pressed:pressed];
+    [self sendButton:button pressed:pressed];
     [self refreshStatusLine];
 }
 

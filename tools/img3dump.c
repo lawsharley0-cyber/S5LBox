@@ -12,12 +12,19 @@
  *
  * Usage:
  *   img3dump <file.img3>                     describe the container
- *   img3dump <file.img3> -k <hex> -iv <hex> [-o out]
+ *   img3dump <file.img3> -k <hex> -iv <hex> [-o out] [-copy-tail]
+ *
+ * -copy-tail copies an unaligned last block through instead of decrypting it
+ * (img3_decrypt_data_iv_tail): how the iPhone 3G's accepted kernel.macho was
+ * made (docs/BOOT_CHAIN.md). Without it the tail is decrypted, as iBoot does,
+ * which a device tree's last property needs.
  *   img3dump -s <blob>                       scan a blob (e.g. a NOR dump)
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "img3.h"
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +104,8 @@ static void list_tags(const uint8_t *buf, size_t len) {
     }
 }
 
+static bool copy_tail;     /* -copy-tail */
+
 static int describe(const char *path, const char *keyhex, const char *ivhex, const char *outpath) {
     size_t len = 0;
     uint8_t *buf = slurp(path, &len);
@@ -168,8 +177,8 @@ static int describe(const char *path, const char *keyhex, const char *ivhex, con
         }
         uint8_t *plain = malloc(img.data_len);
         uint32_t n = 0;
-        bool ok = plain && img3_decrypt_data_iv(&img, key, bits, iv, plain,
-                                                 img.data_len, &n);
+        bool ok = plain && img3_decrypt_data_iv_tail(&img, key, bits, iv, plain,
+                                                      img.data_len, &n, !copy_tail);
         if (ok) {
             printf("decrypted   : %u bytes with a %u-bit key\n", n, bits);
             printf("first 32 bytes of plaintext:\n");
@@ -222,7 +231,7 @@ static int scan(const char *path) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <file.img3> [-k <hexkey> -iv <hexiv>] [-o <out.bin>]\n"
+            "usage: %s <file.img3> [-k <hexkey> -iv <hexiv>] [-o <out.bin>] [-copy-tail]\n"
             "       %s -s <blob>       scan a blob (e.g. a NOR dump)\n",
             argv[0], argv[0]);
         return 1;
@@ -232,10 +241,11 @@ int main(int argc, char **argv) {
         return scan(argv[2]);
     }
     const char *keyhex = NULL, *ivhex = NULL, *outpath = NULL;
-    for (int i = 2; i + 1 < argc; i += 2) {
-        if (strcmp(argv[i], "-k") == 0) keyhex = argv[i + 1];
-        else if (strcmp(argv[i], "-iv") == 0) ivhex = argv[i + 1];
-        else if (strcmp(argv[i], "-o") == 0) outpath = argv[i + 1];
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-copy-tail") == 0) copy_tail = true;
+        else if (i + 1 < argc && strcmp(argv[i], "-k") == 0) keyhex = argv[++i];
+        else if (i + 1 < argc && strcmp(argv[i], "-iv") == 0) ivhex = argv[++i];
+        else if (i + 1 < argc && strcmp(argv[i], "-o") == 0) outpath = argv[++i];
     }
     return describe(argv[1], keyhex, ivhex, outpath);
 }

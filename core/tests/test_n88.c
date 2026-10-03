@@ -1,0 +1,1472 @@
+/*
+ * NEON — the iPhone 3GS machine (n88.h), on synthetic inputs only.
+ *
+ * No Apple bytes: the kernel is a hand-built Mach-O holding a few ARM
+ * instructions and the device tree is built here with just the nodes
+ * bring-up fills in. What is checked:
+ *   - the bus: DRAM, the UART's status and transmit registers, unmodelled
+ *     addresses answering zero, counted and traced;
+ *   - the PMGR timer: count = cycles / 25, the decrementer's read-back and
+ *     expiry, the enable/acknowledge control, VIC0 line 6;
+ *   - a timer FIQ taken by a real program through the vector table, both
+ *     from WFI (time jumps to the expiry) and from a busy loop (the
+ *     interrupt lands on the same instruction on both CPU engines);
+ *   - the NVRAM image's partitions and CHRP checksums;
+ *   - bring-up: layout, boot_args version 5, every device-tree property it
+ *     fills in, the default and explicit un-match lists, and each refusal;
+ *   - the console ring, including overflow;
+ *   - telling a 3GS tree from another.
+ *
+ * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
+ */
+#include "n88.h"
+#include "aes.h"
+#include "macho.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_pass, g_fail;
+
+#define CHECK(cond, ...) do {                                               \
+    if (cond) g_pass++;                                                     \
+    else {                                                                  \
+        g_fail++;                                                           \
+        printf("  FAIL %s:%d: ", __func__, __LINE__);                       \
+        printf(__VA_ARGS__);                                                \
+        printf("\n");                                                       \
+    }                                                                       \
+} while (0)
+
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static uint32_t get32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
+           (uint32_t)p[3] << 24;
+}
+static uint8_t *ram_at(n88_t *m, uint32_t pa) { return m->ram + (pa - N88_DRAM_BASE); }
+
+/* ------------------------------------------------------- A32 encodings */
+
+static uint32_t movw(unsigned rd, uint32_t imm) {
+    return 0xe3000000u | (imm >> 12) << 16 | rd << 12 | (imm & 0xfffu);
+}
+static uint32_t movt(unsigned rd, uint32_t imm) {
+    return 0xe3400000u | (imm >> 12) << 16 | rd << 12 | (imm & 0xfffu);
+}
+static uint32_t mov_imm(unsigned rd, uint32_t imm8) { return 0xe3a00000u | rd << 12 | imm8; }
+static uint32_t str_off(unsigned rt, unsigned rn, uint32_t off) {
+    return 0xe5800000u | rn << 16 | rt << 12 | off;
+}
+static uint32_t ldr_off(unsigned rt, unsigned rn, uint32_t off) {
+    return 0xe5900000u | rn << 16 | rt << 12 | off;
+}
+static uint32_t add_imm(unsigned rd, unsigned rn, uint32_t imm8) {
+    return 0xe2800000u | rn << 16 | rd << 12 | imm8;
+}
+static uint32_t cmp_imm(unsigned rn, uint32_t imm8) { return 0xe3500000u | rn << 16 | imm8; }
+/* B<cond> from `at` to `to`. */
+static uint32_t branch(uint32_t cond, uint32_t at, uint32_t to) {
+    return cond << 28 | 0x0a000000u | (((to - at - 8u) >> 2) & 0x00ffffffu);
+}
+#define AL 0xeu
+#define EQ 0x0u
+#define B_SELF      0xeafffffeu
+#define SUBS_PC_LR4 0xe25ef004u
+#define CPSIE_F     0xf1080040u
+#define WFI         0xe320f003u
+
+/* Emit words at a physical address. */
+typedef struct { n88_t *m; uint32_t pa; } emit_t;
+static void emit(emit_t *e, uint32_t insn) { put32(ram_at(e->m, e->pa), insn); e->pa += 4u; }
+static void emit_const(emit_t *e, unsigned rd, uint32_t v) {
+    emit(e, movw(rd, v & 0xffffu));
+    emit(e, movt(rd, v >> 16));
+}
+
+/* ----------------------------------------------------------------- bus */
+
+typedef struct { unsigned calls; uint32_t pa, value; bool write; unsigned size; } trace_log_t;
+static void trace_cb(void *ctx, uint32_t pa, unsigned size, bool write, uint32_t value,
+                     uint32_t pc) {
+    trace_log_t *t = ctx;
+    (void)pc;
+    t->calls++;
+    t->pa = pa; t->size = size; t->write = write; t->value = value;
+}
+
+static void test_bus_routing(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    trace_log_t t = {0};
+    m->trace = trace_cb;
+    m->trace_ctx = &t;
+
+    n88_write32(m, N88_DRAM_BASE + 0x100u, 0xdeadbeefu);
+    CHECK(n88_read32(m, N88_DRAM_BASE + 0x100u) == 0xdeadbeefu, "DRAM round trip");
+    n88_write32(m, N88_DRAM_BASE + N88_DRAM_SIZE - 4u, 0x12345678u);
+    CHECK(get32(ram_at(m, N88_DRAM_BASE + N88_DRAM_SIZE - 4u)) == 0x12345678u,
+          "the last DRAM word is DRAM");
+    CHECK(m->mmio == 0 && m->unmodelled == 0 && t.calls == 0, "DRAM is not a device");
+
+    CHECK(n88_read32(m, N88_UART0_PA + 0x10u) == 0x6u, "UTRSTAT reports an empty transmitter");
+    n88_write32(m, N88_UART0_PA + 0x20u, 'A');
+    n88_write32(m, N88_UART0_PA + 0x20u, 0x142u);       /* only the low byte */
+    char out[8];
+    CHECK(n88_console_take(m, out, sizeof out) == 2 && out[0] == 'A' && out[1] == 'B',
+          "UTXH bytes reach the console");
+    CHECK(t.calls == 0 && m->unmodelled == 0, "the UART is modelled");
+
+    /* The GPIO pad controller is a faithful register file: a write is stored
+     * and read back, so the driver's read-modify-write of a pin's config
+     * keeps the pin's own bits (the always-zero stub lost them). */
+    CHECK(n88_read32(m, N88_GPIO_PA) == 0u, "GPIO resets to zero");
+    n88_write32(m, N88_GPIO_PA + 0x40u, 0x00000212u);
+    CHECK(n88_read32(m, N88_GPIO_PA + 0x40u) == 0x00000212u, "GPIO reads back a write");
+    {   /* read-modify-write a second bit keeps the first */
+        uint32_t v = n88_read32(m, N88_GPIO_PA + 0x40u);
+        n88_write32(m, N88_GPIO_PA + 0x40u, v | 0x10u);
+        CHECK(n88_read32(m, N88_GPIO_PA + 0x40u) == 0x00000212u, "RMW preserves prior bits");
+    }
+    n88_write32(m, N88_GPIO_PA + N88_GPIO_SIZE - 4u, 0xdeadbeefu);
+    CHECK(n88_read32(m, N88_GPIO_PA + N88_GPIO_SIZE - 4u) == 0xdeadbeefu, "last GPIO reg");
+    CHECK(m->unmodelled == 0 && t.calls == 0, "GPIO is modelled, not traced");
+
+    CHECK(n88_read32(m, 0x81234560u) == 0u, "an unmodelled register answers zero");
+    CHECK(m->unmodelled == 1 && t.calls == 1 && t.pa == 0x81234560u && !t.write &&
+          t.size == 4, "and is counted and traced");
+    n88_write32(m, 0x3fff0000u, 7u);            /* below DRAM */
+    CHECK(m->unmodelled == 2 && t.calls == 2 && t.write && t.value == 7u &&
+          t.pa == 0x3fff0000u, "an unmodelled store is counted and traced");
+    n88_free(m);
+    free(m);
+}
+
+/* --------------------------------------------------------------- timer */
+
+static void test_timer_registers(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+
+    m->cpu.cycles = 2500u;                      /* 100 ticks */
+    CHECK(n88_timer_count(m) == 100u, "count = cycles / 25");
+    CHECK(n88_read32(m, N88_TIMER_PA) == 100u && n88_read32(m, N88_TIMER_PA + 4u) == 0u,
+          "the count's two halves");
+    m->cpu.cycles = (UINT64_C(1) << 32) * N88_CYCLES_PER_TICK + 50u;
+    CHECK(n88_read32(m, N88_TIMER_PA + 4u) == 1u && n88_read32(m, N88_TIMER_PA) == 2u,
+          "the high half carries");
+    m->cpu.cycles = 2500u;
+
+    CHECK(n88_read32(m, N88_TIMER_PA + 8u) == 0u, "an unarmed decrementer reads zero");
+    n88_write32(m, N88_TIMER_PA + 8u, 40u);
+    m->cpu.cycles += 10u * N88_CYCLES_PER_TICK;
+    CHECK(n88_read32(m, N88_TIMER_PA + 8u) == 30u, "the decrementer counts down");
+    CHECK(!m->timer.pending, "not yet");
+
+    /* Enable the interrupt, route it as the kernel does (FIQ), let it expire. */
+    n88_write32(m, N88_TIMER_PA + 0x20u, 1u);
+    n88_write32(m, N88_VIC_PA + VIC_INTSELECT, 1u << N88_TIMER_LINE);
+    n88_write32(m, N88_VIC_PA + VIC_INTENABLE, 1u << N88_TIMER_LINE);
+    CHECK(!m->cpu.fiq_line && !m->cpu.irq_line, "no line before the expiry");
+    m->cpu.cycles += 30u * N88_CYCLES_PER_TICK;
+    n88_write32(m, N88_VIC_PA + VIC_INTENABLE, 1u << N88_TIMER_LINE);  /* any store updates */
+    CHECK(m->timer.pending && m->timer.fired == 1 && !m->timer.armed, "expired once");
+    CHECK(m->cpu.fiq_line && !m->cpu.irq_line, "VIC0 line 6 as FIQ");
+    CHECK(n88_read32(m, N88_VIC_PA + VIC_FIQSTATUS) == 1u << N88_TIMER_LINE &&
+          n88_read32(m, N88_VIC_PA + VIC_IRQSTATUS) == 0u, "VIC0 reports it as a FIQ");
+    CHECK(n88_read32(m, N88_TIMER_PA + 8u) == 0u, "an expired decrementer reads zero");
+
+    /* The handler's sequence: control | 2 (acknowledge), then control. */
+    n88_write32(m, N88_TIMER_PA + 0x20u, 3u);
+    CHECK(!m->timer.pending && !m->cpu.fiq_line, "bit 1 acknowledges");
+    n88_write32(m, N88_TIMER_PA + 0x20u, 1u);
+    CHECK(n88_read32(m, N88_TIMER_PA + 0x20u) == 1u, "control reads back without bit 1");
+
+    /* Disabled: it still expires, but raises nothing. */
+    n88_write32(m, N88_TIMER_PA + 0x20u, 0u);
+    n88_write32(m, N88_TIMER_PA + 8u, 5u);
+    m->cpu.cycles += 5u * N88_CYCLES_PER_TICK;
+    n88_write32(m, N88_VIC_PA + VIC_INTENABLE, 1u << N88_TIMER_LINE);
+    CHECK(m->timer.pending && m->timer.fired == 2 && !m->cpu.fiq_line,
+          "disabled: pending without a line");
+    n88_free(m);
+    free(m);
+}
+
+/*
+ * A timer FIQ through a real vector table. The MMU maps VA 0 and VA
+ * 0x40000000 to the first DRAM megabyte (sections), so the low vectors are
+ * RAM. The handler acknowledges the timer, bumps a counter at 0x40002000 and
+ * records r6 at 0x40002004. `wait` selects WFI (time jumps to the expiry)
+ * over a counting loop in r6 (the interrupt must land on an exact
+ * instruction).
+ */
+#define TICKS 1000u
+static void load_fiq_program(n88_t *m, bool wait) {
+    emit_t e = { m, N88_DRAM_BASE };
+    for (int i = 0; i < 7; i++) emit(&e, B_SELF);           /* 0x00..0x18 */
+    /* 0x1c: FIQ. r8-r12 are banked. */
+    emit_const(&e, 8, N88_TIMER_PA + 0x20u);
+    emit(&e, mov_imm(9, 3)); emit(&e, str_off(9, 8, 0));
+    emit(&e, mov_imm(9, 1)); emit(&e, str_off(9, 8, 0));
+    emit_const(&e, 10, N88_DRAM_BASE + 0x2000u);
+    emit(&e, ldr_off(11, 10, 0)); emit(&e, add_imm(11, 11, 1)); emit(&e, str_off(11, 10, 0));
+    emit(&e, str_off(6, 10, 4));
+    emit(&e, SUBS_PC_LR4);
+
+    e.pa = N88_DRAM_BASE + 0x1000u;
+    emit_const(&e, 0, N88_VIC_PA);
+    emit(&e, mov_imm(1, 1u << N88_TIMER_LINE));
+    emit(&e, str_off(1, 0, VIC_INTSELECT));
+    emit(&e, str_off(1, 0, VIC_INTENABLE));
+    emit_const(&e, 2, N88_TIMER_PA);
+    emit(&e, movw(3, TICKS)); emit(&e, str_off(3, 2, 8));
+    emit(&e, mov_imm(3, 1)); emit(&e, str_off(3, 2, 0x20));
+    emit(&e, mov_imm(6, 0));
+    emit(&e, CPSIE_F);
+    if (wait) {
+        emit(&e, WFI);
+    } else {
+        const uint32_t loop = e.pa;
+        emit_const(&e, 10, N88_DRAM_BASE + 0x2000u);
+        emit(&e, ldr_off(11, 10, 0));
+        emit(&e, add_imm(6, 6, 1));
+        emit(&e, cmp_imm(11, 0));
+        emit(&e, branch(EQ, e.pa, loop));
+    }
+    const uint32_t check = e.pa;
+    emit_const(&e, 10, N88_DRAM_BASE + 0x2000u);
+    emit(&e, ldr_off(11, 10, 0));
+    emit(&e, cmp_imm(11, 0));
+    emit(&e, branch(EQ, e.pa, check));
+    emit_const(&e, 4, N88_UART0_PA + 0x20u);
+    emit(&e, mov_imm(5, 'F')); emit(&e, str_off(5, 4, 0));
+    emit(&e, B_SELF);
+
+    /* Sections, full access: VA 0 and VA 0x40000000 -> PA 0x40000000, and
+     * the three device megabytes at their own addresses. */
+    const uint32_t tt = N88_DRAM_BASE + 0x4000u;
+    static const uint32_t map[][2] = {
+        { 0u, N88_DRAM_BASE }, { N88_DRAM_BASE, N88_DRAM_BASE },
+        { N88_UART0_PA, N88_UART0_PA }, { N88_TIMER_PA, N88_TIMER_PA },
+        { N88_VIC_PA, N88_VIC_PA },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+        put32(ram_at(m, tt + (map[i][0] >> 20) * 4u), (map[i][1] & 0xfff00000u) | 0xc02u);
+    m->cpu.cp15.ttbr0 = tt;
+    m->cpu.cp15.ttbcr = 0;
+    m->cpu.cp15.dacr = 1u;                      /* domain 0: client */
+    m->cpu.cp15.sctlr |= ARM_SCTLR_M;
+    m->cpu.cpsr = ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A;
+    m->cpu.r[15] = N88_DRAM_BASE + 0x1000u;
+}
+
+typedef struct { unsigned retired; uint64_t cycles; uint32_t count, r6_at_fiq; char out[4]; size_t outn; } fiq_result_t;
+
+static fiq_result_t run_fiq(bool engine, bool wait) {
+    fiq_result_t r = {0};
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, engine), "init");
+    if (!m || !m->ram) { free(m); return r; }
+    load_fiq_program(m, wait);
+    arm_status_t st = ARM_HALT;
+    const unsigned budget = wait ? 5000u : 60000u;
+    r.retired = n88_run(m, budget, &st);
+    CHECK(st == ARM_OK && r.retired == budget, "ran the whole budget (status %d, %u)",
+          (int)st, r.retired);
+    r.cycles = m->cpu.cycles;
+    r.count = get32(ram_at(m, N88_DRAM_BASE + 0x2000u));
+    r.r6_at_fiq = get32(ram_at(m, N88_DRAM_BASE + 0x2004u));
+    r.outn = n88_console_take(m, r.out, sizeof r.out);
+    CHECK(m->timer.fired == 1 && !m->timer.pending, "one expiry, acknowledged");
+    if (wait) CHECK(m->wfi == 1, "one WFI");
+    n88_free(m);
+    free(m);
+    return r;
+}
+
+static void test_timer_fiq_program(void) {
+    for (int engine = 0; engine < 2; engine++) {
+        const fiq_result_t w = run_fiq(engine, true);
+        CHECK(w.count == 1 && w.outn == 1 && w.out[0] == 'F',
+              "engine %d: the FIQ ran once and the program went on (%u, %zu)",
+              engine, w.count, w.outn);
+        CHECK(w.cycles >= (uint64_t)TICKS * N88_CYCLES_PER_TICK,
+              "engine %d: WFI moved time to the expiry (%llu cycles)", engine,
+              (unsigned long long)w.cycles);
+    }
+    const fiq_result_t a = run_fiq(false, false), b = run_fiq(true, false);
+    CHECK(a.count == 1 && b.count == 1 && a.outn == 1 && b.outn == 1,
+          "busy loop: the FIQ ran once on each engine");
+    CHECK(a.r6_at_fiq > 100u, "the loop ran a while before the FIQ (%u)", a.r6_at_fiq);
+    CHECK(a.r6_at_fiq == b.r6_at_fiq && a.cycles == b.cycles,
+          "the FIQ lands on the same instruction on both engines (r6 %u vs %u)",
+          a.r6_at_fiq, b.r6_at_fiq);
+}
+
+/* ---------------------------------------------------------------- NVRAM */
+
+static unsigned chrp_sum(const uint8_t *h) {
+    unsigned s = h[0];
+    for (int i = 2; i < 16; i++) s += h[i];
+    while (s >> 8) s = (s & 0xffu) + (s >> 8);
+    return s;
+}
+
+static void test_nvram_image(void) {
+    static uint8_t img[0x2000];
+    memset(img, 0xa5, sizeof img);
+    n88_nvram_image(img, sizeof img);
+    CHECK(img[0] == 0x70 && img[2] == 0x80 && img[3] == 0 &&
+          memcmp(img + 4, "common\0\0\0\0\0\0", 12) == 0, "the common partition header");
+    CHECK(img[1] == chrp_sum(img), "its checksum (%02x vs %02x)", img[1], chrp_sum(img));
+    const uint8_t *f = img + 0x800;
+    CHECK(f[0] == 0x7f && (f[2] | f[3] << 8) == 0x180 && memcmp(f + 4, "wwwwwwwwwwww", 12) == 0,
+          "the free-space partition covers the rest");
+    CHECK(f[1] == chrp_sum(f), "its checksum");
+    bool zero = true;
+    for (size_t i = 16; i < 0x800; i++) zero &= img[i] == 0;
+    for (size_t i = 0x810; i < sizeof img; i++) zero &= img[i] == 0;
+    CHECK(zero, "everything else is zero");
+    /* Walking it the way IODTNVRAM does ends exactly at the end. */
+    uint32_t off = 0;
+    unsigned parts = 0;
+    while (off < sizeof img && parts < 8) {
+        const uint32_t blocks = (uint32_t)img[off + 2] | (uint32_t)img[off + 3] << 8;
+        if (!blocks) break;
+        off += blocks * 16u;
+        parts++;
+    }
+    CHECK(off == sizeof img && parts == 2, "the partition walk ends at the end");
+}
+
+/* ---------------------------------------------------- synthetic inputs */
+
+typedef struct { uint8_t b[16384]; size_t n; } buf_t;
+
+static void b_u32(buf_t *b, uint32_t v) { put32(b->b + b->n, v); b->n += 4; }
+static void b_prop(buf_t *b, const char *name, const void *val, uint32_t len) {
+    memset(b->b + b->n, 0, 32);
+    memcpy(b->b + b->n, name, strlen(name));
+    b->n += 32;
+    b_u32(b, len);
+    memset(b->b + b->n, 0, (len + 3u) & ~3u);
+    if (val) memcpy(b->b + b->n, val, len);
+    b->n += (len + 3u) & ~3u;
+}
+static void b_str(buf_t *b, const char *name, const char *s) {
+    b_prop(b, name, s, (uint32_t)strlen(s) + 1u);
+}
+static void b_node(buf_t *b, uint32_t props, uint32_t children) { b_u32(b, props); b_u32(b, children); }
+
+/* clock_bytes: the size of /arm-io:clock-frequencies (the template's is 128);
+ * 0 leaves it out, with /arm-io:usbphy-frequency and /arm-io/audio-complex. */
+typedef struct {
+    const char *compat; uint32_t compat_len; bool with_pram; uint32_t clock_bytes;
+} tree_opts_t;
+
+/* The nodes bring-up touches, with the template's zeros. */
+static void build_tree(buf_t *t, tree_opts_t o) {
+    static const uint8_t zero8[8];
+    static const uint8_t zero4[4];
+    t->n = 0;
+    b_node(t, 4, o.with_pram ? 6 : 5);
+    b_str(t, "name", "device-tree");
+    b_str(t, "secure-root-prefix", "md");
+    b_prop(t, "compatible", o.compat, o.compat_len);
+    b_prop(t, "clock-frequency", zero4, 4);
+      b_node(t, 2, 0); b_str(t, "name", "memory"); b_prop(t, "reg", zero8, 8);
+      if (o.with_pram) { b_node(t, 2, 0); b_str(t, "name", "pram"); b_prop(t, "reg", zero8, 8); }
+      b_node(t, 2, 0); b_str(t, "name", "vram"); b_prop(t, "reg", zero8, 8);
+      b_node(t, 1, 1); b_str(t, "name", "cpus");
+        b_node(t, 7, 0); b_str(t, "name", "cpu0");
+        b_prop(t, "timebase-frequency", zero4, 4);
+        b_prop(t, "clock-frequency", zero4, 4);
+        b_prop(t, "bus-frequency", zero4, 4);
+        b_prop(t, "memory-frequency", zero4, 4);
+        b_prop(t, "peripheral-frequency", zero4, 4);
+        b_prop(t, "fixed-frequency", zero4, 4);
+      b_node(t, 2, 1); b_str(t, "name", "chosen"); b_prop(t, "nvram-proxy-data", NULL, 0x2000);
+        b_node(t, 5, 0); b_str(t, "name", "memory-map");
+        b_prop(t, "MemoryMapReserved-0", zero8, 8);
+        b_prop(t, "InUse", "\x01\x00\x00\x40\x00\x10\x00\x00", 8);     /* taken */
+        b_prop(t, "MemoryMapReserved-1", zero8, 8);
+        b_prop(t, "MemoryMapReserved-2", zero8, 8);
+      if (o.clock_bytes) {
+        static const uint8_t zero128[128];
+        b_node(t, 3, 3); b_str(t, "name", "arm-io");
+        b_prop(t, "clock-frequencies", zero128, o.clock_bytes);
+        b_prop(t, "usbphy-frequency", zero4, 4);
+          b_node(t, 2, 0); b_str(t, "name", "audio-complex");
+          b_prop(t, "ncoref-frequency", zero4, 4);
+          b_node(t, 1, 1); b_str(t, "name", "mipi-dsim");
+            b_node(t, 2, 0); b_str(t, "name", "lcd");
+            b_prop(t, "lcd-panel-id", zero4, 4);
+      } else {
+        b_node(t, 1, 1); b_str(t, "name", "arm-io");
+      }
+        b_node(t, 2, 0); b_str(t, "name", "iop");
+        b_prop(t, "compatible", "iop-s5l8920x\0iop-s5l8720x", 26);
+}
+
+static const char N88_COMPAT[] = "N88AP\0iPhone2,1\0AppleARM";
+
+#define KVA_TEXT  UINT32_C(0x80001000)
+/* A kernel: one __TEXT segment at KVA_TEXT holding `code`, entry at its start. */
+static size_t build_kernel(uint8_t *img, size_t cap, uint32_t vmaddr, const uint32_t *code,
+                           unsigned ncode) {
+    const uint32_t seg = 56u, thr = 16u + 17u * 4u, cmds = seg + thr;
+    const uint32_t fileoff = 0x100u, filesize = ncode * 4u;
+    if (cap < fileoff + filesize) return 0;
+    memset(img, 0, cap);
+    put32(img + 0, MH_MAGIC_32); put32(img + 4, MH_CPU_TYPE_ARM);
+    put32(img + 8, 9); put32(img + 12, MH_EXECUTE);
+    put32(img + 16, 2); put32(img + 20, cmds);
+    uint8_t *c = img + 28;
+    put32(c + 0, LC_SEGMENT); put32(c + 4, seg);
+    memcpy(c + 8, "__TEXT", 6);
+    put32(c + 24, vmaddr); put32(c + 28, 0x2000u);
+    put32(c + 32, fileoff); put32(c + 36, filesize);
+    c += seg;
+    put32(c + 0, LC_UNIXTHREAD); put32(c + 4, thr);
+    put32(c + 8, 1); put32(c + 12, 17);
+    put32(c + 16 + 15 * 4, vmaddr);             /* pc */
+    for (unsigned i = 0; i < ncode; i++) put32(img + fileoff + 4u * i, code[i]);
+    return fileoff + filesize;
+}
+
+/* A property of the RAM copy of the tree, by walking it again. */
+static const uint8_t *tree_prop(const uint8_t *tree, size_t len, const char *path,
+                                const char *prop, uint32_t *plen);
+
+static size_t skip_node(const uint8_t *b, size_t off) {
+    uint32_t np = get32(b + off), nc = get32(b + off + 4);
+    off += 8;
+    for (uint32_t i = 0; i < np; i++) off += 36u + ((get32(b + off + 32) + 3u) & ~3u);
+    for (uint32_t i = 0; i < nc; i++) off = skip_node(b, off);
+    return off;
+}
+static const uint8_t *node_prop(const uint8_t *b, size_t off, const char *prop, uint32_t *plen) {
+    uint32_t np = get32(b + off);
+    off += 8;
+    for (uint32_t i = 0; i < np; i++) {
+        uint32_t l = get32(b + off + 32) & 0x7fffffffu;
+        if (strncmp((const char *)b + off, prop, 32) == 0) { if (plen) *plen = l; return b + off + 36; }
+        off += 36u + ((l + 3u) & ~3u);
+    }
+    return NULL;
+}
+static const uint8_t *tree_prop(const uint8_t *b, size_t len, const char *path,
+                                const char *prop, uint32_t *plen) {
+    (void)len;
+    size_t off = 0;
+    while (*path) {
+        const char *slash = strchr(path, '/');
+        size_t n = slash ? (size_t)(slash - path) : strlen(path);
+        uint32_t np = get32(b + off), nc = get32(b + off + 4);
+        size_t child = off + 8;
+        for (uint32_t i = 0; i < np; i++) child += 36u + ((get32(b + child + 32) + 3u) & ~3u);
+        size_t found = 0;
+        for (uint32_t i = 0; i < nc; i++) {
+            const uint8_t *nm = node_prop(b, child, "name", NULL);
+            if (nm && memcmp(nm, path, n) == 0 && nm[n] == 0) { found = child; break; }
+            child = skip_node(b, child);
+        }
+        if (!found) return NULL;
+        off = found;
+        path = slash ? slash + 1 : path + n;
+    }
+    return node_prop(b, off, prop, plen);
+}
+
+/* ---------------------------------------------------------- bring-up */
+
+static void test_boot_layout_and_tree(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    /* The "kernel": print "OK\n" on UART0 with the MMU off, then stop. */
+    const uint32_t code[] = {
+        movw(4, (N88_UART0_PA + 0x20u) & 0xffffu), movt(4, (N88_UART0_PA + 0x20u) >> 16),
+        mov_imm(5, 'O'), str_off(5, 4, 0),
+        mov_imm(5, 'K'), str_off(5, 4, 0),
+        mov_imm(5, '\n'), str_off(5, 4, 0),
+        B_SELF,
+    };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code,
+                                     (unsigned)(sizeof code / sizeof code[0]));
+
+    for (int engine = 0; engine < 2; engine++) {
+        n88_t *m = malloc(sizeof *m);
+        CHECK(m && n88_init(m, engine), "init");
+        if (!m || !m->ram) { free(m); return; }
+        char detail[160];
+        const n88_boot_t req = { .kernel = kernel, .kernel_size = klen,
+                                 .devicetree = tree.b, .devicetree_size = tree.n };
+        const n88_status_t st = n88_boot(m, &req, detail, sizeof detail);
+        CHECK(st == N88_OK, "boot: %s (%s)", n88_strerror(st), detail);
+        if (st != N88_OK) { n88_free(m); free(m); return; }
+
+        /* The kernel ends at 0x80003000 -> 0x40003000; the tree follows. */
+        const uint32_t tree_pa = 0x40003000u;
+        const uint32_t args_pa = (tree_pa + (uint32_t)tree.n + 0xfffu) & ~0xfffu;
+        const uint32_t tokd_pa = (args_pa + 0x1000u + 0x3fffu) & ~0x3fffu;
+        CHECK(m->devicetree_pa == tree_pa && m->boot_args_pa == args_pa &&
+              m->tokd_pa == tokd_pa && m->entry_pa == 0x40001000u,
+              "layout: tree %08x args %08x tokd %08x entry %08x", m->devicetree_pa,
+              m->boot_args_pa, m->tokd_pa, m->entry_pa);
+        CHECK(get32(ram_at(m, 0x40001000u)) == code[0], "the segment is at its physical address");
+        CHECK(m->cpu.r[15] == 0x40001000u && m->cpu.r[0] == args_pa &&
+              m->cpu.cpsr == (ARM_MODE_SVC | ARM_CPSR_I | ARM_CPSR_F | ARM_CPSR_A) &&
+              !(m->cpu.cp15.sctlr & ARM_SCTLR_M), "the CPU as iBoot leaves it");
+
+        const uint8_t *ba = ram_at(m, args_pa);
+        CHECK(ba[0] == 1 && ba[1] == 0 && ba[2] == 5 && ba[3] == 0, "boot_args revision 1, version 5");
+        CHECK(get32(ba + 0x04) == N88_VIRT_BASE && get32(ba + 0x08) == N88_DRAM_BASE &&
+              get32(ba + 0x0c) == 0x0fe00000u && get32(ba + 0x10) == tokd_pa,
+              "boot_args bases, memSize whole MiB below the boot-owned top, topOfKernelData");
+        CHECK(get32(ba + 0x30) == tree_pa - N88_DRAM_BASE + N88_VIRT_BASE &&
+              get32(ba + 0x34) == tree.n, "boot_args device tree VA and size");
+        CHECK(strcmp((const char *)ba + 0x38, N88_DEFAULT_CMDLINE) == 0, "the default boot-args");
+        CHECK(get32(ba + 0x14) == N88_VRAM_PA && get32(ba + 0x18) == 0u &&
+              get32(ba + 0x1c) == 1280u && get32(ba + 0x20) == 320u &&
+              get32(ba + 0x24) == 480u && get32(ba + 0x28) == 32u,
+              "Boot_Video: iBoot's 320x480x32 framebuffer, text console mode");
+        CHECK(N88_VRAM_PA == 0x4fe3a000u && N88_PRAM_PA == 0x4fffc000u &&
+              N88_DRAM_SIZE - N88_TOP_RESERVE == 0x0fe3a000u &&
+              N88_VRAM_PA + N88_VRAM_SIZE == N88_PRAM_PA,
+              "the top of DRAM as iBoot lays it out: three buffers, then /pram");
+        CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "n88_framebuffer");
+
+        const uint8_t *dt = ram_at(m, tree_pa);
+        uint32_t l = 0;
+        const uint8_t *p = tree_prop(dt, tree.n, "memory", "reg", &l);
+        CHECK(p && get32(p) == N88_DRAM_BASE && get32(p + 4) == N88_DRAM_SIZE, "/memory:reg");
+        p = tree_prop(dt, tree.n, "pram", "reg", &l);
+        CHECK(p && get32(p) == N88_PRAM_PA && get32(p + 4) == 0x4000u,
+              "/pram:reg: the last 16 KiB of DRAM");
+        p = tree_prop(dt, tree.n, "vram", "reg", &l);
+        CHECK(p && get32(p) == N88_VRAM_PA && get32(p + 4) == N88_VRAM_SIZE,
+              "/vram:reg: the framebuffer pool");
+        p = tree_prop(dt, tree.n, "", "clock-frequency", &l);
+        CHECK(p && get32(p) == N88_BUS_HZ, "root clock-frequency");
+        static const struct { const char *prop; uint32_t v; } cpu0[] = {
+            { "timebase-frequency", N88_TB_HZ }, { "clock-frequency", N88_CPU_HZ },
+            { "bus-frequency", N88_BUS_HZ }, { "memory-frequency", N88_MEM_HZ },
+            { "peripheral-frequency", N88_PRF_HZ }, { "fixed-frequency", N88_FIX_HZ },
+        };
+        for (size_t i = 0; i < sizeof cpu0 / sizeof cpu0[0]; i++) {
+            p = tree_prop(dt, tree.n, "cpus/cpu0", cpu0[i].prop, &l);
+            CHECK(p && get32(p) == cpu0[i].v, "cpu0 %s", cpu0[i].prop);
+        }
+        p = tree_prop(dt, tree.n, "arm-io", "clock-frequencies", &l);
+        bool table = p && l == 128u;
+        for (uint32_t i = 0; table && i < 32u; i++)
+            table = get32(p + 4u * i) == (i < N88_CLOCK_COUNT ? n88_clock_frequencies[i] : 0u);
+        CHECK(table, "/arm-io:clock-frequencies: the 28 clocks, the last 4 words untouched");
+        p = tree_prop(dt, tree.n, "arm-io", "usbphy-frequency", &l);
+        CHECK(p && get32(p) == N88_USBPHY_HZ, "/arm-io:usbphy-frequency");
+        p = tree_prop(dt, tree.n, "arm-io/audio-complex", "ncoref-frequency", &l);
+        CHECK(p && get32(p) == N88_NCOREF_HZ, "/arm-io/audio-complex:ncoref-frequency");
+        p = tree_prop(dt, tree.n, "arm-io/mipi-dsim/lcd", "lcd-panel-id", &l);
+        CHECK(p && l == 4u && get32(p) == N88_LCD_PANEL_ID, "the panel id iBoot would read");
+        p = tree_prop(dt, tree.n, "chosen", "nvram-proxy-data", &l);
+        CHECK(p && l == 0x2000 && p[0] == 0x70 && p[0x800] == 0x7f, "the NVRAM image");
+        p = tree_prop(dt, tree.n, "arm-io/iop", "compatible", &l);
+        CHECK(p && memcmp(p, "xop-s5l8920x\0xop-s5l8720x", 26) == 0,
+              "the IOP un-matched by default, every compatible string struck");
+        p = tree_prop(dt, tree.n, "chosen/memory-map", "DeviceTree", &l);
+        CHECK(p && l == 8 && get32(p) == tree_pa && get32(p + 4) == tree.n,
+              "memory-map DeviceTree took the first placeholder");
+        p = tree_prop(dt, tree.n, "chosen/memory-map", "BootArgs", &l);
+        CHECK(p && get32(p) == args_pa && get32(p + 4) == 0x1000u,
+              "memory-map BootArgs took the next free one");
+        p = tree_prop(dt, tree.n, "chosen/memory-map", "InUse", &l);
+        CHECK(p && get32(p) == 0x40000001u, "an entry in use is left alone");
+        CHECK(!tree_prop(dt, tree.n, "chosen/memory-map", "RAMDisk", &l),
+              "no RAMDisk entry without a root filesystem");
+        CHECK(!m->has_root && !m->bus.privileged_svc_handler, "and no bridge");
+        CHECK(tree_prop(dt, tree.n, "", "secure-root-prefix", &l) != NULL,
+              "secure-root-prefix is left alone without a root");
+
+        /* And it runs. */
+        arm_status_t rs = ARM_HALT;
+        CHECK(n88_run(m, 100, &rs) == 100 && rs == ARM_OK, "engine %d: runs", engine);
+        char out[8] = {0};
+        CHECK(n88_console_take(m, out, sizeof out) == 3 && memcmp(out, "OK\n", 3) == 0,
+              "engine %d: the kernel's UART output", engine);
+
+        /* A second boot starts from clean DRAM. */
+        put32(ram_at(m, 0x48000000u), 0x5a5a5a5au);
+        const n88_boot_t req2 = { .kernel = kernel, .kernel_size = klen,
+                                  .devicetree = tree.b, .devicetree_size = tree.n,
+                                  .cmdline = "-v",
+                                  .unmatch = (const char *const[]){ "" },
+                                  .unmatch_count = 0 };
+        CHECK(n88_boot(m, &req2, NULL, 0) == N88_OK, "second boot");
+        CHECK(get32(ram_at(m, 0x48000000u)) == 0u, "DRAM cleared for a second boot");
+        CHECK(strcmp((const char *)ram_at(m, m->boot_args_pa) + 0x38, "-v") == 0, "given boot-args");
+        p = tree_prop(ram_at(m, m->devicetree_pa), tree.n, "arm-io/iop", "compatible", &l);
+        CHECK(p && p[0] == 'i', "an empty un-match list leaves the IOP");
+        n88_free(m);
+        free(m);
+    }
+}
+
+static void test_boot_refusals(void) {
+    static buf_t tree, nopram, n88tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    build_tree(&nopram, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, false, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    (void)n88tree;
+
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                     .devicetree = tree.b, .devicetree_size = tree.n };
+
+    r.kernel = NULL;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ARGUMENT, "no kernel");
+    r.kernel = kernel;
+    char longline[300];
+    memset(longline, 'a', sizeof longline - 1);
+    longline[sizeof longline - 1] = 0;
+    r.cmdline = longline;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ARGUMENT, "boot-args over 255 bytes");
+    r.cmdline = NULL;
+
+    uint8_t junk[64] = {1, 2, 3};
+    r.kernel = junk; r.kernel_size = sizeof junk;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_KERNEL && d[0], "not a Mach-O: %s", d);
+    static uint8_t low[0x400];
+    const size_t lowlen = build_kernel(low, sizeof low, 0x00001000u, code, 1);
+    r.kernel = low; r.kernel_size = lowlen;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_KERNEL, "linked below 0x80000000");
+    static uint8_t high[0x400];
+    const size_t highlen = build_kernel(high, sizeof high, 0x8ff00000u, code, 1);
+    r.kernel = high; r.kernel_size = highlen;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_LAYOUT, "no room above the kernel: %s", d);
+
+    /* iPhone OS 3.1.3's kernel is linked at 0xC0000000 and loads at the same
+     * physical base; its epoch is 4. */
+    static uint8_t ios3[0x400];
+    const size_t ios3len = build_kernel(ios3, sizeof ios3, 0xc0001000u, code, 1);
+    r.kernel = ios3; r.kernel_size = ios3len; r.boot_args_version = 4;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "a kernel at 0xC0000000: %s", d);
+    {
+        const uint8_t *ba = ram_at(m, m->boot_args_pa);
+        CHECK(m->entry_pa == 0x40001000u && get32(ba + 0x04) == 0xc0000000u &&
+              get32(ba + 0x08) == N88_DRAM_BASE && ba[2] == 4 &&
+              get32(ba + 0x30) == m->devicetree_pa - N88_DRAM_BASE + 0xc0000000u,
+              "0xC0000000 base: entry pa %08x, virtBase %08x, epoch %u", m->entry_pa,
+              get32(ba + 0x04), ba[2]);
+    }
+    r.boot_args_version = 0;
+    r.kernel = kernel; r.kernel_size = klen;
+
+    r.devicetree_size = tree.n - 4;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_DEVICETREE, "a truncated tree: %s", d);
+    r.devicetree = nopram.b; r.devicetree_size = nopram.n;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_DEVICETREE && strstr(d, "pram"),
+          "no /pram: %s", d);
+    r.devicetree = tree.b; r.devicetree_size = tree.n;
+    const char *const bogus[] = { "arm-io/nothing" };
+    r.unmatch = bogus; r.unmatch_count = 1;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_DEVICETREE && strstr(d, "nothing"),
+          "un-matching a missing node: %s", d);
+    r.unmatch = NULL; r.unmatch_count = 0;
+    CHECK(!m->booted, "no failed boot reports booted");
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK && m->booted, "and the good one still boots");
+    CHECK(strcmp(n88_strerror(N88_ERR_LAYOUT), "unknown error") != 0, "strerror");
+    n88_free(m);
+    free(m);
+}
+
+/* The clock table: what the cpu0 frequencies and the drivers read from it,
+ * and iBoot's handling of a short or missing property. */
+static void test_clock_table(void) {
+    const uint32_t *f = n88_clock_frequencies;
+    /* iBoot fills cpu0 from these entries (its clock getter, 0x4ff13e80). */
+    CHECK(f[15] == N88_CPU_HZ && f[25] == N88_MEM_HZ && f[1] == N88_BUS_HZ &&
+          f[2] == N88_PRF_HZ && f[19] == N88_FIX_HZ && f[26] == N88_TB_HZ &&
+          f[27] == N88_USBPHY_HZ, "cpu0's frequencies are the table's");
+    CHECK(N88_CPU_HZ % N88_TB_HZ == 0 && N88_CYCLES_PER_TICK == 25u,
+          "the CPU runs a whole number of cycles per timer tick");
+    CHECK(f[4] == 100000000u, "clock 0x104, the SPI and UART pclk, is PLL2 / 2");
+    CHECK(f[11] == 0 && f[13] == 0 && f[21] == 0,
+          "the clocks LLB leaves disabled read 0");
+
+    static buf_t shorter, none;
+    static uint8_t kernel[0x400];
+    build_tree(&shorter, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 64 });
+    build_tree(&none, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 0 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                     .devicetree = shorter.b, .devicetree_size = shorter.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "a 64-byte clock-frequencies boots: %s", d);
+    uint32_t l = 0;
+    const uint8_t *p = tree_prop(ram_at(m, m->devicetree_pa), shorter.n, "arm-io",
+                                 "clock-frequencies", &l);
+    bool fits = p && l == 64u;
+    for (uint32_t i = 0; fits && i < 16u; i++) fits = get32(p + 4u * i) == f[i];
+    CHECK(fits, "and gets the first 16 words, as iBoot copies them");
+    p = tree_prop(ram_at(m, m->devicetree_pa), shorter.n, "arm-io", "usbphy-frequency", &l);
+    CHECK(p && l == 4u && get32(p) == N88_USBPHY_HZ, "without running into the next property");
+    r.devicetree = none.b; r.devicetree_size = none.n;
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK,
+          "a tree without the clock properties boots, as iBoot passes them over: %s", d);
+    n88_free(m);
+    free(m);
+}
+
+/* spi0 and its flash through the machine's own bus: the select is the GPIO
+ * pin's register, the answers come back through RXDATA, and the controller's
+ * line is VIC0 line 29. The flash's array is erased at first and survives a
+ * reboot. */
+static void test_spi0_flash(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    uint8_t *nor = n88_nor(m);
+    bool erased = nor != NULL;
+    for (uint32_t i = 0; erased && i < N88_NOR_SIZE; i++) erased = nor[i] == 0xffu;
+    CHECK(erased, "the flash is not erased when the machine is made");
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+
+    const uint32_t S = N88_SPI0_PA, CS = N88_GPIO_PA + N88_SPI0_CS_GPIO;
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, S + SPI_STATUS, SPI_STATUS_EVENTS_V1);
+    n88_write32(m, S + SPI_SETUP, 0x4018u);
+    n88_write32(m, S + SPI_CONTROL, SPI_CONTROL_START);
+    n88_write32(m, S + SPI_CNT, 4u);
+    n88_write32(m, S + SPI_CNT_V1, 4u);
+    n88_write32(m, CS, 0x12u);                      /* select: the pin low */
+    n88_write32(m, S + SPI_SETUP, 0x4038u);
+    const uint8_t tx[4] = { 0x9f, 0xff, 0xff, 0xff };
+    for (unsigned i = 0; i < 4u; i++) n88_write32(m, S + SPI_TXDATA, tx[i]);
+    CHECK(!(m->vic[0].raw & (1u << N88_SPI0_LINE)), "the line rose before go");
+    n88_write32(m, S + SPI_SETUP, 0x2041b8u);
+    CHECK(m->vic[0].raw & (1u << N88_SPI0_LINE), "go did not raise VIC0 line 29");
+    const uint32_t s = n88_read32(m, S + SPI_STATUS);
+    const unsigned have = (s >> SPI_STATUS_RX_SHIFT_V1) & SPI_STATUS_LEVEL_V1;
+    uint8_t id[4] = {0};
+    for (unsigned i = 0; i < have && i < 4u; i++) id[i] = (uint8_t)n88_read32(m, S + SPI_RXDATA);
+    n88_write32(m, S + SPI_STATUS, s);
+    n88_write32(m, S + SPI_SETUP, 0x4018u);
+    n88_write32(m, CS, 0x13u);                      /* release */
+    CHECK(have == 4u && id[1] == 0x20 && id[2] == 0x80 && id[3] == 0x14,
+          "the flash's ID through spi0: %u octets, %02x %02x %02x", have, id[1], id[2], id[3]);
+    CHECK(!(m->vic[0].raw & (1u << N88_SPI0_LINE)) && m->unmodelled == unmodelled &&
+          m->nor.selections == 1u && !m->nor.selected,
+          "after the transfer: line down, nothing unmodelled, one selection, released");
+
+    nor[0x1234] = 0x5a;                             /* as a program would leave it */
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK && n88_nor(m)[0x1234] == 0x5a &&
+          m->spi0.version == 1u && m->spi0.words == 0u,
+          "a reboot kept the flash and reset the controller");
+    n88_free(m);
+    free(m);
+}
+
+/* -------------------------------------------------------- root disk */
+
+typedef struct { uint8_t data[16384]; } memdisk_t;
+static vm_block_io_status_t md_read(void *ctx, uint64_t off, void *dst, size_t n, size_t *got) {
+    memdisk_t *d = ctx;
+    memcpy(dst, d->data + off, n);
+    *got = n;
+    return VM_BLOCK_IO_OK;
+}
+static vm_block_io_status_t md_write(void *ctx, uint64_t off, const void *src, size_t n,
+                                     size_t *got) {
+    memdisk_t *d = ctx;
+    memcpy(d->data + off, src, n);
+    *got = n;
+    return VM_BLOCK_IO_OK;
+}
+
+/* Thumb-2 MOVW/MOVT as two halfwords. */
+static void t_mov16(uint16_t *h, unsigned *n, bool top, unsigned rd, uint32_t imm) {
+    h[(*n)++] = (uint16_t)((top ? 0xf2c0u : 0xf240u) | ((imm >> 1) & 0x0400u) | (imm >> 12));
+    h[(*n)++] = (uint16_t)(((imm << 4) & 0x7000u) | (rd << 8) | (imm & 0xffu));
+}
+static void t_const(uint16_t *h, unsigned *n, unsigned rd, uint32_t v) {
+    t_mov16(h, n, false, rd, v & 0xffffu);
+    t_mov16(h, n, true, rd, v >> 16);
+}
+
+/*
+ * A Thumb "kernel" that does what the patched strategy routine does: the
+ * length on the stack, 64-bit source and destination in r1:r0 and r3:r2,
+ * then the bridge's SVC in place of bcopy_phys. It reads disk offset 0x1000
+ * into RAM, then writes that RAM back to disk offset 0x2000.
+ */
+static void test_boot_with_root(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    static memdisk_t disk;
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    for (size_t i = 0; i < sizeof disk.data; i++) disk.data[i] = (uint8_t)(i * 7u + 3u);
+    const vm_block_t block = { &disk, sizeof disk.data, 0, 0, md_read, md_write, NULL };
+
+    uint16_t h[64];
+    unsigned n = 0, read_site, write_site;
+    t_const(h, &n, 0, 0x40200000u);
+    h[n++] = 0x4685;                            /* mov sp, r0 */
+    t_mov16(h, &n, false, 4, 256);
+    h[n++] = 0x9400;                            /* str r4, [sp] */
+    t_const(h, &n, 0, N88_MD_TOKEN_PA + 0x1000u);
+    h[n++] = 0x2100;                            /* movs r1, #0 */
+    t_const(h, &n, 2, 0x40100000u);
+    h[n++] = 0x2300;                            /* movs r3, #0 */
+    read_site = n;
+    h[n++] = (uint16_t)N88_SVC_MD_READ;
+    h[n++] = 0xbf00;
+    t_const(h, &n, 0, 0x40100000u);
+    h[n++] = 0x2100;
+    t_const(h, &n, 2, N88_MD_TOKEN_PA + 0x2000u);
+    h[n++] = 0x2300;
+    write_site = n;
+    h[n++] = (uint16_t)N88_SVC_MD_WRITE;
+    h[n++] = 0xbf00;
+    h[n++] = 0xe7fe;                            /* b . */
+    if (n & 1u) h[n++] = 0xbf00;
+    uint32_t words[32];
+    for (unsigned i = 0; i < n / 2u; i++)
+        words[i] = (uint32_t)h[2u * i] | (uint32_t)h[2u * i + 1u] << 16;
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, words, n / 2u);
+    put32(kernel + 28 + 56 + 16 + 15 * 4, KVA_TEXT | 1u);   /* a Thumb entry */
+
+    /* MMU off, so the sites are the physical pcs the SVCs execute at. */
+    const uint32_t code_pa = KVA_TEXT - N88_VIRT_BASE + N88_DRAM_BASE;
+    for (int engine = 0; engine < 2; engine++) {
+        n88_t *m = malloc(sizeof *m);
+        CHECK(m && n88_init(m, engine), "init");
+        if (!m || !m->ram) { free(m); return; }
+        char d[160];
+        n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                         .devicetree = tree.b, .devicetree_size = tree.n,
+                         .root = &block };
+        CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ROOT, "a root without its sites: %s", d);
+        r.md_read_site_pc = code_pa + 2u * read_site;
+        r.md_write_site_pc = code_pa + 2u * write_site;
+        vm_block_t odd = block;
+        odd.size = 10000u;
+        r.root = &odd;
+        CHECK(n88_boot(m, &r, d, sizeof d) == N88_ERR_ROOT, "part of a page: %s", d);
+        r.root = &block;
+        const n88_status_t st = n88_boot(m, &r, d, sizeof d);
+        CHECK(st == N88_OK, "boot with a root: %s (%s)", n88_strerror(st), d);
+        if (st != N88_OK) { n88_free(m); free(m); return; }
+        CHECK(m->has_root && m->root_size == sizeof disk.data, "attached");
+        CHECK(strcmp((const char *)ram_at(m, m->boot_args_pa) + 0x38, N88_ROOT_CMDLINE) == 0,
+              "rd=md0 by default");
+        uint32_t l = 0;
+        const uint8_t *p = tree_prop(ram_at(m, m->devicetree_pa), tree.n,
+                                     "chosen/memory-map", "RAMDisk", &l);
+        CHECK(p && l == 8 && get32(p) == N88_MD_TOKEN_PA && get32(p + 4) == sizeof disk.data,
+              "the RAMDisk entry names the token and the size");
+        CHECK(!tree_prop(ram_at(m, m->devicetree_pa), tree.n, "", "secure-root-prefix", &l) &&
+              tree_prop(ram_at(m, m->devicetree_pa), tree.n, "", "xecure-root-prefix", &l),
+              "secure-root-prefix is struck out with a root");
+
+        arm_status_t rs = ARM_HALT;
+        n88_run(m, 200, &rs);
+        CHECK(rs == ARM_OK, "engine %d: ran (status %d, pc %08x)", engine, (int)rs, m->cpu.r[15]);
+        CHECK(memcmp(ram_at(m, 0x40100000u), disk.data + 0x1000, 256) == 0,
+              "engine %d: the read landed in RAM", engine);
+        CHECK(memcmp(disk.data + 0x2000, disk.data + 0x1000, 256) == 0,
+              "engine %d: the write reached the disk", engine);
+        CHECK(m->md.stats.successful_reads == 1 && m->md.stats.successful_writes == 1 &&
+              m->md.stats.failures == 0, "engine %d: one of each, no failures", engine);
+        for (size_t i = 0x2000; i < 0x2100; i++) disk.data[i] = (uint8_t)(i * 7u + 3u);
+        n88_free(m);
+        free(m);
+    }
+}
+
+/* ------------------------------------------------------------ console */
+
+static void test_console_ring(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    const unsigned extra = 100;
+    for (unsigned i = 0; i < N88_CONSOLE_CAPACITY + extra; i++)
+        n88_write32(m, N88_UART0_PA + 0x20u, 'a' + i % 26u);
+    CHECK(m->console_total == N88_CONSOLE_CAPACITY + extra &&
+          m->console_dropped == extra && m->console_len == N88_CONSOLE_CAPACITY,
+          "overflow drops the oldest");
+    char *out = malloc(N88_CONSOLE_CAPACITY);
+    size_t got = n88_console_take(m, out, 10);
+    CHECK(got == 10 && out[0] == (char)('a' + extra % 26u), "oldest surviving byte first");
+    got = n88_console_take(m, out, N88_CONSOLE_CAPACITY);
+    CHECK(got == N88_CONSOLE_CAPACITY - 10u &&
+          out[got - 1] == (char)('a' + (N88_CONSOLE_CAPACITY + extra - 1u) % 26u),
+          "the rest, newest last");
+    CHECK(n88_console_take(m, out, 10) == 0, "taken is gone");
+    free(out);
+    n88_free(m);
+    free(m);
+}
+
+/* -------------------------------------------------------- identity */
+
+static void test_devicetree_identity(void) {
+    static buf_t t;
+    build_tree(&t, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    CHECK(n88_devicetree_is_3gs(t.b, t.n), "N88AP first");
+    static const char later[] = "iPhone2,1\0N88AP\0AppleARM";
+    build_tree(&t, (tree_opts_t){ later, sizeof later, true, 128 });
+    CHECK(n88_devicetree_is_3gs(t.b, t.n), "N88AP anywhere in the list");
+    static const char m68[] = "M68AP\0iPhone1,1\0AppleARM";
+    build_tree(&t, (tree_opts_t){ m68, sizeof m68, true, 128 });
+    CHECK(!n88_devicetree_is_3gs(t.b, t.n), "an iPhone (original) tree is not a 3GS");
+    static const char prefix[] = "N88APX\0N88A";
+    build_tree(&t, (tree_opts_t){ prefix, sizeof prefix - 1, true, 128 });
+    CHECK(!n88_devicetree_is_3gs(t.b, t.n), "only a whole string matches");
+    uint8_t junk[16] = {0xff, 0xff, 0xff, 0xff};
+    CHECK(!n88_devicetree_is_3gs(junk, sizeof junk), "garbage");
+    CHECK(!n88_devicetree_is_3gs(NULL, 0), "nothing");
+}
+
+/* The display controller on the bus: iBoot's hand-off as AppleM2CLCD reads
+ * it, a frame interrupt that wakes a waiting core (WFI fast-forwards to the
+ * frame, not past it), its acknowledgement, and the scanout following a swap. */
+static void test_display_controller(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { 0xe320f003u /* WFI */, B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 2);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    const uint32_t C = N88_CLCD_PA;
+    const uint64_t unmodelled = m->unmodelled;
+    CHECK((n88_read32(m, C + 0x4) & 0x10u) && n88_read32(m, C + 0x24) == N88_VRAM_PA &&
+          n88_read32(m, C + 0x28) == N88_FB_WIDTH &&
+          n88_read32(m, C + 0x30) == ((N88_FB_WIDTH << 16) | N88_FB_HEIGHT) &&
+          (n88_read32(m, C + 0x20) & 0xf00u) == 0x700u, "window A as iBoot leaves it");
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "scanout at hand-off");
+
+    /* Frame interrupts on, line 0x25 = VIC1 bit 5 enabled; the core waits. */
+    n88_write32(m, C + 0x8, 1u);
+    n88_write32(m, N88_VIC_PA + 0x10000u + VIC_INTENABLE, 1u << 5);
+    const uint64_t frame = (uint64_t)(N88_TB_HZ / N88_FRAME_HZ) * N88_CYCLES_PER_TICK;
+    arm_status_t st;
+    n88_run(m, 3, &st);
+    CHECK(m->cpu.cycles >= frame && m->cpu.cycles < frame + 16u,
+          "WFI woke at cycle %llu, the frame starts at %llu",
+          (unsigned long long)m->cpu.cycles, (unsigned long long)frame);
+    CHECK((s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 5)) &&
+          n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == (0x80000000u | N88_CLCD_LINE),
+          "frame interrupt on line 0x25, through the chain");
+    CHECK((n88_read32(m, C + 0xc) & n88_read32(m, C + 0x8)) == 1u, "status & enable");
+    n88_write32(m, C + 0x1b2c, 0xfu);
+    n88_write32(m, C + 0xc, 1u);
+    CHECK(!(s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 5)), "acknowledged");
+
+    /* A swap to the second boot buffer moves what the host shows. */
+    n88_write32(m, C + 0x24, N88_VRAM_PA + N88_FB_BYTES);
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA + N88_FB_BYTES), "swapped scanout");
+    /* An I/O address, as 3.1.3's display driver leaves it (0x3C0D8000):
+     * gathered through dart0 a page at a time, in the order the DART maps
+     * them, which here is backwards through DRAM. */
+    {
+        const uint32_t D = N88_DART0_PA, tables = 0x40400000u, pages = 0x40500000u;
+        const uint32_t bytes = N88_FB_STRIDE * N88_FB_HEIGHT, npages = (bytes + 0xfffu) >> 12;
+        n88_write32(m, D + 0xc, 0u);
+        for (uint32_t n = 0; n < 16u; n++)
+            n88_write32(m, D + 0x8, ((tables - N88_DRAM_BASE) + (n << 12)) | (n << 8) | 1u);
+        n88_write32(m, D + 0xc, 0x80000070u);
+        for (uint32_t i = 0; i < npages; i++) {
+            const uint32_t iova = 0x3c0d8000u + (i << 12);
+            const uint32_t page = pages + ((npages - 1u - i) << 12);
+            n88_write32(m, tables + ((iova >> 22) & 0xfu) * 0x1000u + ((iova >> 12) & 0x3ffu) * 4u,
+                        (page - N88_DRAM_BASE) | 1u);
+            n88_write32(m, page, 0xff000000u | i);
+        }
+        n88_write32(m, C + 0x24, 0x3c0d8000u);
+        const uint8_t *fb = n88_framebuffer(m);
+        bool ok = fb && fb != ram_at(m, N88_VRAM_PA);
+        for (uint32_t i = 0; ok && i < npages; i++) ok = get32(fb + (i << 12)) == (0xff000000u | i);
+        CHECK(ok, "scanout through dart0, page by page");
+        n88_write32(m, D + 0xc, 0u);
+        CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "translation off: iBoot's buffer");
+        n88_write32(m, C + 0x24, N88_VRAM_PA + N88_FB_BYTES);
+    }
+    /* A geometry the hosts cannot show falls back to iBoot's buffer. */
+    n88_write32(m, C + 0x30, (240u << 16) | 320u);
+    CHECK(n88_framebuffer(m) == ram_at(m, N88_VRAM_PA), "fallback");
+    CHECK(m->unmodelled == unmodelled, "every access modelled");
+    n88_free(m);
+    free(m);
+}
+
+/* The CDMA engine on the bus: a UID-key request as iOS 6 makes it moves
+ * through DRAM and raises channel 1's line, VIC1 line 11. */
+static void test_cdma_on_the_bus(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    const uint32_t C = N88_CDMA_PA, A = N88_CDMA_AES_PA, in = 0x40100000u, out = 0x40100100u;
+    for (unsigned i = 0; i < 16u; i++) ram_at(m, in)[i] = (uint8_t)i;
+    const uint32_t d1[4] = { 0x40200020u, 0x30103u, in, 16u }, d2[4] = { 0x40200120u, 0x103u, out, 16u };
+    for (unsigned i = 0; i < 4u; i++) {
+        n88_write32(m, 0x40200000u + 4u * i, d1[i]);
+        n88_write32(m, 0x40200100u + 4u * i, d2[i]);
+    }
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, A + 0x1000u, 0x30100u);
+    n88_write32(m, C + 0x1014u, 0x40200000u);
+    n88_write32(m, C + 0x1000u, 0x188u);
+    n88_write32(m, C + 0x1000u, 0x189u);
+    n88_write32(m, C + 0x2014u, 0x40200100u);
+    n88_write32(m, C + 0x2000u, 0x88u);
+    n88_write32(m, C + 0x2000u, 0x89u);
+    uint8_t want[16], plain[16];
+    for (unsigned i = 0; i < 16u; i++) plain[i] = (uint8_t)i;
+    aes_ctx_t a;
+    static const uint8_t iv[16];
+    aes_init(&a, CDMA_STANDIN_KEY, 128);
+    aes_cbc_encrypt(&a, iv, plain, want, 16);
+    CHECK(memcmp(ram_at(m, out), want, 16) == 0, "the UID encrypt did not land in DRAM");
+    CHECK((s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 11)) &&
+          (s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 12)), "channels 1 and 2 on VIC1 11/12");
+    CHECK((n88_read32(m, C + 0x1000u) & CDMA_CSR_DONE) && m->unmodelled == unmodelled,
+          "done, and every access modelled");
+    /* Daisy chain: VIC0 has nothing pending, so its vector is VIC1's. */
+    n88_write32(m, N88_VIC_PA + 0x10000u + VIC_INTENABLE, 1u << 11);
+    CHECK(n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == (0x80000000u | 43u) &&
+          n88_read32(m, N88_VIC_PA + 0x10000u + VIC_VECTADDR) == (0x80000000u | 43u),
+          "VIC0's vector is VIC1's source 43");
+    n88_write32(m, C + 0x1000u, n88_read32(m, C + 0x1000u));
+    CHECK(!(s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 11)), "acknowledge drops the line");
+    CHECK(n88_read32(m, N88_VIC_PA + VIC_VECTADDR) == 0u, "nothing pending anywhere");
+    n88_free(m);
+    free(m);
+}
+
+/* The SHA-1 engine behind CDMA channel 4, programmed as iPhone OS 3.1.3's
+ * AppleS5L8920XSHA1 and AppleCDMA program them: "abc", padded by the
+ * driver, through the FIFO; channel 4's line is VIC1 line 14. */
+static void test_sha1_through_cdma(void) {
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    const uint32_t C = N88_CDMA_PA, S = N88_SHA1_PA, data = 0x40300000u, chain = 0x40200000u;
+    uint8_t *p = ram_at(m, data);
+    memcpy(p, "abc", 3);
+    p[3] = 0x80;
+    p[63] = 24;                                    /* the length in bits */
+    const uint32_t d[4] = { chain + 0x20u, 0x303u, data, 64u };
+    for (unsigned i = 0; i < 4u; i++) n88_write32(m, chain + 4u * i, d[i]);
+    const uint64_t unmodelled = m->unmodelled;
+    n88_write32(m, S + 0x4u, 1u);
+    n88_write32(m, S + 0x10u, 0u);
+    n88_write32(m, S + 0x0u, 0x2u);
+    n88_write32(m, C + 0x4000u, 0x18u);
+    n88_write32(m, C + 0x4004u, 0xcau);
+    n88_write32(m, C + 0x4008u, S + 0xa0u);
+    n88_write32(m, C + 0x4014u, chain);
+    n88_write32(m, C + 0x4000u, 0x19u);
+    static const uint32_t want[5] = { 0xa9993e36u, 0x4706816au, 0xba3e2571u, 0x7850c26cu, 0x9cd0d89du };
+    bool same = true;
+    for (unsigned i = 0; i < 5u; i++) {
+        const uint32_t v = n88_read32(m, S + 0x20u + 4u * i);
+        const uint32_t h = (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);
+        same = same && h == want[i];
+    }
+    CHECK(same, "the digest of \"abc\" at +0x20, byte-reversed");
+    CHECK((n88_read32(m, C + 0x4000u) & CDMA_CSR_DONE) &&
+          (s5l_vic_read(&m->vic[1], VIC_RAWINTR) & (1u << 14)) &&
+          m->cdma.periph_transfers == 1u && m->unmodelled == unmodelled,
+          "channel 4 done on VIC1 line 14, every access modelled");
+    n88_free(m);
+    free(m);
+}
+
+/* The touch controller on spi1, as AppleMultitouchN1SPI first reaches it:
+ * reset released through its pad (0x12 driven low, then 0x10, an input the
+ * board pulls high), selected through spi1's (0x12), and the HBPP probe
+ * `1A A1 18 E1 ...` answered with a word isInHBPP accepts. */
+static void test_touch_on_spi1(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    const uint32_t G = N88_GPIO_PA, S = N88_SPI1_PA;
+    CHECK(m->touch.in_reset, "held in reset at hand-off");
+    n88_write32(m, G + N88_TOUCH_RESET_PAD, 0x12u);
+    CHECK(m->touch.in_reset, "0x12 drives the reset low");
+    n88_write32(m, G + N88_TOUCH_RESET_PAD, 0x10u);
+    CHECK(!m->touch.in_reset, "0x10 lets the board pull it high: released");
+    n88_write32(m, G + N88_TOUCH_CS_PAD, 0x12u);
+    static const uint8_t probe[16] = { 0x1a, 0xa1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1,
+                                       0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1, 0x18, 0xe1 };
+    uint8_t rx[16] = {0};
+    for (unsigned i = 0; i < 16u; i++) {
+        n88_write32(m, S + SPI_TXDATA, probe[i]);
+        rx[i] = (uint8_t)n88_read32(m, S + SPI_RXDATA);
+    }
+    n88_write32(m, G + N88_TOUCH_CS_PAD, 0x13u);
+    const unsigned w0 = (unsigned)rx[0] << 8 | rx[1], w1 = (unsigned)rx[2] << 8 | rx[3];
+    static const unsigned ok[] = { 0x1aa1u, 0x18e1u, 0x1f01u, 0x4879u, 0x4969u, 0x4bc1u, 0x4ad1u };
+    bool a0 = false, a1 = false;
+    for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) { a0 |= w0 == ok[i]; a1 |= w1 == ok[i]; }
+    CHECK(a0 && a1 && m->touch.hbpp_probes == 1u, "HBPP probe answered (%04x %04x)", w0, w1);
+    /* The attention line's pad, masked as AppleS5L8920XGPIOIC leaves every
+     * pad and then as the touch driver enables it; a status bit written back
+     * clears. */
+    CHECK(n88_read32(m, G + N88_GPIOIC_STATUS + 4u * (N88_TOUCH_ATN_IRQ / 32u)) == 0u,
+          "no touch interrupt pending");
+    m->gpioic_status[N88_TOUCH_ATN_IRQ / 32u] = 1u << (N88_TOUCH_ATN_IRQ % 32u);
+    n88_write32(m, G + N88_TOUCH_ATN_IRQ * 4u, 0x20au);
+    CHECK(s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+          (1u << (N88_GPIOIC_LINE % 32u)), "a pending GPIO interrupt raises line 0x5E");
+    n88_write32(m, G + N88_GPIOIC_STATUS + 4u * (N88_TOUCH_ATN_IRQ / 32u),
+                1u << (N88_TOUCH_ATN_IRQ % 32u));
+    CHECK(!(s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+            (1u << (N88_GPIOIC_LINE % 32u))), "written back, the line drops");
+    n88_free(m);
+    free(m);
+}
+
+/* A booted machine whose kernel is one branch to itself; NULL on failure. */
+static n88_t *boot_parked(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 1);
+    n88_t *m = malloc(sizeof *m);
+    if (!m || !n88_init(m, false)) { free(m); return NULL; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    if (n88_boot(m, &r, d, sizeof d) != N88_OK) { n88_free(m); free(m); return NULL; }
+    return m;
+}
+
+/* One transfer with the PMU on i2c0, the way AppleS5L8920XI2CController
+ * makes it; returns the status it ended with. */
+static uint32_t pmu_xfer(n88_t *m, uint8_t reg, uint8_t *buf, unsigned n, bool write) {
+    const uint32_t I = N88_I2C0_PA;
+    n88_write32(m, I + S5L8920_I2C_ADDR, N88_PMU_ADDR);
+    n88_write32(m, I + S5L8920_I2C_FIRST, reg);
+    n88_write32(m, I + S5L8920_I2C_COUNT, n);
+    for (unsigned i = 0; write && i < n; i++) n88_write32(m, I + S5L8920_I2C_FIFO, buf[i]);
+    n88_write32(m, I + S5L8920_I2C_CONTROL,
+                S5L8920_I2C_CTRL_START | (write ? S5L8920_I2C_CTRL_WRITE : 0u));
+    const uint32_t st = n88_read32(m, I + S5L8920_I2C_STATUS);
+    for (unsigned i = 0; !write && i < n; i++)
+        buf[i] = (uint8_t)n88_read32(m, I + S5L8920_I2C_FIFO);
+    n88_write32(m, I + S5L8920_I2C_STATUS, st);
+    return st;
+}
+
+static bool gpio_pending(n88_t *m, unsigned irq) {
+    return (n88_read32(m, N88_GPIO_PA + N88_GPIOIC_STATUS + 4u * (irq / 32u)) >> (irq % 32u)) & 1u;
+}
+
+static void gpio_ack(n88_t *m, unsigned irq) {
+    n88_write32(m, N88_GPIO_PA + N88_GPIOIC_STATUS + 4u * (irq / 32u), 1u << (irq % 32u));
+}
+
+/* The buttons and the ringer switch: each pin's level in bit 0 of its pad,
+ * by its polarity, and its interrupt by the pad's mode. */
+static void test_buttons_and_switch(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    const uint32_t G = N88_GPIO_PA;
+    static const uint32_t pads[] = { 0x2dcu, 0x2d8u, 0x2c0u, 0x2c4u, 0x28cu };
+    /* AppleS5L8920XGPIO's interrupt setup: masked, both edges; then enabled. */
+    for (unsigned i = 0; i < 5u; i++) n88_write32(m, G + pads[i], 0x21cu);
+    for (unsigned i = 0; i < 5u; i++) n88_write32(m, G + pads[i], 0x20cu);
+    CHECK((n88_read32(m, G + 0x2dcu) & 1u) == 0u && (n88_read32(m, G + 0x2d8u) & 1u) == 0u,
+          "hold and menu released read low");
+    CHECK((n88_read32(m, G + 0x2c0u) & 1u) == 1u && (n88_read32(m, G + 0x2c4u) & 1u) == 1u,
+          "volume buttons released read high (pressed is low)");
+    CHECK((n88_read32(m, G + 0x28cu) & 1u) == 1u, "the switch at ring reads high");
+    CHECK(n88_read32(m, G + 0x2c0u) == 0x20du, "the rest of the pad is its register");
+    bool none = true;
+    for (unsigned i = 0; i < 5u; i++) none &= !gpio_pending(m, pads[i] >> 2);
+    CHECK(none, "configuring them raises nothing");
+
+    n88_set_input(m, N88_INPUT_VOLUP, true);
+    CHECK((n88_read32(m, G + 0x2c0u) & 1u) == 0u, "volume up pressed reads low");
+    CHECK(gpio_pending(m, 0xb0u) && (s5l_vic_read(&m->vic[N88_GPIOIC_LINE / 32u], VIC_RAWINTR) &
+                                     (1u << (N88_GPIOIC_LINE % 32u))),
+          "the press interrupts on 0xB0 and raises line 0x5E");
+    gpio_ack(m, 0xb0u);
+    CHECK(!gpio_pending(m, 0xb0u), "written back");
+    n88_set_input(m, N88_INPUT_VOLUP, false);
+    CHECK(gpio_pending(m, 0xb0u), "both edges: the release interrupts too");
+    gpio_ack(m, 0xb0u);
+
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK((n88_read32(m, G + 0x2d8u) & 1u) == 1u && gpio_pending(m, 0xb6u),
+          "menu pressed reads high and interrupts on 0xB6");
+    gpio_ack(m, 0xb6u);
+    n88_write32(m, G + 0x2d8u, 0x21cu);
+    n88_set_input(m, N88_INPUT_MENU, false);
+    CHECK(!gpio_pending(m, 0xb6u), "a masked pad latches nothing");
+    n88_write32(m, G + 0x2d8u, 0x20cu);
+    CHECK(!gpio_pending(m, 0xb6u), "and unmasking it is no edge");
+    n88_write32(m, G + 0x2d8u, 0x13u);
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK(n88_read32(m, G + 0x2d8u) == 0x13u, "a pad driven as an output reads its register");
+    n88_set_input(m, N88_INPUT_MENU, false);
+
+    n88_set_input(m, N88_INPUT_SILENT, true);
+    CHECK((n88_read32(m, G + 0x28cu) & 1u) == 0u && gpio_pending(m, 0xa3u),
+          "the switch at silent reads low and interrupts on 0xA3");
+    gpio_ack(m, 0xa3u);
+
+    /* The other modes, on volume down (pressed = low). */
+    n88_write32(m, G + 0x2c4u, 0x208u);                     /* rising edge */
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(!gpio_pending(m, 0xb1u), "rising edge: the press (falling) is not one");
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    CHECK(gpio_pending(m, 0xb1u), "rising edge: the release is");
+    gpio_ack(m, 0xb1u);
+    n88_write32(m, G + 0x2c4u, 0x20au);                     /* falling edge */
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(gpio_pending(m, 0xb1u), "falling edge: the press is one");
+    gpio_ack(m, 0xb1u);
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    n88_write32(m, G + 0x2c4u, 0x206u);                     /* while low */
+    CHECK(!gpio_pending(m, 0xb1u), "level low: released, nothing");
+    n88_set_input(m, N88_INPUT_VOLDOWN, true);
+    CHECK(gpio_pending(m, 0xb1u), "level low: pressed, pending");
+    gpio_ack(m, 0xb1u);
+    CHECK(gpio_pending(m, 0xb1u), "level: writing back does not clear a held level");
+    n88_set_input(m, N88_INPUT_VOLDOWN, false);
+    CHECK(!gpio_pending(m, 0xb1u), "level: released, the status follows the pin");
+    n88_free(m);
+    free(m);
+}
+
+/* The D1755's clock at 0x4C and the touch controller's LDO at 0x11 bit 6. */
+static void test_pmu_clock_and_ldo(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    n88_set_rtc(m, 0x5f5e1000u);
+    uint8_t b[4] = {0};
+    CHECK(pmu_xfer(m, N88_PMU_RTC, b, 4, false) == S5L8920_I2C_ST_DONE &&
+          get32(b) == 0x5f5e1000u, "the count reads back, least significant first (%08x)",
+          get32(b));
+    m->cpu.cycles += 3ull * N88_TB_HZ * N88_CYCLES_PER_TICK;
+    pmu_xfer(m, N88_PMU_RTC, b, 4, false);
+    CHECK(get32(b) == 0x5f5e1003u && n88_rtc(m) == 0x5f5e1003u, "and runs with guest time");
+
+    CHECK(pmu_xfer(m, N88_PMU_LDO, b, 1, false) == S5L8920_I2C_ST_DONE &&
+          b[0] == N88_PMU_LDO_TOUCH && m->touch.power_level, "the touch LDO on at hand-off");
+    const uint64_t edges = m->touch.power_edges;
+    b[0] = 0x01u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(!m->touch.power_level && m->touch.power_edges == edges + 1u, "bit 6 clear: off");
+    b[0] = 0x41u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(m->touch.power_level && m->touch.hbpp_mode && m->touch.power_edges == edges + 2u,
+          "on again, in its boot loader");
+    b[0] = 0x40u;
+    pmu_xfer(m, N88_PMU_LDO, b, 1, true);
+    CHECK(m->touch.power_edges == edges + 2u, "another write with bit 6 set is no edge");
+    n88_free(m);
+    free(m);
+}
+
+/* A CPU parked with interrupts masked sleeps; hold or menu wakes it through
+ * the vector page when the kernel left its mark. */
+static void test_sleep_and_wake(void) {
+    n88_t *m = boot_parked();
+    CHECK(m, "boot");
+    if (!m) return;
+    arm_status_t st;
+    m->cpu.cpsr &= ~ARM_CPSR_I;
+    CHECK(n88_run(m, 50, &st) == 50u && !n88_asleep(m), "IRQs open: a branch to itself runs");
+    m->cpu.cpsr |= ARM_CPSR_I;
+    n88_run(m, 50, &st);
+    n88_run(m, 50, &st);
+    CHECK(n88_asleep(m) && m->sleeps == 1u, "IRQ and FIQ masked: asleep (two runs ending there)");
+    const uint64_t c0 = m->cpu.cycles;
+    CHECK(n88_run(m, 1000, &st) == 0u && st == ARM_OK && m->cpu.cycles == c0 + 1000u,
+          "asleep, nothing retires and time passes");
+    n88_set_input(m, N88_INPUT_VOLUP, true);
+    n88_set_input(m, N88_INPUT_VOLUP, false);
+    CHECK(n88_asleep(m), "volume does not wake it");
+    n88_set_input(m, N88_INPUT_MENU, true);
+    CHECK(n88_asleep(m) && (m->pmu.reg[N88_PMU_WAKE_REASON] & 1u),
+          "without the mark it stays parked; the PMU still latched menu");
+    n88_set_input(m, N88_INPUT_MENU, false);
+
+    /* The kernel's vector page and mark, and a resume that parks again. */
+    put32(ram_at(m, N88_DRAM_BASE), mov_imm(1, 0x55));
+    put32(ram_at(m, N88_DRAM_BASE + 4u), B_SELF);
+    memcpy(ram_at(m, N88_DRAM_BASE + N88_SUSPEND_MARK_OFF), "XSOMPSUS", 8);
+    m->cpu.cycles += 5000u;
+    const uint64_t c1 = m->cpu.cycles;
+    n88_set_input(m, N88_INPUT_HOLD, true);
+    CHECK(!n88_asleep(m) && m->wakes == 1u && m->cpu.r[15] == N88_DRAM_BASE &&
+          (m->cpu.cpsr & 0x1fu) == ARM_MODE_SVC && (m->cpu.cpsr & ARM_CPSR_I) &&
+          !(m->cpu.cp15.sctlr & 1u) && m->cpu.cycles == c1,
+          "hold: reset into the vector page, MMU off, the clock kept");
+    CHECK((m->pmu.reg[N88_PMU_WAKE_REASON] & 3u) == 3u, "the PMU says hold (and the menu before)");
+    uint8_t b[4] = {0};
+    pmu_xfer(m, N88_PMU_WAKE_REASON, b, 4, false);
+    CHECK(b[0] & 2u, "read over I2C as AppleD1755PMU does on wake");
+    n88_set_input(m, N88_INPUT_HOLD, false);
+    n88_run(m, 10, &st);
+    n88_run(m, 10, &st);
+    CHECK(m->cpu.r[1] == 0x55u && n88_asleep(m) && m->sleeps == 2u &&
+          !(m->pmu.reg[N88_PMU_WAKE_REASON] & 3u), "resumed, ran, and slept again; reason cleared");
+    n88_free(m);
+    free(m);
+}
+
+/* Sound (n88.h): the audio complex's NCO read back and setting the rate,
+ * and channel 21 into i2s0 played at that rate to the sink, its interrupt
+ * when the marked descriptor has played -- which is when a waiting core
+ * wakes. */
+static uint32_t g_snd_frames, g_snd_rate, g_snd_first, g_snd_last;
+static void snd_sink(void *ctx, const uint32_t *frames, size_t count, uint32_t rate) {
+    (void)ctx;
+    if (!g_snd_frames && count) g_snd_first = frames[0];
+    if (count) g_snd_last = frames[count - 1u];
+    g_snd_frames += (uint32_t)count;
+    g_snd_rate = rate;
+}
+
+static void nco_set(n88_t *m, uint32_t f) {
+    n88_write32(m, N88_ACX_AHB_PA + N88_ACX_NCO_A, 2u * f);
+    n88_write32(m, N88_ACX_AHB_PA + N88_ACX_NCO_B, 2u * f - N88_NCOREF_HZ);
+    n88_write32(m, N88_ACX_AHB_PA + 0x14u, 0xd00u);
+}
+
+static void test_sound(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { WFI, B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 2);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    n88_set_audio_sink(m, snd_sink, NULL);
+    const uint64_t unmodelled = m->unmodelled;
+
+    CHECK(n88_audio_rate(m) == N88_AUDIO_HZ, "the default rate before the NCO is set");
+    nco_set(m, 8000u * N88_AUDIO_BITS_PER_FRAME);
+    CHECK(n88_read32(m, N88_ACX_AHB_PA + N88_ACX_NCO_A) == 2u * 512000u &&
+          n88_audio_rate(m) == 8000u, "the NCO reads back; 512 kHz is 8 kHz");
+    nco_set(m, 44100u * N88_AUDIO_BITS_PER_FRAME);
+    CHECK(n88_audio_rate(m) == 44100u, "2.8224 MHz is 44.1 kHz");
+    n88_write32(m, N88_I2S_PA + 0x408u, 0x78057805u);
+    n88_write32(m, N88_ACX_APB_PA, 0x00010002u);
+    CHECK(n88_read32(m, N88_I2S_PA + 0x408u) == 0x78057805u &&
+          n88_read32(m, N88_ACX_APB_PA) == 0x00010002u, "i2s0 and the APB window read back");
+
+    /* 1024 frames, one marked descriptor, then the terminator. */
+    const uint32_t ring = 0x40300000u, pcm = 0x40310000u, frames = 1024u;
+    for (uint32_t i = 0; i < frames; i++) put32(ram_at(m, pcm + 4u * i), i | (i + 1u) << 16);
+    const uint32_t d0[4] = { ring + 0x20u, 0x303u, pcm, 4u * frames }, d1[4] = { ring, 0, 0, 0 };
+    for (unsigned i = 0; i < 4u; i++) {
+        put32(ram_at(m, ring + 4u * i), d0[i]);
+        put32(ram_at(m, ring + 0x20u + 4u * i), d1[i]);
+    }
+    const unsigned line = N88_CDMA_LINE0 + 21u;
+    n88_write32(m, N88_VIC_PA + 0x10000u * (line / 32u) + VIC_INTENABLE, 1u << (line % 32u));
+    const uint32_t C = N88_CDMA_PA + (21u << 12);
+    const uint64_t t0 = m->cpu.cycles;
+    n88_write32(m, C + CDMA_CSR, 0x18u);
+    n88_write32(m, C + 0x4u, 0xa6u);
+    n88_write32(m, C + CDMA_DAR, N88_I2S_PA);
+    n88_write32(m, C + CDMA_CAR, ring);
+    n88_write32(m, C + CDMA_CSR, 0x19u);
+    CHECK(g_snd_frames == 0u && m->audio_due != UINT64_MAX, "started: nothing yet, a wake planned");
+    arm_status_t st;
+    n88_run(m, 3, &st);
+    const uint64_t want = (uint64_t)frames * N88_CPU_HZ / 44100u;
+    CHECK(m->cpu.cycles - t0 >= want && m->cpu.cycles - t0 < want + 2u * N88_CYCLES_PER_TICK +
+          N88_CPU_HZ / 44100u, "the core woke when 1024 frames had played (%llu cycles, %llu)",
+          (unsigned long long)(m->cpu.cycles - t0), (unsigned long long)want);
+    CHECK(g_snd_frames == frames && g_snd_rate == 44100u && g_snd_first == (0u | 1u << 16) &&
+          g_snd_last == ((frames - 1u) | frames << 16), "every frame, in order, at 44.1 kHz");
+    const uint32_t csr = n88_read32(m, C + CDMA_CSR);
+    CHECK((csr & CDMA_CSR_DONE) && (csr & CDMA_CSR_SEGMENT) &&
+          (s5l_vic_read(&m->vic[line / 32u], VIC_RAWINTR) & (1u << (line % 32u))) &&
+          n88_read32(m, C + CDMA_CAR) == ring + 0x20u, "done, line 0x3f up, CAR on the terminator");
+    CHECK(m->audio_frames == frames && m->audio_due == UINT64_MAX, "counted; nothing more planned");
+    n88_write32(m, C + CDMA_CSR, csr);
+    CHECK(!(s5l_vic_read(&m->vic[line / 32u], VIC_RAWINTR) & (1u << (line % 32u))),
+          "acknowledged");
+    CHECK(m->unmodelled == unmodelled, "every access modelled");
+    n88_free(m);
+    free(m);
+}
+
+int main(void) {
+    test_bus_routing();
+    test_timer_registers();
+    test_timer_fiq_program();
+    test_nvram_image();
+    test_boot_layout_and_tree();
+    test_boot_refusals();
+    test_clock_table();
+    test_spi0_flash();
+    test_cdma_on_the_bus();
+    test_sha1_through_cdma();
+    test_display_controller();
+    test_touch_on_spi1();
+    test_buttons_and_switch();
+    test_pmu_clock_and_ldo();
+    test_sleep_and_wake();
+    test_sound();
+    test_boot_with_root();
+    test_console_ring();
+    test_devicetree_identity();
+    printf("n88: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}

@@ -1,4 +1,8 @@
-# Current S5LBox Architecture Audit
+# Current NEON (formerly S5LBox) Architecture Audit
+
+> **Superseded** by [`CURRENT_ARCHITECTURE.md`](CURRENT_ARCHITECTURE.md)
+> (2026-09-23). Section 4 below lists bottlenecks without the measurements in
+> `hotpath.md` that refute several of them; do not use it to plan work.
 
 ## 1. System Overview
 

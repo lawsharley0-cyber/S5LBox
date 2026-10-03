@@ -321,7 +321,7 @@ static void test_wrong_thread_is_rejected(void) {
 static void test_block_entry_guards(void) {
     jit_buf_t b = {0}, wrong = {0};
     jit_block_t blk;
-    arm_cpu_t cpu;
+    arm_cpu_t cpu = {0};
     uint32_t *code, *other;
     uint64_t generation;
     uint64_t committed_epoch;

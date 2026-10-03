@@ -286,7 +286,9 @@ static void test_cpu_state_round_trips(void) {
      * machine's own bus, not at the machine the snapshot came from. */
     CHECK(b->cpu.bus == &b->bus, "restored cpu->bus must point at its own machine");
     CHECK(b->bus.ctx == b, "restored bus ctx must point at its own machine");
-    CHECK(b->bus.host_ram_write == b->bus.host_ram,
+    CHECK(b->bus.host_ram_write != NULL &&
+          b->bus.host_ram_write(b->bus.ctx, b->ram_base, 0x400u) ==
+              b->bus.host_ram(b->bus.ctx, b->ram_base, 0x400u),
           "restore did not preserve live direct-write consent");
     CHECK(b->cpu.dread[0].host == NULL && b->cpu.dwrite[0].host == NULL,
           "restore retained process-local data-cache pointers");

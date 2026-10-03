@@ -283,6 +283,8 @@ static void mapped_store_u32(const md_raw_bridge_config_t *config,
                              uint32_t pa, uint32_t value) {
     size_t offset = (size_t)((uint64_t)pa - config->ram_base);
     store_u32(config->ram + offset, value);
+    if (config->ram_written)
+        config->ram_written(config->ram_written_context, pa, 4u);
 }
 
 static bool user_segment(uint32_t segment) {
@@ -852,6 +854,10 @@ static arm_svc_result_t start_uiomove(md_raw_bridge_t *bridge,
     bounce = pending_bounce(bridge, pending);
 
     memset(bounce, 0, (size_t)residual);
+    /* Everything below writes only inside [bounce, bounce + residual). */
+    if (config->ram_written)
+        config->ram_written(config->ram_written_context, pending->bounce_pa,
+                            residual);
     if (rw == XNU32_UIO_READ && media_length != 0u) {
         block_status = vm_block_read_exact(
             config->block, offset, bounce, media_length,

@@ -60,8 +60,22 @@ static const guest_patch_entry_t kernel_patches[] = {
          * has resolved any user-page fault and returned.
          */
         .replacement = {0xe3u, 0xdfu, 0xe4u, 0xdfu}
+    },
+    /* Optional, and last so the first five keep their indices: the global
+     * _vm_fault_enter tests before killing a process over an invalid page
+     * (non-zero skips the kill). Little-endian word 0 -> 1. */
+    {
+        .virtual_address = IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA,
+        .length = 4u,
+        .expected = {0x00u, 0x00u, 0x00u, 0x00u},
+        .replacement = {0x01u, 0x00u, 0x00u, 0x00u}
     }
 };
+
+#define KERNEL_PATCH_ALWAYS ((size_t)IOS3_KERNEL_PATCH_SITE_CS_ENFORCEMENT)
+typedef char kernel_patch_table_matches_sites[
+    (sizeof kernel_patches / sizeof kernel_patches[0] ==
+     KERNEL_PATCH_ALWAYS + 1u) ? 1 : -1];
 
 /*
  * The raw bridge redirects guest control to this unmodified helper. Pinning
@@ -345,6 +359,7 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
     guest_patch_status_t patch_status;
     ios3_kernel_patch_status_t status;
     size_t byte_index;
+    size_t patch_count;
 
     if (report == NULL)
         return IOS3_KERNEL_PATCH_STATUS_INVALID_ARGUMENT;
@@ -358,6 +373,8 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
     /* Copy before overlap detection: this is a read only. If report aliases the
      * request, the copy lets us reject without performing the first write. */
     saved_request = *request;
+    patch_count = KERNEL_PATCH_ALWAYS +
+                  (saved_request.disable_codesign_page_kill ? 1u : 0u);
     if (!make_host_range(report, sizeof *report, &report_range) ||
         !make_host_range(request, sizeof *request, &request_range) ||
         !make_host_range(saved_request.kernel_file,
@@ -502,9 +519,7 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
 
     {
         size_t site_index;
-        for (site_index = 0u;
-             site_index < sizeof kernel_patches / sizeof kernel_patches[0];
-             site_index++) {
+        for (site_index = 0u; site_index < patch_count; site_index++) {
             const guest_patch_entry_t *entry = &kernel_patches[site_index];
             uint32_t site_byte;
             size_t ram_offset = ram_offset_for_va(entry->virtual_address);
@@ -598,13 +613,11 @@ ios3_kernel_patch_status_t ios3_kernel_patch_apply(
         .ram_base = saved_request.ram_base,
         .virt_base = saved_request.virt_base,
         .entries = kernel_patches,
-        .entry_count = sizeof kernel_patches / sizeof kernel_patches[0]
+        .entry_count = patch_count
     };
     patch_status = guest_patch_apply(&manifest, &patch_report);
     if (patch_status != GUEST_PATCH_STATUS_OK) {
-        uint32_t site = patch_report.entry_index <
-                            (uint32_t)(sizeof kernel_patches /
-                                       sizeof kernel_patches[0])
+        uint32_t site = patch_report.entry_index < (uint32_t)patch_count
             ? patch_report.entry_index : IOS3_KERNEL_PATCH_NO_SITE;
         return report_failure(
             report, IOS3_KERNEL_PATCH_STATUS_PATCH_TRANSACTION_FAILED,
@@ -699,6 +712,8 @@ const char *ios3_kernel_patch_site_string(uint32_t site) {
     case IOS3_KERNEL_PATCH_SITE_MD_READ: return "mdevstrategy read";
     case IOS3_KERNEL_PATCH_SITE_MD_WRITE: return "mdevstrategy write";
     case IOS3_KERNEL_PATCH_SITE_RAW_WATCHER: return "mdevrw raw watcher";
+    case IOS3_KERNEL_PATCH_SITE_CS_ENFORCEMENT:
+        return "cs_enforcement_disable";
     case IOS3_KERNEL_PATCH_NO_SITE: return "none";
     default: return "unknown kernel patch site";
     }

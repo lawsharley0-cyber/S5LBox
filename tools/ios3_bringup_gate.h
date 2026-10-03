@@ -49,9 +49,25 @@ bool ios3_bringup_gate(void *context,
                        size_t detail_capacity);
 
 /*
+ * The same gate, plus the _cs_enforcement_disable patch
+ * (ios3_kernel_patch_request_t::disable_codesign_page_kill), for a machine
+ * that boots with the guest code-signing policy relaxed.
+ */
+bool ios3_bringup_gate_unsigned_code(void *context,
+                                     const uint8_t *kernel_file,
+                                     size_t kernel_file_size,
+                                     uint8_t *ram,
+                                     size_t ram_size,
+                                     uint64_t ram_base,
+                                     uint32_t virt_base,
+                                     char *detail,
+                                     size_t detail_capacity);
+
+/*
  * Fill in `request`'s gate hook and the four 7E18 SVC site addresses in one
  * place, so a frontend cannot arm the bridges against a kernel patched
- * somewhere else. `gate_report` may be NULL.
+ * somewhere else. `gate_report` may be NULL. The hook follows
+ * request->guest_codesign_disabled, so call this after that is decided.
  */
 void ios3_bringup_gate_configure(s5l_bringup_request_t *request,
                                  ios3_bringup_gate_report_t *gate_report);

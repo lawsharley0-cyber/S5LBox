@@ -1,11 +1,11 @@
-# XcodeGen spec for the S5LBox app.
+# XcodeGen spec for the NEON app (called S5LBox until 2026-09-25).
 #
 # We do NOT commit an .xcodeproj (it is a churny binary blob). CI runs
-# `xcodegen generate` on the macOS runner to produce S5LBox.xcodeproj from
+# `xcodegen generate` on the macOS runner to produce NEON.xcodeproj from
 # this file, then `xcodebuild`. To develop locally on a Mac, first run
 # `python3 ../tools/gen_a64_static.py Generated/a64_static_handlers.S`, then
 # `xcodegen generate`, and open the project.
-name: S5LBox
+name: NEON
 options:
   bundleIdPrefix: com.j0shua
   deploymentTarget:
@@ -13,7 +13,7 @@ options:
   createIntermediateGroups: true
 
 targets:
-  S5LBox:
+  NEON:
     type: application
     platform: iOS
     sources:
@@ -80,6 +80,14 @@ targets:
         group: core
       - path: ../tools/rootfs_work.c
         group: core
+      # iPhone OS 3.1.3 on the iPhone 3GS machine: its kernel gate (the three
+      # memory-disk patch sites, by the 7E18 3GS kernel's LC_UUID) and the boot
+      # recipe the desktop harness measured (tools/n88_ios3.h), so the phone
+      # boots exactly what boot3gs did.
+      - path: ../tools/ios3_n88_kernel_patch.c
+        group: core
+      - path: ../tools/n88_ios3.c
+        group: core
       # Strict tar metadata parsing for the verified guest package foundation.
       # Payload bytes remain download-only and are never part of the app.
       - path: ../tools/payload_tar.c
@@ -101,16 +109,21 @@ targets:
       - sdk: AVFoundation.framework
     settings:
       base:
-        PRODUCT_NAME: S5LBox
+        PRODUCT_NAME: NEON
         S5LBOX_SOURCE_REVISION: development
+        # The bundle identifier deliberately keeps the old name. It is never
+        # shown, and keeping it is what lets an install of NEON update the
+        # S5LBox already on a phone in place, with its IPSW, machines and
+        # settings, instead of arriving as a second, empty app. The S5LBOX_*
+        # build-setting names stay for the same no-churn reason.
         PRODUCT_BUNDLE_IDENTIFIER: com.j0shua.S5LBox
-        # The normal build shows S5LBox. The manual MBX workflow overrides this
-        # one setting to "S5LBox MBX" while retaining the stable product path
+        # The normal build shows NEON. The manual MBX workflow overrides this
+        # one setting to "NEON MBX" while retaining the stable product path
         # used by packaging.
-        S5LBOX_DISPLAY_NAME: S5LBox
+        S5LBOX_DISPLAY_NAME: NEON
         INFOPLIST_FILE: Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        CODE_SIGN_ENTITLEMENTS: S5LBox.entitlements
+        CODE_SIGN_ENTITLEMENTS: NEON.entitlements
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/../core/include
           - $(SRCROOT)/../tools

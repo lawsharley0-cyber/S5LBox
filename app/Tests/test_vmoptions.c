@@ -47,6 +47,10 @@ static const struct {
     { "baseband",           false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     { "spi2",               false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     { "usb-otg",            false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
+    /* Hidden: the hardware AAC/MP3 decoder's DSP is not modelled. bootkernel
+     * leaves it matched by default so its recorded runs keep their meaning;
+     * only the default differs, which is what this table is allowed to do. */
+    { "amc",                false, VM_OPT_GROUP_HARDWARE,    VM_OPT_IMPL_HARNESS },
     /* Off, and unlike the others this default is a LOSS taken deliberately.
      * run140 and run151 are the clean pair -- same ca-software-render, same
      * usb-otg, same budget, differing only here: un-matched renders at 273206

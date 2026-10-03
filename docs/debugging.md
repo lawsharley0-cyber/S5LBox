@@ -160,6 +160,155 @@ address you can disassemble, where "66.9% in AppleMBX" is not.
 If the kext map fails to build, the boot log prints a banner saying why, with a
 byte offset. A silently empty map is exactly what would waste the next cycle.
 
+### 2a. The same question on the phone — "Copy Guest Profile"
+
+The app samples the guest PC after every full 100,000-instruction chunk
+(`core/include/guest_profile.h`, sampled in `VMEngine.m`'s run loop), so one
+sample stands for 100,000 retired guest instructions. Chunks that end early —
+the guest went idle, or the run stopped — are counted but not sampled: the
+profile describes busy time, not idle time.
+
+*Performance & Sound → Copy Guest Profile* closes the current window, names
+it, copies it and opens the next window. To profile one activity: copy once
+and discard it, do the activity for 30–60 s, then copy again.
+
+Names come from two files already imported, both read-only:
+
+- kernel PCs: `kernel.macho` through `ksyms.h`, the same as above. Kext code
+  cannot be named past its bundle id, so it is reported as a 256-byte block with
+  its address (`com.apple.driver.AppleMBX  code @0xc0712300 (256 B)`).
+- user PCs: the dyld shared cache
+  (`/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv6`), read out
+  of the pristine `rootfs.img` with `rootfs_work_read_file()`. Every framework
+  and libSystem lives in it at the same address in every process, and each
+  image keeps its own `LC_SYMTAB`, so user code resolves to library and
+  function. Code outside the cache (the app itself, a plugin) is reported by
+  block.
+
+The report gives the kernel/user split, the top libraries and kexts, the top
+functions, and the hottest single addresses. With N samples a share p has a
+standard error of about sqrt(p(1−p)/N): at 3,000 samples a 10% entry is
+10 ± 0.5%.
+
+It also says **which process** each sample ran in. The process is the address
+space: the guest's TTBR0 at the sample (XNU loads each task's own first-level
+table there). The name is the exec path that the kernel copies to the top of
+the task's user stack at exec (iPhone OS 3: just below 0x30000000). It is read
+from guest RAM by a pure ARMv6 table walk (`gprof_va_to_pa`,
+`gprof_exec_path`), once per context switch and again every 64 samples.
+
+exec writes the path, argv and envp as one run of NUL-terminated strings
+ending at the stack top, above the argv/envp pointer array. The run is found
+from the top down: it ends at the first byte that is neither printable nor
+NUL, which is a pointer's 0xff. The path is the lowest complete string in the
+run. The first version took the lowest '/' string anywhere in the two pages
+below the top. That picked up paths in the process's own stack frames. The
+bc45a3f reports named launchd's address space
+`/var/mobile/Library/Preferences/com.apple.PortableStorage.plist`, `/S+K`
+and `/dev/md0` in turn. Each wrong name took a row, which filled the
+64-entry table and left 58% of samples unattributed. The table now holds 256
+address spaces.
+
+A TTBR0 is reused after its task exits, so an address space is the pair
+(TTBR0, path). The report groups address spaces by path. A program started
+more than once in the window, for example a daemon that crashes and is
+relaunched, shows as one row "(N address spaces)", not as N rows. A
+shared-cache function called from several processes is counted once per
+process, and the per-process top-function lists come from those counts.
+Kernel samples count toward the process whose tables were loaded. That
+includes its system calls, and also interrupts that happened to land in its
+time slice. An address space with no readable path (a kernel thread, or a
+stack page not present yet) goes in one group of its own.
+
+Each sample also keeps its **call stack**: the pc, the link register (unless
+it is already the first saved lr, as it is once a function has pushed its
+frame), then the saved lr of every frame reached through r7. iPhone OS code
+keeps r7 pointing at {saved r7, saved lr} in ARM and Thumb alike. The walk
+(`gprof_backtrace`) goes through the same page tables, stops at the first
+frame that does not climb, and keeps at most 12 frames; identical stacks
+share one entry. The report adds "Inclusive" (a function plus everything it
+called, each function counted once per stack) and the four most common call
+paths into each of the three hottest functions. Return addresses are named
+two bytes back, at the call site. The 6ec47e8
+reports put 45% and 62% of all samples in Security.framework's bignum code
+(`_mulg_common`, `_grammarSquare_common`). That is RSA-sized arithmetic. The
+process section exists to name who is doing it.
+
+The bc45a3f reports named it. `/usr/libexec/lockdownd` took 31% and 43% of
+two cached-interpreter boots (1.9 and 2.6 G instructions). Its call paths
+run from its own code into `SecKeyGeneratePair` -> `RSA_GenKeyPair` ->
+`rsaGenRandPrime` -> `isGiantPrime`: it is generating a key pair. Each of
+those reports was taken 55 to 102 s into a boot, while it was still going.
+The work image keeps what the guest writes, so a key saved once should not
+be generated again. It is generated again, so something prevents the save.
+
+**Inferred, to be tested on the device:** the generation takes longer than a
+session. Stopping the machine does not unmount the guest disk cleanly: the
+Guest Logs reader refuses the disk until iPhone OS is shut down with slide
+to power off. A key that was never finished, or finished but still in the
+guest's buffer cache, is lost, and the next boot starts again. Two things
+settle this:
+- the profile's "seen a-b%" column, where "-100%" means still running at the
+  end of the window;
+- one long session ended with slide to power off, followed by a boot that
+  either repeats the work or does not.
+
+Nothing is pre-provisioned for lockdownd. What it stores, and in what
+format, would have to come from its own code, as `data_ark.plist`'s
+contents did (`docs/derivations.md` 23.3).
+
+### 2b. Everything from one session — "Save Full Test Report"
+
+The emulator menu's *Save Full Test Report* writes
+`Documents/Reports/S5LBox-test-<time>.txt` (Files app → S5LBox → Reports) and
+offers the share sheet. It holds, in order: the Performance & Sound text; the
+machine's name and recorded graphics mode; the whole console scrollback; the
+guest profile (which, like *Copy Guest Profile*, starts a new window); and the
+audio section:
+
+- the whole kexts of both audio paths, cut from a copy of the kernel's first
+  16 MiB of guest RAM at each kext's extent in the kernelcache's prelink map,
+  so `__cstring` and `__DATA` come with the code. Four kinds of kext are
+  included:
+  - the kext whose code touched AMC or its SRAM;
+  - the kext whose code touched either I2S window;
+  - `com.apple.driver.AppleEmbeddedAudio`, which prints "could not start
+    DMA", by name;
+  - `com.apple.driver.AppleARMPL080DMAC`, by name.
+
+  Each copy lists every kernel function the kext references, by name
+  (`app/Sources/VMDriverDump.c` finds ARM B/BL/BLX, Thumb BL/BLX pairs and
+  vtable/literal words; only exact symbol entries are printed). A kext whose
+  SHA-256 matches one already analysed is named with its hash and nothing
+  else; today that is AppleAMC_r1, `d3611f38...`. AppleAMC_r1 prints each
+  failed assertion as its own preformatted string, so its line numbers can
+  only be matched to code through `__cstring`;
+- the PCM path's state. This is the kernel's recent distinct accesses to the
+  I2S windows (a table of their own, which the timer cannot evict). It also
+  has, for both PL080 controllers, the configuration, bytes moved, every
+  refusal counter and each programmed channel, and for both I2S windows,
+  the seven stored registers, any other offset touched and the TX FIFO word
+  count;
+- the AMC registers the driver left non-zero, and the SRAM's non-empty 1 KiB
+  chunks by offset;
+- the kernel's SHA-1, from `_SHA1Init` to the first symbol after the last of
+  its entry points (at most 16 KiB). It is behind every code-signing page
+  check (`cs_validate_page`) and took about 14% of guest time in the bc45a3f
+  profiles. It is copied so that a native replacement can be checked against
+  the exact instructions it would stand in for.
+
+Binary images are raw DEFLATE in base64. To get the bytes back:
+
+```python
+import base64, zlib
+raw = zlib.decompress(base64.b64decode(text), -15)   # "deflate-raw+base64"
+```
+
+The kext's `va=` is where the bytes start, so a disassembler pointed at that
+base reproduces the kernel's own addresses (`capstone`, ARM and Thumb). The
+bytes are the user's firmware: read them in a scratch directory and never
+commit them.
+
 ---
 
 ## 3. "Make the loop bearable" — snapshot and restore

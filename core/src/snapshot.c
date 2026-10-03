@@ -105,7 +105,11 @@
         "purpose: add the new field to " visitor "() in core/src/snapshot.c, " \
         "update this number, and bump SNAPSHOT_VERSION in snapshot.h.")
 
-SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
+/* 76 = 64 + PAR, CSSELR and the A8's L2 auxiliary control: ARMv7-only
+ * registers, zero on the ARM1176. Like d16-d31 below they are not stored, a
+ * read zeroes them, and SNAPSHOT_VERSION does not move. Measured with
+ * sizeof. */
+SNAP_SIZE_GUARD(arm_cp15_t,        76,    "snap_cpu");
 /* 68112 = 66032 + the data-read and data-write block caches (2 x 64 x 16),
  * their four host-only accounting counters (32), and the padding their
  * 8-byte alignment adds after fetch_priv. Like the fetch cache they hold HOST
@@ -114,8 +118,17 @@ SNAP_SIZE_GUARD(arm_cp15_t,        64,    "snap_cpu");
  * -- SNAPSHOT_VERSION therefore does not move. Same exception as level_dirty
  * below, and justified the same way. Measured with the compiler's failed size
  * guard and confirmed by the successful guard below, not assumed from source
- * arithmetic; the padding is exactly why. */
-SNAP_SIZE_GUARD(arm_cpu_t,         68112,   "snap_cpu");
+ * arithmetic; the padding is exactly why. reset_epoch (host-only, not
+ * serialised) now occupies four bytes of that padding, so the size holds. */
+/* 68240 = 68112 + d16-d31 (vfp_s grew from 32 words to 64). Those registers
+ * exist only on the ARMv7 profiles and the S5L8900 is an ARM1176, so
+ * snap_cpu() still stores 32 words and zeroes the rest on read, and
+ * snap_machine_valid() refuses a machine whose CPU is not the ARM1176. The
+ * bytes on disk do not change and SNAPSHOT_VERSION does not move. Measured
+ * with sizeof, not inferred. */
+/* 68256 = 68240 + arm_cp15_t's 12 ARMv7 bytes + 4 of alignment padding,
+ * measured with sizeof. Not stored, same reasoning. */
+SNAP_SIZE_GUARD(arm_cpu_t,         68256,   "snap_cpu");
 SNAP_SIZE_GUARD(s5l_uart_t,        8280,  "snap_uart");
 SNAP_SIZE_GUARD(s5l_vic_t,         16,    "snap_vic");
 SNAP_SIZE_GUARD(s5l_timer_t,       40,    "snap_timer");
@@ -130,9 +143,16 @@ SNAP_SIZE_GUARD(s5l_i2c_t,         320,   "snap_i2c");
 SNAP_SIZE_GUARD(s5l_pcf50635_t,    600,   "snap_pmu");
 SNAP_SIZE_GUARD(s5l_wm8991_t,      496,   "snap_codec");
 /* 128 = 104 + the audio tx callback, context, and tx_words counter (24).
- * Host wiring, not serialized. */
-SNAP_SIZE_GUARD(s5l_i2s_t,         128,   "snap_i2s");
-SNAP_SIZE_GUARD(s5l_spi_t,         240,   "snap_spi");
+ * Host wiring, not serialized. 192 adds tx_frames (host-side, not serialised),
+ * the v33 frame clock and TX FIFO (phase, frames, fill, pack, pack length,
+ * underrun, overrun; serialised) and tx_credit (zero outside a refresh, not
+ * serialised). */
+SNAP_SIZE_GUARD(s5l_i2s_t,         192,   "snap_i2s");
+/* 256 = 240 + cnt_v1 (4), the FIFOs widened from 8 to 16 octets each (16),
+ * and `version` (1, in padding), less padding. None of it enters the file:
+ * this format carries the S5L8900 machine, whose controllers are version 0 --
+ * see snap_spi(). */
+SNAP_SIZE_GUARD(s5l_spi_t,         256,   "snap_spi");
 /* Four register banks, plus what the board is driving and which lines it
  * drives at all -- see the `driven` note in soc.h. */
 SNAP_SIZE_GUARD(s5l_gpioic_t,      224,   "snap_gpioic");
@@ -203,12 +223,38 @@ SNAP_SIZE_GUARD(s5l_stub_t,        56,    "snap_stubs");
  * 125768 adds host-only audio sink callback/context to s5l8900_t (16) and two
  * s5l_i2s_t host callback/counter fields (2 x 24 = 48), also live host wiring
  * and deliberately outside snap_mach().
- * 125792 adds host-only CPU backend acceleration state (enum backend, cached block
- * pointer, micro-op IR pointer, 24 bytes). Never serialized in snap_mach().
- * SNAPSHOT_VERSION and the bytes on disk therefore do not move. The size below
+ * 125776 adds the host-only CPU backend selection (s5l8900_cpu_backend_t, 4
+ * bytes plus tail padding). It is execution policy, not guest state, and is
+ * deliberately outside snap_mach().
+ * 125784 adds the cached interpreter pointer (8): a cache derived from guest
+ * RAM, never serialised; restore flushes it (s5l8900_ram_replaced).
+ * 127072 adds the host-only unmodelled-access log (32 x 40 + 8): diagnostics
+ * about what the guest touched, not machine state, outside snap_mach().
+ * 128360 adds the host-only all-device access log (another 32 x 40 + 8),
+ * likewise outside snap_mach().
+ * 128392 adds the host-only cached-interpreter horizon state (ci_run_open,
+ * ci_horizon_off, ci_run_caught, and the refresh-keyed horizon cache):
+ * per-run bookkeeping and a cache of derived state, and no run is open
+ * between s5l8900_run() calls, so it is outside snap_mach() as well.
+ * 128408 adds the host-only audio-block pc range (lo, hi, count), a
+ * diagnostic like the access logs, outside snap_mach().
+ * 129712 adds the host-only PCM-path log (32 x 40 + 8) and its pc range
+ * (lo, hi, count): diagnostics again, outside snap_mach().
+ * SNAPSHOT_VERSION and the bytes on disk do not move for any of those.
+ * 129840 is the exception: the two I2S windows grew by 64 bytes each (see
+ * the s5l_i2s_t guard), and their frame clock and FIFO ARE in snap_i2s(), so
+ * this one is v33. The host-only dma_bus_active flag sits in the tail
+ * padding after ci_horizon_idle and does not change the size. The size below
  * must be read from the compiler's emitted `.space`, not inferred from source
- * padding. */
-SNAP_SIZE_GUARD(s5l8900_t,         125792, "snap_mach");
+ * padding.
+ * 129968 is the CPU's d16-d31 (128 bytes, see the arm_cpu_t guard): not
+ * stored, since the ARM1176 has no such registers, so v33 stands.
+ * 129984 is the CPU's ARMv7 CP15 registers (16 bytes with padding, see the
+ * arm_cpu_t guard): not stored either, v33 stands. Measured with sizeof.
+ * 130016 is the two SPI controllers' version 1 fields (16 bytes each, see the
+ * s5l_spi_t guard): a version 0 part never uses them, so not stored and v33
+ * stands. Measured with sizeof. */
+SNAP_SIZE_GUARD(s5l8900_t,         130016, "snap_mach");
 #endif
 
 /* ---------------------------------------------------------------- the IO --- */
@@ -392,6 +438,10 @@ static void snap_cp15(sn_io_t *io, arm_cp15_t *p) {
     F32(p->dfar);       F32(p->ifar);
     F32(p->fcse_pid);   F32(p->context_id);
     F32(p->tpidrurw);   F32(p->tpidruro);   F32(p->tpidrprw);
+    /* PAR, CSSELR and L2AUXCR exist only on the ARMv7 profiles, and a
+     * snapshot only ever holds an ARM1176 (snap_machine_valid), where they
+     * are zero. Not stored; a read leaves them as arm_reset would. */
+    if (sn_reading(io)) { p->par = 0; p->csselr = 0; p->l2auxcr = 0; }
 }
 
 /*
@@ -423,8 +473,13 @@ static void snap_cpu(sn_io_t *io, arm_cpu_t *c) {
     F32(c->vfp_fpexc);
     F32(c->vfp_fpscr);
     /* s0-s31. d0-d15 alias these and so need no separate entry — that is the
-     * point of storing the file once (see arm_cpu_t.vfp_s). */
+     * point of storing the file once (see arm_cpu_t.vfp_s). Words 32-63 are
+     * d16-d31, which only an ARMv7 CPU has; this machine's ARM1176 does not
+     * (snap_machine_valid insists), so they are not stored and read as zero,
+     * which is what arm_reset leaves in them. */
     FA32(c->vfp_s, 32);
+    if (sn_reading(io))
+        memset(&c->vfp_s[32], 0, sizeof c->vfp_s - 32u * sizeof c->vfp_s[0]);
     /*
      * THE TLB IS DELIBERATELY NOT STORED, and the size guard above is what
      * forces anyone adding to arm_cpu_t to read this rather than assume it.
@@ -450,6 +505,7 @@ static void snap_cpu(sn_io_t *io, arm_cpu_t *c) {
         /* And generation 1, for the same reason arm_reset does: an entry at
          * generation 0 in a table whose counter is also 0 is a false hit. */
         c->tlb_gen = 1u;
+        c->reset_epoch++;      /* see arm.h: caches outside this struct */
     }
     F64(c->tlb_hits); F64(c->tlb_misses); F64(c->tlb_flushes);
     /*
@@ -811,7 +867,10 @@ static bool codec_state_valid(const s5l_wm8991_t *c) {
 }
 
 static bool i2s_state_valid(const s5l_i2s_t *s) {
-    return s && s->unknown_off_count <= S5L_I2S_UNKNOWN_OFF;
+    return s && s->unknown_off_count <= S5L_I2S_UNKNOWN_OFF &&
+           s->tx_fill <= S5L_I2S_TX_FIFO_BYTES &&
+           s->tx_pack_len < S5L_I2S_FRAME_BYTES &&
+           (s->tx_pack >> (8u * s->tx_pack_len)) == 0u;
 }
 
 static void snap_codec(sn_io_t *io, s5l_wm8991_t *c) {
@@ -837,6 +896,13 @@ static void snap_i2s(sn_io_t *io, s5l_i2s_t *s) {
     F64(s->unknown_reads); F64(s->unknown_writes);
     FA32(s->unknown_off, S5L_I2S_UNKNOWN_OFF);
     F32(s->unknown_off_count);
+    /* v33: the frame clock and the TX FIFO it drains. tx_credit is not here:
+     * it is zero outside a refresh. The partial frame for the host sink is,
+     * so a restore does not shift every later sample by a halfword. */
+    F64(s->fclk_phase); F64(s->frames);
+    F32(s->tx_fill); F32(s->tx_pack); F32(s->tx_pack_len);
+    F64(s->tx_underrun); F64(s->tx_overrun);
+    if (sn_reading(io) && io->err == SNAP_OK) s->tx_credit = 0;
     if (sn_reading(io) && io->err == SNAP_OK && !i2s_state_valid(s))
         io->err = SNAP_ERR_CORRUPT;
 }
@@ -853,7 +919,8 @@ static bool spi_state_valid(const s5l_spi_t *s) {
                    S5L_SPI_LCD_READ_PENDING)) != 0u ||
         (s->cs & S5L_SPI_CS_ROUTE_MASK) >= S5L_SPI_SLAVES ||
         (s->status & ~(uint32_t)SPI_STATUS_EVENTS) != 0u ||
-        s->unknown_off_count > S5L_SPI_UNKNOWN_OFF)
+        s->unknown_off_count > S5L_SPI_UNKNOWN_OFF ||
+        s->version != 0u || s->cnt_v1 != 0u)
         return false;
     if ((s->cs & S5L_SPI_LCD_READ_PENDING) != 0u &&
         ((s->cs & S5L_SPI_CS_ROUTE_MASK) != S5L_SPI0_LCD_CS ||
@@ -871,6 +938,14 @@ static bool spi_state_valid(const s5l_spi_t *s) {
  * value as corrupt, while a new reader interprets an old clear bit as no
  * pending read. snap_apply() reasserts spi0's current low board route so
  * checkpoints made before the lcd0 endpoint existed can resume.
+ */
+/*
+ * Version 1 state is not in the file. The S5L8900 machine this format carries
+ * has only version 0 controllers: `version` is board wiring like the slave
+ * table, `cnt_v1` is a register such parts do not have, and a version 0 FIFO
+ * never holds more than its first S5L_SPI_FIFO_DEPTH octets (fifo_pop zeroes
+ * the rest), so those are all the octets written. spi_state_valid() refuses a
+ * controller that is not version 0.
  */
 static void snap_spi(sn_io_t *io, s5l_spi_t *s) {
     F32(s->control); F32(s->setup); F32(s->pin);
@@ -1340,6 +1415,9 @@ static bool snap_machine_valid(const s5l8900_t *m) {
         m->nor.image_count > S5L_NOR_MAX_IMAGES ||
         m->unmapped_addr_count > S5L_UNMAPPED_LOG || m->dev_count > S5L_DEVLOG)
         return false;
+    /* The format has no field for the CPU profile and none for d16-d31: it
+     * describes an ARM1176, the S5L8900's CPU, and nothing else. */
+    if (m->cpu.arch != ARM_ARCH_V6_ARM1176) return false;
     for (unsigned i = 0; i < S5L8900_I2C_COUNT; i++)
         if (!i2c_state_valid(&m->i2c[i])) return false;
     if (!pmu_state_valid(&m->pmu)) return false;
@@ -1530,6 +1608,9 @@ static snapshot_status_t snap_validate_structure(const s5l8900_t *m, FILE *f,
 
 static snapshot_status_t snap_apply(s5l8900_t *m, FILE *f,
                                     const uint8_t *in, size_t in_len) {
+    /* Guest RAM is about to be replaced wholesale (possibly partially, on an
+     * I/O error): nothing the cached interpreter derived from it survives. */
+    s5l8900_ram_replaced(m);
     sn_io_t io = {0};
     io.mode = SN_LOAD; io.f = f; io.in = in; io.in_len = in_len;
     io.hash = FNV64_OFFSET;

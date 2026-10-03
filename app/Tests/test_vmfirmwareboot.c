@@ -139,7 +139,7 @@ static void test_app_settings_reach_the_guest(const uint8_t *kernel,
      * node the app strikes from the tree.
      */
     static const char *const NUBS[] = {
-        "mbx", "sha1", "baseband", "spi2", "usb-otg"
+        "mbx", "sha1", "baseband", "spi2", "usb-otg", "amc"
     };
     const unsigned want = (unsigned)(sizeof NUBS / sizeof NUBS[0]);
     bool values[VM_BOOT_OPTION_MAX];

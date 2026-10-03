@@ -135,6 +135,33 @@ typedef void (^VMEngineStopCompletion)(void);
 - (NSString *)audioStatusDescription;
 - (void)playAudioTestTone;
 
+/* The cached interpreter's counters for this run (what share of instructions
+ * it retired and why the rest went to the reference interpreter) and the
+ * machine's most recent accesses to hardware it does not model. Refreshed
+ * with the status line; safe on any thread. */
+- (NSString *)diagnosticsDescription;
+
+/* Opt-in: the guest kernel's own code around every pc that accessed the
+ * audio block, base64 with its VA and SHA-256, for analysing the driver's
+ * register protocol. Read from guest RAM; nothing is stored. */
+- (NSString *)audioDriverExcerpt;
+
+/* Where the guest's instructions went since the previous call (or since the
+ * engine was made): sampled pcs named by library and function, from the
+ * imported kernelcache and the root filesystem's dyld shared cache. Each call
+ * starts a new window. Symbolization reads files, so it runs off the calling
+ * thread; `completion` is called on the main queue. */
+- (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion;
+
+/* Opt-in, for the Full Test Report: the whole kexts of the audio paths,
+ * base64, with the kernel functions they reference named from the imported
+ * kernelcache -- the ones whose code touched the AMC or the I2S windows, and
+ * AppleEmbeddedAudio and AppleARMPL080DMAC by name -- then the PCM path's
+ * device state and the AMC's storage. A kext already analysed is named by
+ * hash only. Guest RAM is copied before this returns; the rest runs off the
+ * calling thread and `completion` is called on the main queue. */
+- (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion;
+
 /*
  * Host-side control over VMFirmwareBoot.c's `engine.interpreter` marker: with
  * the build-time compact AArch64 engine compiled in, this forces every guest

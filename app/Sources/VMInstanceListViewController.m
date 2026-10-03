@@ -9,6 +9,7 @@
 #import "VMEngine.h"
 #import "VMGuestInstallViewController.h"
 #import "VMUserAppViewController.h"
+#import "VMGuestLogsViewController.h"
 #import "VMInstanceStore.h"
 #import "VMInstances.h"
 #import "VMSettings.h"
@@ -133,15 +134,66 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
 
 #pragma mark - Actions
 
+/*
+ * The renderer is fixed when a machine's work image is made, so it is chosen
+ * here, per machine, instead of by flipping the app-wide Settings rows before
+ * creating one. The middle choice is the one for 3D games: the PowerVR driver
+ * is matched (OpenGL ES has a GPU to talk to) while SpringBoard keeps Apple's
+ * CPU compositor, the configuration the home screen is known to run with.
+ */
 - (void)addTapped {
-    [self promptWithTitle:@"New Machine"
-                     text:@""
-                   accept:@"Create"
-                  handler:^(NSString *name) {
-        NSError *err = nil;
-        if (![[VMInstanceStore sharedStore] createInstanceNamed:name error:&err])
-            [self showError:err doing:@"Could not create the machine"];
-    }];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"New Machine"
+                         message:@"Graphics are fixed when the machine first starts."
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak VMInstanceListViewController *weakSelf = self;
+    void (^choose)(NSString *, NSString *, BOOL, BOOL) =
+        ^(NSString *title, NSString *suggested, BOOL mbx, BOOL software) {
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            VMInstanceListViewController *self_ = weakSelf;
+            [self_ promptWithTitle:title
+                              text:suggested
+                            accept:@"Create"
+                           handler:^(NSString *name) {
+                NSError *err = nil;
+                if (![[VMInstanceStore sharedStore] createInstanceNamed:name
+                                                            mbxEnabled:mbx
+                                               softwareRendererEnabled:software
+                                                                 error:&err])
+                    [self_ showError:err doing:@"Could not create the machine"];
+            }];
+        }]];
+    };
+    choose(@"CPU graphics (stable)", @"iPhone OS 3.1.3", NO, YES);
+    choose(@"GPU for apps and games (experimental)", @"iPhone OS 3.1.3 GPU apps", YES, YES);
+    choose(@"Full GPU (experimental)", @"iPhone OS 3.1.3 GPU", YES, NO);
+    /* A different machine, not a renderer choice: the iPhone 3GS. What it
+     * runs is the firmware imported for it: iPhone OS 3.1.3, or the iOS 6
+     * preview, which prints the kernel's console and stops where the kernel
+     * waits for a root filesystem. */
+    [sheet addAction:[UIAlertAction actionWithTitle:@"iPhone 3GS (iPhone OS 3.1.3 or iOS 6 preview)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        VMInstanceListViewController *self_ = weakSelf;
+        [self_ promptWithTitle:@"iPhone 3GS"
+                          text:@"iPhone 3GS"
+                        accept:@"Create"
+                       handler:^(NSString *name) {
+            NSError *err = nil;
+            if (![[VMInstanceStore sharedStore] createIPhone3GSInstanceNamed:name
+                                                                       error:&err])
+                [self_ showError:err doing:@"Could not create the machine"];
+        }];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    /* An action sheet on iPad needs an anchor; the + button is it. */
+    sheet.popoverPresentationController.barButtonItem =
+        self.navigationItem.rightBarButtonItems.firstObject;
+    [self presentViewController:sheet animated:YES completion:nil];
 }
 
 - (void)settingsTapped {
@@ -204,7 +256,18 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
         done(YES);
     }];
     add.backgroundColor = UIColor.systemIndigoColor;
-    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[add]];
+    UIContextualAction *logs = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+        title:@"Crash Logs" handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+        (void)action; (void)view;
+        if (self.navigationController.topViewController == self && row) {
+            VMGuestLogsViewController *screen = [[VMGuestLogsViewController alloc]
+                initWithInstanceID:row[@"id"] machineName:row[@"name"]];
+            [self.navigationController pushViewController:screen animated:YES];
+        }
+        done(YES);
+    }];
+    logs.backgroundColor = UIColor.systemOrangeColor;
+    UISwipeActionsConfiguration *configuration = [UISwipeActionsConfiguration configurationWithActions:@[add, logs]];
     configuration.performsFirstActionWithFullSwipe = NO;
     return configuration;
 }
@@ -339,7 +402,12 @@ titleForFooterInSection:(NSInteger)section {
         ? @""
         : [NSString stringWithFormat:@" · %.2f B instructions",
            (double)retired / 1e9];
-    cell.detailTextLabel.text = [when stringByAppendingString:work];
+    NSString *graphics = row[@"id"]
+        ? [[VMInstanceStore sharedStore] graphicsSummaryForInstanceWithID:row[@"id"]]
+        : nil;
+    cell.detailTextLabel.text = graphics
+        ? [NSString stringWithFormat:@"%@ · %@%@", graphics, when, work]
+        : [when stringByAppendingString:work];
     cell.detailTextLabel.font =
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
     cell.detailTextLabel.adjustsFontForContentSizeCategory = YES;

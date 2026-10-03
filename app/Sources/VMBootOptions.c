@@ -81,6 +81,9 @@ static const struct {
     /* The baseband's bus. */
     { "spi2", MAP_UNMATCH, NULL, "arm-io/spi2" },
     { "usb-otg", MAP_UNMATCH, NULL, "arm-io/usb-otg" },
+    /* The hardware AAC/MP3 decoder. Its DSP is not modelled, so matched it
+     * takes every hardware decode and returns silence; see docs/audio.md. */
+    { "amc", MAP_UNMATCH, NULL, "arm-io/amc" },
     /*
      * The digitizer, and the only nub here whose default is MATCHED -- the
      * touch controller is the point of the exercise, not a hazard to hide.

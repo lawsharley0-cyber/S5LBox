@@ -572,7 +572,10 @@ int main(int argc, char **argv) {
     s5l8900_t mach;
     if (!s5l8900_init(&mach, phys_base, ram_size)) { fprintf(stderr, "init failed\n"); return 1; }
     mach.trace_devices = true;
-    s5l8900_set_cpu_backend(&mach, cpu_backend_choice);
+    if (!s5l8900_set_cpu_backend(&mach, cpu_backend_choice)) {
+        fprintf(stderr, "could not allocate the cached interpreter\n");
+        return 1;
+    }
 
     for (unsigned i = 0; i < mo.segment_count; i++) {
         macho_segment_t *s = &mo.segments[i];

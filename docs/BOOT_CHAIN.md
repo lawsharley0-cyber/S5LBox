@@ -142,7 +142,7 @@ IPSW=firmware/iPhone1,2_3.1.3_7E18_Restore.ipsw
 
 # kernel.macho -- 7,942,144 bytes
 python tools/ipsw_explore.py $IPSW -x kernelcache.release.s5l8900x -o $S/kc.img3
-./build/core/img3dump $S/kc.img3 -k <hexkey> -iv <hexiv> -o $S/kc.complzss
+./build/core/img3dump $S/kc.img3 -k <hexkey> -iv <hexiv> -o $S/kc.complzss -copy-tail
 ./build/core/unlzss $S/kc.complzss firmware/kernel.macho
 
 # devicetree.bin -- 40,544 bytes
@@ -170,7 +170,12 @@ Four things that cost time and are easy to get wrong:
   docs/debugging.md named the wrong one.
 - `unlzss` prints `adler32 check: MISMATCH` and a 42-byte zero-fill notice on
   this kernelcache. That is the documented known discrepancy, it is baked into
-  the canonical hash, and it is **not** a failure.
+  the canonical hash, and it is **not** a failure. It comes from the IMG3's
+  last, unaligned block being copied rather than decrypted, which is why the
+  kernel line passes `-copy-tail` (img3dump decrypts that block by default, as
+  iBoot does and as a device tree's last property needs). The app's importer
+  copies a kernelcache's tail and decrypts a device tree's for the same
+  reasons.
 - The decrypted DMG is a whole disk, 846,324 sectors, including the partition
   map and free space. Only the `Apple_HFSX` partition -- 846,240 sectors --
   reproduces the accepted hash, which is why `udif.py` takes a blkx filter.

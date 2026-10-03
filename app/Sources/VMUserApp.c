@@ -64,7 +64,7 @@ static bool thin_macho(const uint8_t *b, size_t n, bool main_executable,
             return fail(detail, capacity, "An executable load command has an invalid size.");
         if (command == 0x21u || command == 0x2cu) {
             if (size < 20u || le32(b + offset + 16u) != 0u)
-                return fail(detail, capacity, "This app is encrypted. Import an unencrypted app you own; S5LBox does not remove DRM.");
+                return fail(detail, capacity, "This app is encrypted. Import an unencrypted app you own; NEON does not remove DRM.");
             uint32_t crypt_offset = le32(b + offset + 8u), crypt_size = le32(b + offset + 12u);
             if ((uint64_t)crypt_offset + crypt_size > n)
                 return fail(detail, capacity, "The executable encryption range is outside its slice.");
@@ -250,6 +250,18 @@ static bool identifier_safe(const char *s) {
     return true;
 }
 
+/* The digest names exactly the paths and bytes the transaction writes. */
+static void plan_rehash(vm_user_app_plan_t *p) {
+    ios3_sha256_context_t hash;
+    (void)ios3_sha256_init(&hash);
+    for (size_t i = 0u; i < p->count; i++) {
+        const rootfs_work_entry_t *e = &p->entries[i];
+        (void)ios3_sha256_update(&hash, e->path, strlen(e->path) + 1u);
+        (void)ios3_sha256_update(&hash, e->content, e->content_size);
+    }
+    (void)ios3_sha256_final(&hash, p->digest);
+}
+
 vm_user_app_plan_t *vm_user_app_plan_open(vmfw_pread_fn read, void *read_context, uint64_t archive_size,
     vm_user_app_plist_fn parse, void *plist_context, char *detail, size_t capacity) {
     if (detail && capacity) detail[0] = '\0';
@@ -328,14 +340,7 @@ vm_user_app_plan_t *vm_user_app_plan_open(vmfw_pread_fn read, void *read_context
         if (!add_entry(p, path, false, content, size, main || macho, detail, capacity)) { free(content); goto failed; }
     }
     if (!found_executable) { fail(detail, capacity, "CFBundleExecutable does not name a file in this app."); goto failed; }
-    ios3_sha256_context_t hash;
-    (void)ios3_sha256_init(&hash);
-    for (size_t i = 0u; i < p->count; i++) {
-        const rootfs_work_entry_t *e = &p->entries[i];
-        (void)ios3_sha256_update(&hash, e->path, strlen(e->path) + 1u);
-        (void)ios3_sha256_update(&hash, e->content, e->content_size);
-    }
-    (void)ios3_sha256_final(&hash, p->digest);
+    plan_rehash(p);
     free(a);
     return p;
 failed:
@@ -353,6 +358,53 @@ void vm_user_app_plan_close(vm_user_app_plan_t **slot) {
     }
     free(p); *slot = NULL;
 }
+static bool ascii_case_equal(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return false;
+    }
+    return *a == *b;
+}
+
+/* entries[0] is the bundle directory itself; a file is "<bundle>/<relative>". */
+static rootfs_work_entry_t *plan_find(const vm_user_app_plan_t *p, const char *relative) {
+    if (!p || !relative || !*relative || !p->count) return NULL;
+    const size_t base = strlen(p->entries[0].path);
+    for (size_t i = 1u; i < p->count; i++) {
+        rootfs_work_entry_t *e = (rootfs_work_entry_t *)&p->entries[i];
+        if (e->kind != ROOTFS_WORK_ENTRY_FILE || strncmp(e->path, p->entries[0].path, base) ||
+            e->path[base] != '/')
+            continue;
+        if (ascii_case_equal(e->path + base + 1u, relative)) return e;
+    }
+    return NULL;
+}
+
+bool vm_user_app_plan_file(const vm_user_app_plan_t *p, const char *relative,
+                           const uint8_t **bytes, size_t *size) {
+    const rootfs_work_entry_t *e = plan_find(p, relative);
+    if (!e || !bytes || !size) return false;
+    *bytes = e->content;
+    *size = e->content_size;
+    return true;
+}
+
+bool vm_user_app_plan_replace_file(vm_user_app_plan_t *p, const char *relative,
+                                   uint8_t *content, size_t size) {
+    rootfs_work_entry_t *e = plan_find(p, relative);
+    if (!e || !content || !size || size > ROOTFS_WORK_MAX_ENTRY_BYTES ||
+        p->bytes - e->content_size + size > VM_USER_APP_MAX_CONTENT)
+        return false;
+    p->bytes = p->bytes - e->content_size + size;
+    free((void *)e->content);
+    e->content = content;
+    e->content_size = size;
+    plan_rehash(p);
+    return true;
+}
+
 const vm_user_app_metadata_t *vm_user_app_plan_metadata(const vm_user_app_plan_t *p) { return p ? &p->metadata : NULL; }
 const rootfs_work_entry_t *vm_user_app_plan_entries(const vm_user_app_plan_t *p) { return p ? p->entries : NULL; }
 size_t vm_user_app_plan_entry_count(const vm_user_app_plan_t *p) { return p ? p->count : 0u; }

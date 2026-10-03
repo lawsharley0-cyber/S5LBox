@@ -1,5 +1,11 @@
 # iCube / Dolphin Architecture & Translation Research
 
+> **Superseded** by [`ICUBE_DOLPHIN_RESEARCH.md`](ICUBE_DOLPHIN_RESEARCH.md)
+> (2026-09-23), which cites verified source locations. Several statements
+> below are contradicted by the Dolphin source (there is no
+> `InterpreterOpInfo`; `PPCCache` is the emulated I-cache; Dolphin's JITs do not
+> lift to an IR), and its speedup figures are estimates, not measurements.
+
 ## Executive Summary
 
 This document evaluates the architectural techniques employed by **Dolphin** (the GameCube/Wii emulator) and its iOS adaptation **iCube** (and DolphiniOS) for CPU emulation, basic block dispatch, cached interpretation, fast memory subsystems, and dynamic recompilation.

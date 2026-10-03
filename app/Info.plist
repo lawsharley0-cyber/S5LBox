@@ -4,20 +4,22 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
-    <!-- What the home screen shows under the icon.
+    <!-- What the home screen shows under the icon: NEON.
 
-         S5LBox names the SILICON, which is what this project emulates, and the
-         *Box suffix reads as "emulator" the way DOSBox and 86Box do. It also
-         survives the roadmap: M-P2 adds a second machine profile on the
-         S5L8950X, and a name tied to one OS version would go stale the moment
-         that lands.
+         The app was S5LBox, named for the S5L8900 chip it emulates, until
+         2026-09-25, when the owner renamed it NEON as the project turned
+         towards ARMv7 and iOS 6 on the iPhone 3GS. (Not to be confused with
+         ARM's NEON, the Advanced SIMD instructions the Cortex-A8 profile
+         executes; the docs call that "Advanced SIMD (NEON)".)
 
-         CFBundleName follows PRODUCT_NAME, which is now S5LBox as well – the
-         Xcode target, the .app, the .ipa and the entitlements file were all
-         renamed once the CI workflow that pinned them could be edited. The
-         only thing still called iOS3-VM is the working directory on disk,
-         because 16 CMake build trees cache its absolute path and a folder name
-         is not worth reconfiguring them for. -->
+         CFBundleName follows PRODUCT_NAME, which is NEON as well, as are the
+         Xcode target, the .app, the .ipa and the entitlements file. The
+         bundle identifier is still com.j0shua.S5LBox on purpose: it is never
+         shown, and keeping it makes a NEON install update an S5LBox already
+         on the phone in place, with its firmware, machines and settings.
+         Internal names that nobody sees (build settings, file-format markers,
+         accessibility identifiers) keep the old spelling for the same
+         reason. -->
     <key>CFBundleDisplayName</key>
     <string>$(S5LBOX_DISPLAY_NAME)</string>
     <key>CFBundleExecutable</key>
@@ -38,7 +40,7 @@
     <string>$(S5LBOX_SOURCE_REVISION)</string>
     <!-- The app's Documents folder appears in Files under "On My iPhone",
          which is how a 239 MB IPSW gets in without going through a document
-         picker: copy it into S5LBox's folder and the Firmware screen finds it
+         picker: copy it into NEON's folder and the Firmware screen finds it
          where it already is.
 
          WHAT THIS EXPOSES, stated because it is not only the firmware. The

@@ -265,6 +265,29 @@ static void test_good_cache(void) {
     ksyms_free(&ks);
 }
 
+/*
+ * The later key spelling, _PrelinkExecutableLoadAddr (xnu's prelink.h calls
+ * it kPrelinkExecutableLoadKey), which iOS 6's kernelcache uses with
+ * _PrelinkExecutableSourceAddr beside it, the load address given its own ID
+ * and the source address an IDREF to it -- the shape the iPhone 3GS 10B500
+ * cache has.
+ */
+static void test_newer_load_address_key(void) {
+    build_image("<array><dict>"
+          "<key>CFBundleIdentifier</key><string>com.example.new</string>"
+          "<key>_PrelinkExecutableLoadAddr</key><integer ID=\"0\" size=\"64\">0xc0100000</integer>"
+          "<key>_PrelinkExecutableSourceAddr</key><integer IDREF=\"0\"/>"
+          "<key>_PrelinkExecutableSize</key><integer size=\"64\">0x1000</integer>"
+        "</dict></array>", true);
+    ksyms_t ks;
+    ksyms_status_t st = ksyms_load(&ks, g_img, g_len);
+    CHECK(st == KSYMS_OK, "load: %s (%s)", ksyms_strerror(st), ks.detail);
+    CHECK(ks.nkext_exec == 1, "nkext_exec=%u expect 1", ks.nkext_exec);
+    CHECK(!strcmp(name_of(&ks, 0xc0100010u), "com.example.new+0x10"),
+          "%s", name_of(&ks, 0xc0100010u));
+    ksyms_free(&ks);
+}
+
 /* A plain kernel: no kext map, but the symbols must still work. */
 static void test_no_prelink_still_names_kernel(void) {
     build_image(NULL, true);
@@ -318,16 +341,16 @@ static void test_malformed_plists(void) {
         "</dict></array>",
         "outside __PRELINK_TEXT");
 
-    /* The later (iOS 4+) key spelling. Accepting the dict without it would
-     * produce a map with no addresses; guessing that it means the same thing
-     * would be a guess. Say which key the image actually uses. */
-    bad_plist("newer _PrelinkExecutableLoadAddr spelling",
+    /* Both spellings of the load address in one kext, disagreeing: which one
+     * is right cannot be known, so neither wins by key order. */
+    bad_plist("_PrelinkExecutable and _PrelinkExecutableLoadAddr disagree",
         "<array><dict>"
           "<key>CFBundleIdentifier</key><string>com.example.new</string>"
-          "<key>_PrelinkExecutableLoadAddr</key><integer size=\"64\">0xc0100000</integer>"
+          "<key>_PrelinkExecutable</key><integer size=\"64\">0xc0100000</integer>"
+          "<key>_PrelinkExecutableLoadAddr</key><integer size=\"64\">0xc0110000</integer>"
           "<key>_PrelinkExecutableSize</key><integer size=\"64\">0x1000</integer>"
         "</dict></array>",
-        "_PrelinkExecutableLoadAddr");
+        "disagree");
 
     bad_plist("IDREF with no ID",
         "<array><dict>"
@@ -475,6 +498,7 @@ static void test_real_kernelcache(void) {
 int main(void) {
     printf("S5LBox symbol/kext resolver tests\n");
     test_good_cache();
+    test_newer_load_address_key();
     test_no_prelink_still_names_kernel();
     test_stripped_kernel();
     test_malformed_plists();

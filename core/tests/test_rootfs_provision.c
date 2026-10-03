@@ -4588,6 +4588,193 @@ static int sc_thread_name_is(const tr_record_t *thread, const char *name) {
     return 1;
 }
 
+/*
+ * The read-only API against the scale image, whose directories span split
+ * leaves: every provisioned directory lists exactly its children, in binary
+ * name order, with the kind and size that were provisioned; every file reads
+ * back byte for byte; truncated listings and reads keep the true totals; and
+ * the wrong kind of object, or a missing one, is NOT_FOUND.
+ */
+#define RD_LIST_CAP 64u
+
+static const rootfs_work_dirent_t *rd_find(const rootfs_work_dirent_t *list,
+                                           size_t count, const char *name) {
+    size_t index;
+
+    for (index = 0; index < count; index++)
+        if (strcmp(list[index].name, name) == 0)
+            return &list[index];
+    return NULL;
+}
+
+static void readonly_scale_checks(const run_t *run,
+                                  const rootfs_work_entry_t *entries,
+                                  size_t count, const char *const *leaf,
+                                  const int *parent_of,
+                                  const uint32_t *valence) {
+    rootfs_work_dirent_t *list =
+        (rootfs_work_dirent_t *)calloc(RD_LIST_CAP, sizeof(*list));
+    rootfs_work_result_t result;
+    rootfs_work_status_t status;
+    uint8_t buffer[SC_BODY];
+    size_t index;
+    size_t listed = 0;
+    size_t read_back = 0;
+    size_t n = 0;
+    size_t total = 0;
+    size_t length = 0;
+    uint64_t size = 0;
+    const char *bodied_file = NULL;
+    size_t bodied_size = 0;
+    const char *group_dir = NULL;
+
+    if (!list) {
+        CHECK(0, "read-only listing buffer allocation failed");
+        return;
+    }
+    for (index = 0; index < count; index++) {
+        const rootfs_work_entry_t *entry = &entries[index];
+
+        if (entry->kind == ROOTFS_WORK_ENTRY_DIRECTORY) {
+            size_t child;
+            size_t expected = 0;
+            size_t k;
+
+            status = rootfs_work_list_directory(run->destination, entry->path,
+                                                list, RD_LIST_CAP, &n, &total,
+                                                &result);
+            CHECK(status == ROOTFS_WORK_OK && n == total &&
+                  total == valence[index],
+                  "list %s: %s (%s), %zu of %zu, valence %u", entry->path,
+                  rootfs_work_status_name(status), result.detail, n, total,
+                  valence[index]);
+            if (status != ROOTFS_WORK_OK)
+                continue;
+            for (k = 1; k < n; k++)
+                CHECK(strcmp(list[k - 1u].name, list[k].name) < 0,
+                      "list %s: %s before %s is not binary order",
+                      entry->path, list[k - 1u].name, list[k].name);
+            for (child = 0; child < count; child++) {
+                const rootfs_work_dirent_t *found;
+
+                if (parent_of[child] != (int)index)
+                    continue;
+                expected++;
+                found = rd_find(list, n, leaf[child]);
+                if (!found) {
+                    CHECK(0, "list %s: %s is missing", entry->path,
+                          leaf[child]);
+                    continue;
+                }
+                if (entries[child].kind == ROOTFS_WORK_ENTRY_DIRECTORY)
+                    CHECK(found->kind == ROOTFS_WORK_NODE_DIRECTORY &&
+                          found->size == valence[child],
+                          "list %s: %s kind %d size %llu", entry->path,
+                          leaf[child], (int)found->kind,
+                          (unsigned long long)found->size);
+                else
+                    CHECK(found->kind == (entries[child].kind ==
+                                                  ROOTFS_WORK_ENTRY_FILE
+                                              ? ROOTFS_WORK_NODE_FILE
+                                              : ROOTFS_WORK_NODE_SYMLINK) &&
+                              found->size == entries[child].content_size,
+                          "list %s: %s kind %d size %llu, expected %zu",
+                          entry->path, leaf[child], (int)found->kind,
+                          (unsigned long long)found->size,
+                          entries[child].content_size);
+            }
+            CHECK(expected == total, "list %s: %zu listed, %zu provisioned",
+                  entry->path, total, expected);
+            if (!group_dir && total > 5u)
+                group_dir = entry->path;
+            listed++;
+        } else if (entry->kind == ROOTFS_WORK_ENTRY_FILE) {
+            status = rootfs_work_read_file(run->destination, entry->path,
+                                           buffer, sizeof(buffer), &length,
+                                           &size, &result);
+            CHECK(status == ROOTFS_WORK_OK &&
+                  size == entry->content_size &&
+                  length == entry->content_size &&
+                  (length == 0u ||
+                   memcmp(buffer, entry->content, length) == 0),
+                  "read %s: %s (%s), %zu of %llu bytes", entry->path,
+                  rootfs_work_status_name(status), result.detail, length,
+                  (unsigned long long)size);
+            if (status == ROOTFS_WORK_OK)
+                read_back++;
+            if (!bodied_file && entry->content_size > 3u) {
+                bodied_file = entry->path;
+                bodied_size = entry->content_size;
+            }
+        }
+    }
+    CHECK(listed > 50u && read_back > 500u,
+          "read-only coverage: %zu directories, %zu files", listed, read_back);
+
+    status = rootfs_work_list_directory(run->destination, "/", list,
+                                        RD_LIST_CAP, &n, &total, &result);
+    CHECK(status == ROOTFS_WORK_OK && rd_find(list, n, "payload") &&
+              rd_find(list, n, "payload")->kind == ROOTFS_WORK_NODE_DIRECTORY,
+          "list /: %s (%s), payload %s", rootfs_work_status_name(status),
+          result.detail, rd_find(list, n, "payload") ? "found" : "missing");
+
+    if (group_dir) {
+        rootfs_work_dirent_t first[5];
+        rootfs_work_dirent_t *full = list;
+        size_t full_n = 0;
+        size_t full_total = 0;
+
+        (void)rootfs_work_list_directory(run->destination, group_dir, full,
+                                         RD_LIST_CAP, &full_n, &full_total,
+                                         &result);
+        status = rootfs_work_list_directory(run->destination, group_dir,
+                                            first, 5u, &n, &total, &result);
+        CHECK(status == ROOTFS_WORK_OK && n == 5u && total == full_total &&
+                  full_n == full_total && total > 5u &&
+                  strcmp(first[0].name, full[0].name) == 0 &&
+                  strcmp(first[4].name, full[4].name) == 0,
+              "a truncated listing keeps the first names and the true total "
+              "(%zu of %zu, full %zu)", n, total, full_total);
+        status = rootfs_work_read_file(run->destination, group_dir, buffer,
+                                       sizeof(buffer), &length, &size,
+                                       &result);
+        CHECK(status == ROOTFS_WORK_NOT_FOUND && length == 0u && size == 0u,
+              "reading a directory is %s", rootfs_work_status_name(status));
+    }
+    if (bodied_file) {
+        status = rootfs_work_read_file(run->destination, bodied_file, buffer,
+                                       3u, &length, &size, &result);
+        CHECK(status == ROOTFS_WORK_OK && length == 3u && size == bodied_size,
+              "a short read stores 3 bytes and reports %zu (got %zu of %llu)",
+              bodied_size, length, (unsigned long long)size);
+        status = rootfs_work_list_directory(run->destination, bodied_file,
+                                            list, RD_LIST_CAP, &n, &total,
+                                            &result);
+        CHECK(status == ROOTFS_WORK_NOT_FOUND && n == 0u && total == 0u,
+              "listing a file is %s", rootfs_work_status_name(status));
+    }
+    status = rootfs_work_read_file(run->destination, "/payload/absent.txt",
+                                   buffer, sizeof(buffer), &length, &size,
+                                   &result);
+    CHECK(status == ROOTFS_WORK_NOT_FOUND,
+          "a missing file is %s", rootfs_work_status_name(status));
+    status = rootfs_work_list_directory(run->destination, "/no/such/dir", list,
+                                        RD_LIST_CAP, &n, &total, &result);
+    CHECK(status == ROOTFS_WORK_NOT_FOUND,
+          "a missing directory is %s", rootfs_work_status_name(status));
+    status = rootfs_work_read_file(run->destination, "/payload/g00/l000",
+                                   buffer, sizeof(buffer), &length, &size,
+                                   &result);
+    CHECK(status == ROOTFS_WORK_NOT_FOUND,
+          "reading a symlink is %s", rootfs_work_status_name(status));
+    status = rootfs_work_list_directory(run->destination, "payload", list,
+                                        RD_LIST_CAP, &n, &total, &result);
+    CHECK(status != ROOTFS_WORK_OK, "a relative path is refused");
+    printf("  read-only: %zu directories listed, %zu files read back\n",
+           listed, read_back);
+    free(list);
+}
+
 static void test_scale_payload_forces_real_splits(void) {
     static const char *const TARGETS[] = {
         "../../usr/lib/libcydia.dylib", "private/etc/", "bash",
@@ -5047,6 +5234,7 @@ static void test_scale_payload_forces_real_splits(void) {
             CHECK(0, "the published scale image could not be opened");
         }
     }
+    readonly_scale_checks(&run, entries, count, leaf, parent_of, valence);
     run_release(&run);
 
 done:
@@ -5069,7 +5257,7 @@ static void test_status_and_stage_names(void) {
         ROOTFS_WORK_PROVISION_SPLIT_UNSUPPORTED,
         ROOTFS_WORK_PROVISION_BTREE_FULL,
         ROOTFS_WORK_PROVISION_NO_SPACE, ROOTFS_WORK_PROVISION_LIMIT,
-        ROOTFS_WORK_FILE_REPAIR_MISMATCH
+        ROOTFS_WORK_FILE_REPAIR_MISMATCH, ROOTFS_WORK_NOT_FOUND
     };
     size_t index;
 

@@ -3,6 +3,8 @@
 #include "VMFirmwareFixtures.h"
 #include "VMFirmwareTest.h"
 
+#include <stdlib.h>
+
 static const char plist[] =
     "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>"
     "<key>CFBundleIdentifier</key><string>org.example.Tiny</string>"
@@ -106,6 +108,30 @@ int main(void) {
         /* The plan owns bytes; archive lifetime cannot change the candidate. */
         memset(archive, 0, size);
         VMFW_T_EQ_MEM(&t, entries[2].content, executable, sizeof executable, "archive-independent content");
+
+        const uint8_t *found = NULL;
+        size_t found_size = 0u;
+        VMFW_T_CHECK(&t, vm_user_app_plan_file(plan, "EN.LPROJ/Note.TXT", &found, &found_size) &&
+                     found_size == 3u && found[2] == 3u, "file lookup ignores ASCII case");
+        VMFW_T_CHECK(&t, !vm_user_app_plan_file(plan, "en.lproj", &found, &found_size),
+                     "a directory is not a file");
+        VMFW_T_CHECK(&t, !vm_user_app_plan_file(plan, "missing.png", &found, &found_size),
+                     "a missing file is reported");
+        const uint64_t before_bytes = vm_user_app_plan_content_bytes(plan);
+        uint8_t *icon = malloc(10u);
+        memset(icon, 0x5a, 10u);
+        VMFW_T_CHECK(&t, vm_user_app_plan_replace_file(plan, "en.lproj/note.txt", icon, 10u),
+                     "replace a file");
+        uint8_t after[32];
+        VMFW_T_CHECK(&t, vm_user_app_plan_digest(plan, after) && memcmp(after, digest, 32u) != 0,
+                     "the digest follows the new bytes");
+        VMFW_T_EQ_U(&t, vm_user_app_plan_content_bytes(plan), before_bytes + 7u, "size follows");
+        VMFW_T_CHECK(&t, vm_user_app_plan_file(plan, "en.lproj/note.txt", &found, &found_size) &&
+                     found == icon && found_size == 10u, "the plan now owns the new bytes");
+        uint8_t *unused = malloc(4u);
+        VMFW_T_CHECK(&t, !vm_user_app_plan_replace_file(plan, "missing.png", unused, 4u),
+                     "replacing a missing file is refused");
+        free(unused);
     }
     vm_user_app_plan_close(&plan);
     VMFW_T_CHECK(&t, plan == NULL, "close clears pointer");

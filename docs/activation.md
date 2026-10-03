@@ -224,6 +224,31 @@ knobs and only need one to land:
    `0` to `1` at file offset `0x205aac` — a one-word patch, the same class of edit
    `tools/bootkernel.c` already performs on the device tree.
 
+### A.3.1 2026-09-24: the page-fault kill now bites, and knob 3 is applied
+
+The first real third-party app (a user's IPA, device report on build
+`6cf0ed2`) appeared on the home screen but went black and back to
+SpringBoard when opened. The "likely" reading above covers only a binary with
+no code-directory blob; an app whose signature is present but no longer
+matches its code (the usual state of a decrypted App Store app) has a blob,
+so its pages are validated, fail, and with the global at 0 the process is
+killed at its first text page even though AMFI permitted the exec. Not yet
+confirmed from that device's console (the next report carries the guest
+console tail), but it matches the symptom and nothing else in this chain
+would.
+
+So knob 3 is now applied, and only for a machine that already boots with the
+relaxed policy (an installed app or payload): `ios3_kernel_patch_apply` has
+an optional sixth site, `_cs_enforcement_disable` at VA `0xc020daac` (file
+offset `0x205aac`), 4 bytes `00 00 00 00` -> `01 00 00 00`, validated and
+written in the same all-or-nothing transaction as the five compatibility
+patches, after the same exact-build SHA-256 gate
+(`ios3_kernel_patch_request_t::disable_codesign_page_kill`, selected by
+`ios3_bringup_gate_configure` from `guest_codesign_disabled`). Tests:
+`test_ios3_kernel_patch` (named site mismatch with nothing written; no patch
+site without the flag; with the private kernel, the word is 0 by default and
+1 when asked for).
+
 ## A.4 Answers to the three questions
 
 1. **Do the boot-args / `debug-enabled` disable signing for *userspace* (not just

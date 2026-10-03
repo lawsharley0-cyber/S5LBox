@@ -1,10 +1,16 @@
 <div align="center">
 
-# S5LBox
+# NEON
 
 ### Project goal: boot **real iPhone OS 3** — Apple's actual kernel, `launchd`, and SpringBoard — inside an app on a modern iPhone. **No jailbreak required** — see *Requirements*.
 
 *A from-scratch emulator of the 2007 iPhone's chip, written in portable C.*
+
+*Formerly **S5LBox**. Renamed NEON on 2026-09-25 as the project grows an ARMv7
+Cortex-A8 CPU towards iOS 6 on the iPhone 3GS; see
+[`docs/IOS6_READINESS.md`](docs/IOS6_READINESS.md). Older docs and internal
+names still say S5LBox, and the bundle ID is unchanged, so an install updates
+the app already on a phone.*
 
 [![core-tests](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/core-tests.yml/badge.svg)](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/core-tests.yml)
 [![ios-build](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/ios-build.yml/badge.svg)](https://github.com/j0shua-SYSON/S5LBox/actions/workflows/ios-build.yml)
@@ -16,7 +22,7 @@
 
 ---
 
-S5LBox does not reimplement iPhone OS or fake its apps. It emulates the
+NEON does not reimplement iPhone OS or fake its apps. It emulates the
 **hardware** of the original iPhone — the Samsung **S5L8900** chip and its ARMv6
 processor — in software, then runs Apple's own unmodified operating system on
 top of that model. You supply the firmware; none is included here. To the
@@ -91,9 +97,12 @@ are deterministic apart from that one contact, so the tap is what dismissed it.
   simultaneous contacts do traverse the device, the driver and the normaliser.
   What has *not* been shown is an app responding to one, because a pinch on the
   home screen has nothing to zoom.
-- **No sound has been produced.** Apple's audio drivers start
-  (`AppleWM8991Audio::start`, both I²S controllers) and **zero** words have ever
-  reached the transmit FIFO.
+- **System sounds play; ringtones do not.** Since the I²S frame clock was
+  modelled, PCM DMA runs on the device, and with the guest's Ring/Silent
+  switch moved once (controls menu: Silent, then Ring) the user hears keyboard
+  clicks, lock sounds and the rest, with some lag (build 2ecac70). Ringtones
+  are AAC and need the hardware decoder (AMC), which is not modelled
+  (`docs/audio.md`).
 - **No packet has been carried.** The PPP link comes up — `IPCP Opened`,
   `10.0.2.15` — and every NAT counter is still zero.
 - **30 fps is not established.** User-reported foreground navigation can still
@@ -134,7 +143,7 @@ userspace received the framebuffer read-only and faulted on its first store.*
 | **Hardware modelled** | Serial ports, timers, both interrupt controllers, the GPIO controller, display controller, SPI, the multitouch controller, the power-management chip and its I2C bus, the USB controller's configuration registers, and an experimental MBX reset/ring/2D/3D path. The MBX path is substantial but not yet the accepted default. |
 | **Touch: works, one finger** | The Z2 is modelled on SPI and **bootloaded exactly as the real part is** — it has no flash, so its 54,156-byte firmware is downloaded on every boot over Apple's HBPP protocol, which had to be reverse-engineered before anything could work. Apple's driver confirms it in its own words: *"downloaded 54156 bytes of firmware data ("0x0049.bin") in 106ms"*. The part then leaves the bootloader, answers interrogation, and streams touch reports. A host gesture reaches SpringBoard and **completes a slide-to-unlock**. Measured through the whole stack: surface bounds `-75..4656` and `-75..7275` read out of the running guest and matching the model exactly, reports paced at 16.000 ms (62.5 Hz), and the knob tracking the contact linearly. A controlled tap dismisses Apple's first-run dialog. Two simultaneous contacts also reach userspace — a pinch's 26 two-contact frames entered Apple's per-contact normaliser exactly 52 times — but no two-finger gesture has yet produced a visible response. |
 | **Not modelled as usable devices** | No cellular radio, Wi-Fi, Bluetooth, camera or accelerometer. MBX is no longer correctly described as absent from the codebase: its experimental model completes the current measured command families, but the default machine still hides it pending final acceptance. |
-| **Audio: modelled, never heard** | The WM8991 codec, both I²S controllers and the PL080 DMA engine are modelled and unit-tested, and Apple's `AppleWM8991Audio` starts against them. That is the whole of it: **zero** words have ever reached the transmit FIFO and the DMA has never been enabled, because nothing asks a locked phone to play anything. There is also no host playback path, so even a guest that produced samples would not reach a speaker yet. |
+| **Audio: system sounds play** | The WM8991 codec, both I²S controllers (with a frame clock) and the PL080 DMA engine are modelled, and the app plays what reaches I2S0. On the device, system sounds play once the guest's Ring/Silent switch has been moved (controls menu). Ringtones (AAC) do not: the hardware decoder (AMC) is not modelled. |
 | **Networking: a temporary substitution** | The desktop harness now terminates the guest's own stock `pppd` over emulated uart4: LCP and IPCP reach `Opened`, and the guest receives `10.0.2.15`. That is a real advance over the earlier one-way Configure-Request, but **no guest IP packet has crossed the link** and every NAT traffic counter remains zero. The iOS app does not wire the host PPP/NAT endpoint at all. A real iPhone 3G used Wi-Fi or its cellular baseband, so PPP-over-uart4 remains an explicit temporary substitute rather than a claim of radio emulation. |
 | **Hidden from the guest by default** | SHA-1 acceleration, cellular/baseband transport and USB are deliberately declared absent by editing only the in-memory device tree, because their rows name measured boot failures. MBX is also hidden in the accepted default, but is now an opt-in experiment rather than an unmodelled register hole. The firmware files on disk are never modified. |
 | **Invented register values** | The USB controller's three configuration registers (`GHWCFG1`/`GHWCFG2`/`GHWCFG4`) hold a legal and sufficient configuration. They are **not** measured from real S5L8900 silicon. This is one of the two exceptions the networking row above draws its line around: three constants, named here so nobody has to discover them, and replaceable the day somebody reads the real part. |
@@ -275,6 +284,26 @@ slower on average; it therefore stays off. Full synthetic, physical and
 rejected-engine measurements remain in
 [`docs/hotpath.md`](docs/hotpath.md); they are evidence, not FPS multipliers.
 
+A portable **cached interpreter** (`core/src/arm/arm_ci*.c`) is the app's
+default CPU backend (Settings → Diagnostics → CPU Execution Backend offers
+Standard for comparison) and an opt-in backend on every other host
+(`bootkernel --cpu-backend cached`).
+It predecodes guest code into blocks of specialised handlers, runs anything
+uncommon through the reference interpreter's own code, keeps device time
+exact, and generates no host code. On compiled ARMv6 workloads it measured
+2.56× the reference on a desktop x86-64 host, 2.50× with MSVC and 2.94× on
+Apple Silicon CI runners, with identical final machine state on every run; a
+differential fuzzer and the workload suite check it on every push. On an
+iPhone 17 Pro Max (build bc45a3f, CPU graphics, one full boot each) it ran
+208.6 M guest instructions per busy second against Standard's 114.7 M. Two
+boots on it, one per graphics mode, were still running when their reports
+were taken (6.0 and 6.2 G instructions in, no CPU stop). A
+bit-for-bit comparison with the reference over a full boot has not been run,
+so the desktop tools keep the reference interpreter as their default. Details:
+[`docs/BENCHMARK_RESULTS.md`](docs/BENCHMARK_RESULTS.md),
+[`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md),
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+
 ## Build & run
 
 Building the app needs no local Apple SDK or toolchain — CI does the
@@ -359,7 +388,7 @@ so historical 768 MiB experiments are not valid recipes.
 [`docs/debugging.md`](docs/debugging.md) is the procedure these add up to.
 
 **Get the app:** on a matching push or manual dispatch, the `ios-build` workflow
-produces an ad-hoc-signed `S5LBox.ipa` as a temporary GitHub Actions artifact.
+produces an ad-hoc-signed `NEON.ipa` as a temporary GitHub Actions artifact.
 CI has no Apple signing identity, so that artifact **will not install on stock
 iOS as-is**. Re-sign it with your own ordinary provisioning profile using your
 preferred stock-device installation method. The app requests no private, JIT,
@@ -410,7 +439,7 @@ value cannot. Results from such a hybrid do not test the newly selected mode.
 
 ## Legal
 
-S5LBox is an independently written emulator under the MIT license. It ships
+NEON is an independently written emulator under the MIT license. It ships
 **no Apple firmware images or decryption keys.** You supply firmware you are
 entitled to use. "iPhone", "iOS", and "iPhone OS" are trademarks of Apple Inc.;
 this project is not affiliated with or endorsed by Apple.

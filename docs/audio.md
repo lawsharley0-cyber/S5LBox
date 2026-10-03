@@ -386,3 +386,451 @@ device itself.
 3. The "Force Interpreter" toggle (Developer Mode → machine menu) now ships
    in the app and is generally useful for any future "is this an emulator
    bug or a translation bug" question, not just this one.
+
+# 2026-09-23 Device-side evidence for the BSU loop, without a disassembler
+
+The trace above stopped at "the device the `+0x400` register actually belongs
+to is still unidentified". The machine now keeps, always on, the most recent
+distinct accesses to hardware it does not model (unmapped addresses and
+storage-only stubs), each with the guest pc, the value, and a repeat count
+(`s5l8900_t::unmodelled`, `s5l_unmodelled_describe()`). A driver spinning on
+a register it is waiting for shows up as a few lines with large counts.
+
+To capture it on the device: boot, reproduce the freeze (it also fires on its
+own after `launchd[N] Builtin profile: MobileMail (seatbelt)`; Settings >
+Sounds makes it visible), wait for the console's `[stall]` line, which now
+prints the most recent unmodelled accesses, then open Performance & Sound
+Details and Copy Report. The pcs resolve to kernel symbols with
+`machoinfo <kernel> -r <pc>`; the address and region name say which window
+(`sram/amc`, a stub such as `clkrstgen`, or plain unmapped) the driver is
+polling, and the value says what it keeps reading. That is the input a
+register model needs; nothing is changed in the guest by collecting it.
+
+## First device report (iPhone18,2, iOS 27.2, build 3a9ddef, 2026-09-23)
+
+The run was on the forced interpreter (`(interpreter control)`), 6,627.6 M
+instructions in, guest time 0.41x wall time; I2S0 received 0 words. The
+twelve most recent unmodelled accesses were:
+
+| pc | access | count | region |
+|---|---|---:|---|
+| c05a7e54 | R 3c500024 -> fffffffa | 19,461 | stub clkrstgen |
+| c05a7e60 | W 3c500024 <- fffffffb | 19,479 | stub clkrstgen |
+| c05a7e78 | W 38100008 <- 00001000 | 19,461 | stub miu |
+| c05a7e78 | W 38100404 <- 00000000 | 19,461 | stub miu |
+| c05a7e60 | W 3c50004c <- 0001edcf | 1,003 | stub clkrstgen |
+| c05a7e60 | W 3c500048 <- 6fcff3ff | 22 | stub clkrstgen |
+| c06f5526 | R 38d00018 -> 00000000 | 10,001 | unmapped arm-io |
+| c06f54e8, c06f54ac, c06f54a6, c06f460c, c06f4604 | 38d00010 R; 38d00008 <- 00040045, 38d0000c <- 0, 38d00034 <- 2, 38d0003c <- 3 | 1 each | unmapped arm-io |
+
+What this shows, and what it does not:
+
+- **Observed:** one ARM routine (c05a7e54-c05a7e78) read-modify-writes
+  clkrstgen `+0x24`, toggling bit 0 (the stub stores writes, and the last
+  read returned the bit clear while the last write set it), and on each pass
+  writes the MIU's `+0x008` (0x1000) and `+0x404` (0) — the two MIU offsets
+  already recorded as the clock controller's second range. About 19,500
+  passes over the run. The `+0x404 <- 0` write is the "writes 0 to offset
+  +0x400-ish" of the earlier trace; nothing ever reads it back.
+- **Observed:** a Thumb routine (c06f4604-c06f5526) programs an unmapped
+  block at 0x38d00000 (+0x3c, +0x34, +0x0c, +0x08 = 0x00040045), reads
+  +0x10 once, then polls +0x18 exactly 10,001 times (reads 0) and gives up:
+  a bounded poll timing out. `BOOTLOG.md` records
+  `AppleS5L8900XSDIO::sendCommand(): Timeout waiting for CMDRDY`; that this
+  block is the SDIO controller is a **hypothesis** until the pcs are
+  resolved to symbols.
+- **Not observed:** any access to the `sram/amc` window (0x22000000) among
+  these entries, and nothing reads back a register that the loop above
+  could be waiting on. The next build therefore also logs the most recent
+  accesses to **modelled** devices (`s5l8900_t::mmio_recent`), because a
+  poll on the power controller or another modelled block would not appear
+  in the unmodelled table at all.
+
+To resolve the pcs with your own kernelcache on a desktop:
+`machoinfo <kernel> -r c05a7e54`, `-r c06f5526`.
+
+## Second device report (build 3f74a82): the BSU lock is AMC +0x400
+
+With every device access logged, the retry loop is fully visible (unmodelled
+table, most recent first; counts are since each entry was last inserted):
+
+- `c05a7e54/60/78`: clkrstgen +0x24 bit 0 toggled and MIU +0x008/+0x404
+  written, x13,174; `c0717714`: **W 0x38502000 <- 3**, x13,174 — the AMC
+  reset, once per retry.
+- `c07174cc/c07174d4` then `c07174fc/c0717504`: **W 0x38500400 <- 1, R
+  0x38500400 -> 0**, x3 and x3,000 — the lock: write 1, read it back,
+  up to 1,000 times per attempt, give up when it stays 0.
+- After it, one pass of set-up: 0x38501000..0x3850101c (a channel: enable,
+  **0x095b5000** — a DRAM address — and 0xfef, i.e. a 4,080-byte buffer),
+  0x38500a00, 0x38500004, 0x38500b04/0b0c, 0x38500204, polls of 0x38500b18
+  (x11) and 0x38500010, and two halfword reads of SRAM 0x22028000.
+
+0x38500000 is `/arm-io/amc` reg[0] (child 0x00500000 in the first arm-io
+window); 0x22000000 is its reg[1], the SRAM. Neither was modelled, so every
+read returned 0 and the lock could never be taken.
+
+Change: both are declared as honest storage (`S5L8900_AMC_BASE`, 0x3000
+bytes, the span the driver touched; `S5L8900_SRAM_BASE`, 0x2c000). Reads
+return what the guest wrote, so the lock read-back sees the 1 it wrote. That
+is storage, not a fabricated status. What it does NOT do: move audio. The
+channel at +0x1000 names a DRAM buffer and a length, which looks like the
+AMC fetching samples itself rather than the PL080 feeding I2S0; if the next
+report shows the driver waiting on +0x0b18/+0x0010 for progress, that is a
+real DMA model to build (AMC -> audio sink), with its registers read from
+the driver's own accesses.
+
+## Third device report (build 9382179) and the driver's own register protocol
+
+The BSU lock now succeeds (`+0x400` reads back the 1 written), and the next
+failure is `AppleEmbeddedAudioDevice: could not start DMA: operation was
+aborted`. The user copied the kernel code around every pc that touched the
+AMC (opt-in "Copy Audio Driver Code", VA 0xc07170c0, 0x12b0 bytes, SHA-256
+f74fa5bc...95f9; disassembled here, not stored in the repository). What it
+establishes, as register semantics read from the driver (inference is marked):
+
+| Offset | Access | Driver use |
+|---|---|---|
+| +0x000, +0x004, +0x008, +0x00c | W 1 | separate "go" strobes (small leaf setters) |
+| +0x010 | R | compared with 1; when equal the driver writes +0x00c = 1 and then waits for +0xb18 bit 8 (up to 10 x 1 ms) |
+| +0x100 | W | mailbox 0 push (used to restore saved entries) |
+| +0x180/+0x184/+0x188 + 16n | W 1 / RW / R | per-mailbox control, data, pending count |
+| +0x204 | W 1 | enable |
+| +0x340 | W 0/1 | written 0 before the SRAM is cleared and 1 after a copy loop that precedes the excerpt: INFERRED "run" of something that executes from the SRAM |
+| +0x400 | W 1 / W 0, R | the BSU lock: write 1 and read back until non-zero (10 ms), write 0 to release |
+| +0x404 | R | status returned by every locked save/restore |
+| +0x410..+0x428 | RW | seven words saved and restored around a reset, with the mailbox 0 contents (+0x47c read while +0x188 > 0) |
+| +0xa00 + 4n | W | per-channel enable |
+| +0xb04, +0xb0c, +0xb10 | W | configuration (0x2000; 0x400 or 0x2000; 0x400 or 0x7fff) |
+| +0xb18 | R | status: bit 8 awaited after start, bit 9 awaited by a second routine (10 x 1 ms each); the storage stub returns 0, which matches the 44 polls in the report |
+| +0xb1c | R | status |
+| +0xd00 / +0xd04 | R / W 0,1 | |
+| +0xf00, +0xf04 | W | the same value to both |
+| +0x1000 | W | channel enable |
+| +0x1004 / +0x1008 | W | DRAM start address / length in words |
+| +0x100c | W | start (1) / stop (0) |
+| +0x1010 | R | current read pointer: the driver computes words remaining as length - (current - start) / 4 |
+| +0x1014 | W 1 | abort (with +0xa00 = 0 and +0x1000 = 0) |
+| +0x1018 | W 0/1 | INFERRED interrupt enable |
+| +0x101c | R bit 0 / W 1 | done status, write 1 to acknowledge |
+| +0x2000 | W | n - 1 (a divider) |
+| SRAM +0x5000, +0x14000, +0x1c000..+0x28000, +0x28000 | | cleared at init; two 24 KiB sample buffers at +0x1c000 and +0x22000 (0x6000 apart); a halfword read at +0x28000 |
+
+If the SRAM does hold code that the block executes (the +0x340 reading),
+then status bits 8/9 and the mailbox replies come from that code, and a
+correct model has to reproduce its protocol rather than set bits. The calling
+logic sits before this excerpt, so the excerpt window was widened to 16 KiB
+before the first accessing pc (and 8 KiB after the last) to capture it.
+Nothing is modelled from this yet.
+
+# 2026-09-24 The whole AMC kext (build 6ec47e8) and what it adds
+
+The Full Test Report carried AppleAMC_r1 from its Mach-O header at
+0xc0712000 through 0xc0758000 (SHA-256 df16fc63...1a31; read in a scratch
+directory, not stored here). Its own load commands put `__text` at
+0xc0713000 (0xa338 bytes, ARM), `__const` at 0xc071d338 (0x4e3e4 bytes),
+`__cstring` at 0xc076b71c (0xadbe bytes) and `__DATA` at 0xc0777000. The
+copy stopped short of `__cstring` and `__DATA`, and the dump window is now
+wide enough to include both next time.
+
+**Observed:**
+
+- The low-level layer is a small C HAL over one global at 0xc07770a0:
+  word 0 is the mapped SRAM, word 1 is the mapped register block. Every
+  register access in the earlier tables goes through it. It holds:
+  - one-word setters for the strobes (+0x0, +0x4, +0x8, +0xc) and for +0xd04;
+  - `+0x2000 = n - 1`;
+  - two DMA starts: ack +0x101c, stop +0x100c, enable +0x1000, then address
+    +0x1004 and length +0x1008. One of them also sets +0xa00 = 1 before
+    +0x100c = 1;
+  - a progress read: +0x1010, returned with `len - (cur - start) / 4`;
+  - a wait routine at 0xc071768c. If +0x10 reads 1 it writes +0xc = 1. It
+    then polls +0xb18 bit 8, with IOSleep(1) between polls, 10 times.
+- The SRAM clear before any use: +0x5000, +0x14000..+0x1c000 and
+  +0x1c000..+0x28000 are zeroed with +0x340 = 0 in between. Then +0x28000
+  and the 16 KiB after it are zeroed.
+- The report's access order is:
+  1. `+0x2000 = 3`;
+  2. a streaming channel on DRAM 0x095b5000, 0xfb1 words, started with
+     +0xa00 = 1;
+  3. `+0x4 = 1`;
+  4. two halfword reads of SRAM +0x28000, which return 0;
+  5. configuration writes (+0xb0c, +0x204, +0xb04);
+  6. the BSU lock, three times;
+  7. the channel torn down four times;
+  8. 44 polls of +0xb18, i.e. four waits of 11 reads, all timing out.
+  The assertions (lines 350, 565, 726, 2097) print in that window.
+- `__const` begins with a table of (pointer, word count) pairs: eight
+  blocks of 0x4ea or 0x4eb 32-bit words, about 5 KiB each, followed by
+  one-word entries. The blocks are not ARM or Thumb code (under 2% of
+  words carry ARM's always-condition, against 75-83% in `__text`).
+  Byte-reversed four-character codes in `__text` read `paac`, `.mp3`,
+  `alac`, `aach`, `lpcm`.
+
+**Inferred, to be checked against `__cstring` in the next report:**
+
+- The eight blocks are microcode for the AMC's own processor, one per
+  codec or mode, and the block decodes compressed audio (MP3/AAC/ALAC) in
+  hardware as well as playing PCM.
+- The driver starts that processor and waits for it to answer. The answer
+  is a halfword in SRAM at +0x28000 or status bit 8/9 in +0xb18, and
+  nothing in this VM ever sets either. That would explain every
+  assertion, and it means the fix is a model of what the firmware
+  reports, not more storage.
+
+A faithful model would have to run that microcode, and its instruction set
+is not documented. The practical model is behavioural: acknowledge what
+the driver starts (status bits, the SRAM reply), and play the PCM that the
+streaming channel reads from DRAM at the rate +0x1010 must advance. The
+next report's `__cstring` names each assertion. That maps the four lines
+to the checks that fail, and so to the exact replies the model owes.
+
+# 2026-09-24 The assertions, named (build bc45a3f)
+
+The bc45a3f report carried the whole of AppleAMC_r1 (va 0xc0712000, 0x66000
+bytes, SHA-256 d3611f38...626f; read in a scratch directory, not stored
+here), `__cstring` and `__DATA` included. Each assertion is a preformatted
+string passed to `IOLog`, so a string's address leads straight to its call
+site.
+
+**Observed:**
+
+- **The four assertions are one failure.** Line 350 is in the reset routine
+  at 0xc0715748. That routine calls the device-tree platform functions
+  `function-core_reset` and `function-de_reset` (looked up by name during
+  start, at 0xc0716428) with argument 1, then the wait at 0xc071768c. Line
+  349 would mean the `de_reset` call failed; it never printed. Line 350 means
+  all ten polls of +0xb18 bit 8 read 0. The other three are callers giving
+  up:
+  - line 565 is in the codec start at 0xc0715a48 (vtable +0x3f8);
+  - line 2097 is in the locked reset at 0xc0715804 (vtable +0x478, whose BSU
+    error reads "AMC reset [non-fatal error]");
+  - line 726 is in 0xc07135fc (vtable +0x3fc), which fails when +0x3f8 does.
+- **What the block is.** The strings name the driver classes
+  (`AppleAMCDriver_r1`, `AppleAMCDriverManager`) and the codecs they load:
+  `Espico_mp3`, `Espico_aac`, `Spirit_aache`, `Spirit_aace`, `ARM_alac`,
+  `ARM_acelp`, and `::Encoder`. They also name:
+  - the properties it publishes: `input format`, `output formats`,
+    `encoder bitrate`;
+  - the DSP memory regions it loads code into: `pmem`, `sys_pmem`,
+    `ram_mc1`, `ram_mc2` and `AMCSS`;
+  - a dependency on `com_apple_driver_FairPlayIOKit`;
+  - its own description of what it runs: "starting the transformer without
+    an input magic cookie".
+
+  The AMC is a codec offload engine for MP3, AAC, HE-AAC and ALAC. It is not
+  the PCM output path.
+- **After a successful reset**, the codec start goes on to:
+  1. reset the mailboxes and the channel;
+  2. write +0x204 = 1, a mailbox word, and +0xb0c = 0x2000;
+  3. set +0x1018 = 1;
+  4. wait for +0xb18 **bit 9** (0xc0717b94, 10 polls 1 ms apart).
+- **Nothing links it to PCM playback.** `__text` contains no call into
+  AppleEmbeddedAudio. The report's "calls" into AppleEmbeddedAudio,
+  AppleEmbeddedUSBAudio and AppleWM8991Audio are words in `__const` (the
+  microcode tables) that happen to decode as Thumb `BL`.
+
+**Not observed:** what `function-core_reset` and `function-de_reset` do in
+hardware. The platform function lives in another kext.
+
+**Inferred:** +0xb18 bit 8 says the DSP core is out of reset, and bit 9 says
+the loaded codec is running. Both are answers from the DSP's own firmware or
+reset logic.
+
+**Decision: these bits are not set.** Setting them without running the codec
+would let the driver start a decoder that never produces a sample. For any
+app that asks for hardware decode, that turns today's fast, logged failure
+into a hang. A working AMC means high-level emulation of the transformer
+protocol (the mailboxes, the channel at +0x1000, the two 24 KiB SRAM buffers)
+with host decoders behind it. That is a project of its own and comes after
+PCM output works.
+
+**The PCM path fails on its own.** The line to diagnose is
+`AppleEmbeddedAudioDevice: could not start DMA: device is not ready`, and I2S0
+has received 0 words. The report now also carries:
+
+- AppleEmbeddedAudio's kext;
+- the kext whose code touches the I2S windows;
+- AppleARMPL080DMAC's kext;
+- every PL080 channel's registers;
+- the I2S windows' storage;
+- a separate access log for the I2S windows.
+
+The AMC kext's bytes are left out when their SHA-256 matches the copy already
+analysed.
+
+## 2026-09-24 Why DMA never started, and the frame clock (build d09d9b8 reports)
+
+In the three d09d9b8 reports, i2s0 received configure()'s seven writes and
+never the `6` that startTransfer() writes to +0x08. The DMA controllers had
+no channel pointed at 0x3ca00010. So startTransfer() returned before it
+started DMA. Its code (AppleS5L8900X, 0xc05a3928) is a wait:
+
+| Step | Address | What it does |
+|---|---|---|
+| 1 | 0xc05a3964 | state (this+0x8c) = 1 |
+| 2 | 0xc05a3980 | enable the nub's interrupt 0 (vtable +0x220) |
+| 3 | 0xc05a3998 | arm a timer from the command's timeout |
+| 4 | 0xc05a39a0 | commandSleep on the state word until it is 3 or 4 |
+| 5 | 0xc05a3a3c | only for state 3: start the DMA channel, then write 6 |
+
+The interrupt handler at 0xc05a3c2c moves state 1 to 2 on the first
+interrupt. On the second it stores 3, disables the interrupt and wakes the
+sleeper. The timer stores 4, which returns `kIOReturnNotReady`
+(0xe00002d8, "device is not ready"). An interrupted sleep returns
+`kIOReturnAborted` (0xe00002eb, "operation was aborted"). Those are the two
+messages every report carried.
+
+Interrupt 0 of the i2s0 nub is GPIO-IC line 0x86 (i2s1: 0xaa), and nothing
+in the emulator drove either line. That was the whole failure.
+
+**Inferred:** the line is the I2S frame (word-select) clock's pin. The
+handler reads no register and no time; it counts two edges and starts DMA.
+That is how DMA is usually lined up with a frame boundary.
+
+**What changed:**
+
+- Each I2S window runs a frame clock once configure() has set +0x00 bit 0.
+  The clock drives its GPIO-IC line: high for the first half of each frame.
+- The clock also drains the TX FIFO, one 4-byte frame per edge. The FIFO's
+  DMA request is asserted only while it has room. Before this, a started
+  channel would have moved its whole list in one refresh.
+- The host sink now gets whole 32-bit frames (left sample in the low half).
+  The `dma-channels` template 0x00249000 means 16-bit DMA stores. The old
+  path would have played each 16-bit store as a stereo frame.
+- The idle fast-forward and the cached interpreter's horizon know the new
+  edges. An unmasked frame-clock line names its next level change. A DMA
+  channel feeding the FIFO names the frame at which its current item ends.
+
+**Not decoded, and stated in soc.h:**
+
+- The rate is a nominal 44.1 kHz, which is what the app's output assumes.
+  +0x04 = 0x01100301 in every report, and nothing says which field is a
+  divider.
+- The FIFO depth is 64 bytes. The driver never reads a FIFO level.
+- 16-bit stereo frames.
+
+The wait's handler cannot observe the rate or the depth. They only set the
+pace of the audio.
+
+Snapshots are v33: the clock phase and the FIFO state are guest state.
+
+**What the next report should show if this worked:**
+
+- i2s0 +0x08 = 6.
+- A dmac channel with dst 0x3ca00010.
+- "frame clock running".
+- A rising frames count and non-zero "frames to host".
+- No "could not start DMA" lines.
+
+If the lines are gone and the sound is still silent, look next at the app's
+"Guest I2S0" line: words received, how many were non-zero, and underruns. The
+app plays whatever reaches I2S0; the codec's own registers do not gate it.
+
+Tests: `core/tests/test_audio_dma.c` (153 checks, including a replay of
+startTransfer()'s two-edge wait and a WFI-sized refresh that must equal
+per-tick refreshes). Three hand mutants were all caught: no pulse on a
+multi-frame refresh, FIFO room ignored, and the DMA wake source removed.
+
+## 2026-09-24 The PCM path runs, and plays silence (build 12b2cba)
+
+The first device report with the frame clock (CPU graphics, Settings >
+Sounds, 76.7 s window):
+
+| Measurement | Value |
+|---|---|
+| "could not start DMA" lines | none |
+| i2s0 frame clock | running, 1,687,315 frames |
+| DMA into 0x3ca00010 (dmac0 ch2, 16-bit stores) | 2,918,160 stores, 5,836,320 bytes, 1,423 items, 90 completions |
+| Frames handed to the app | 1,459,080 |
+| App: words received / non-zero | 1,459,080 / **0** |
+| startTransfer/stop writes to +0x08 | 98 |
+
+So startTransfer() now gets its two edges, DMA runs, and every sample in
+the buffer it reads is zero. The DMA reads guest RAM, so those zeros are
+what the guest put in its output buffer.
+
+Each ringtone tap in the same report logs AppleAMC_r1 assertions (lines 350,
+565, 726, 2097). The AMC kext's own tables are named `aacd_*` and `mp3d_*`:
+it is the hardware AAC/MP3 decoder. Ringtones are AAC. With the DSP
+unmodelled, the hardware decode fails and nothing is mixed into the output
+buffer. The PCM engine keeps running and plays silence.
+
+**Change:** the app now hides `/arm-io/amc` by default (switch "amc", Guest
+hardware). AppleAMC_r1 then never matches, and the guest has no hardware
+decoder to pick.
+
+**Expected, not yet observed:** iPhone OS 3 decodes AAC and MP3 in software
+when no hardware decoder is available, so ringtones should reach the PCM
+path. The next report settles it. If the samples are still all zero with the
+AMC hidden, the zeros come from somewhere else.
+
+bootkernel has the same switch (`--no-amc`) but leaves the AMC matched by
+default, so the ~60 recorded desktop runs keep their meaning.
+
+**Two limits of the underrun counter:**
+
+- The clock keeps running while the audio engine is stopped (stop() writes
+  +0x08 = 0). So "underrun" also counts idle time, and 912,940 bytes is not
+  a measure of gaps during playback.
+- Guest time ran at 0.77x wall time in this report. The app plays at 44.1 kHz
+  of wall time, so it will underrun whenever the guest runs slower than real
+  time. That is a speed limit, not an audio-model one.
+
+## 2026-09-24 The AMC hidden, and still silence (build 27d084d)
+
+With `/arm-io/amc` hidden: no AMC assertions, and AppleAMC_r1 touched nothing.
+DMA ran as before: 2,158,150 16-bit stores, 1,079,075 frames to the app,
+**0 non-zero**. So the AMC was not the only cause, and maybe not the cause
+at all.
+
+In the profile, `mediaserverd` used 2.03% of the window, and no audio code is
+among its functions: no AudioToolbox, no decoder, no mixer. The audio engine
+started and stopped about 41 times (83 writes to +0x08), so something asks
+for output. But the audio server renders nothing into it. The emulator is
+not losing samples; the guest is producing none.
+
+The user checked the volume: the guest's volume display appears, and maximum
+volume changes nothing.
+
+**Open question, being tested next: the Ring/Silent switch.** Silent mode
+mutes keyboard clicks, lock sounds and ringtone previews, which is this
+pattern. The model presents the pin level that AppleM68Buttons reports as
+"not muted". But the driver reports only *changes* (its debounce timer
+compares all five pins with a shadow bitmap). So an unmoved switch has never
+been reported, and what SpringBoard assumes at boot is not known. The
+controls menu now has a latching "Ring/Silent Switch" item: moving it gives
+the guest real events, and SpringBoard's own Ring/Silent display shows how
+it reads them.
+
+The report's PCM section now also lists the WM8991 registers the driver
+wrote, and the switch position set in the app.
+
+## 2026-09-24 System sounds play (build 2ecac70)
+
+**Measured on the device:** after moving the new Ring/Silent switch to Silent
+and back to Ring, the user hears every system sound (keyboard clicks,
+lock/unlock and the rest), "a bit laggy". Ringtones stay silent.
+
+So the whole PCM path works end to end: frame clock, startTransfer()'s two
+edges, paced DMA, 16-bit frames packed for the app, and host playback. The
+silence in the 12b2cba and 27d084d reports was the guest's silent mode.
+
+**The switch at boot.** The model rests the ringer pin low, the level
+AppleM68Buttons reports as "not muted". Moving it gives SpringBoard real
+events, and after that it plays sound. An unmoved switch was never
+reported, and SpringBoard behaved as if silent. Why is not established. It
+may start silent until told otherwise, or it may read the state some way
+this model answers differently. The next report dumps AppleM68Buttons so its
+start-up path can be read. Until then, the fix is the menu step: Silent,
+then Ring.
+
+**Ringtones are AAC.** With `/arm-io/amc` hidden there is no hardware AAC
+decoder, and the ringtone path does not fall back to software. With the AMC
+matched, the hardware decode fails its reset asserts. So ringtones need the
+AMC's decoder modelled (the transformer protocol from 2026-09-24's AMC
+section, with a host decoder behind it) or a software path the ringtone
+player will take. Neither exists yet.
+
+**The lag** is not measured yet. Two known sources:
+- the guest runs slower than real time (0.77x in the 27d084d report);
+- the app's ring buffer holds up to 16,383 frames (0.37 s).

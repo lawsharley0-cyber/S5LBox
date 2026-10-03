@@ -9,9 +9,9 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "soc.h"
-#include "arm_block.h"
-#include "arm_ir.h"
+#include "arm_ci.h"
 #include "../arm/a64_static_engine.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,6 +114,52 @@ bool s5l8900_overlaps(uint32_t a, uint32_t alen, uint32_t b, uint32_t blen) {
     uint64_t b0 = b, b1 = b0 + blen;
     if (!alen || !blen) return false;
     return b0 < a1 && a0 < b1;
+}
+
+/* The SoC region an unmodelled address falls in, for the diagnostic log.
+ * The DRAM row names the whole fitted aperture; an unmapped address inside it
+ * is beyond this machine's configured RAM. */
+static const char *soc_region_name(uint32_t addr) {
+    for (unsigned i = 0; i < sizeof SOC_REGIONS / sizeof SOC_REGIONS[0]; i++)
+        if (addr - SOC_REGIONS[i].base < SOC_REGIONS[i].size)
+            return SOC_REGIONS[i].name;
+    return NULL;
+}
+
+size_t s5l_access_log_describe(const s5l_access_entry_t *log, unsigned n,
+                               unsigned max_lines, char *out, size_t cap) {
+    if (!out || !cap) return 0;
+    out[0] = '\0';
+    if (!log) return 0;
+    size_t len = 0;
+    uint64_t below = UINT64_MAX;          /* emit strictly decreasing recency */
+    for (unsigned line = 0; line < max_lines; line++) {
+        const s5l_access_entry_t *best = NULL;
+        for (unsigned i = 0; i < n; i++)
+            if (log[i].seq && log[i].seq < below && (!best || log[i].seq > best->seq))
+                best = &log[i];
+        if (!best) break;
+        below = best->seq;
+        char who[16];
+        if (best->kind == S5L_ACCESS_DMA) snprintf(who, sizeof who, "dma");
+        else snprintf(who, sizeof who, "pc %08x", best->pc);
+        int w = snprintf(out + len, cap - len,
+                         "%s %s %08x %s %08x x%u%s%s (%s%s%s)\n",
+                         who, best->write ? "W" : "R", best->addr,
+                         best->write ? "<-" : "->", best->value, best->count,
+                         best->count == UINT32_MAX ? "+" : "",
+                         best->bytes == 2u ? " h" : best->bytes == 1u ? " b" : "",
+                         best->kind == S5L_ACCESS_DEVICE ? "device" :
+                         best->kind == S5L_ACCESS_STUB ? "stub" :
+                         best->kind == S5L_ACCESS_DMA ? "dma to device" : "unmapped",
+                         best->region ? " " : "",
+                         best->region ? best->region : "");
+        if (w < 0) break;
+        if ((size_t)w >= cap - len) { len = cap - 1u; break; }
+        len += (size_t)w;
+    }
+    if (len == 0) len = (size_t)snprintf(out, cap, "(none)\n");
+    return len < cap ? len : cap - 1u;
 }
 
 unsigned s5l8900_soc_regions(const s5l_window_t **out) {
@@ -313,6 +359,104 @@ static void note_unmapped(s5l8900_t *m, uint32_t addr) {
         m->unmapped_addr[m->unmapped_addr_count++] = page;
 }
 
+static const char *soc_region_name(uint32_t addr);
+
+/* Record one access in an access log: bump the entry for the same (pc, addr,
+ * direction) if there is one, else take an empty slot or the least recent
+ * one. Returns the slot and whether it was newly taken, so the caller names
+ * the region only once per entry. */
+static s5l_access_entry_t *log_access(s5l_access_entry_t *log, uint64_t *seq,
+                                      uint32_t pc, uint32_t addr, uint32_t val,
+                                      unsigned bytes, bool is_write, bool *fresh) {
+    s5l_access_entry_t *slot = NULL, *oldest = &log[0];
+    for (unsigned i = 0; i < S5L_ACCESS_LOG; i++) {
+        s5l_access_entry_t *e = &log[i];
+        if (!e->seq) { if (!slot) slot = e; continue; }
+        if (e->pc == pc && e->addr == addr && e->write == (uint8_t)is_write) {
+            slot = e;
+            break;
+        }
+        if (e->seq < oldest->seq) oldest = e;
+    }
+    if (!slot) slot = oldest;
+    *fresh = !(slot->seq && slot->pc == pc && slot->addr == addr &&
+               slot->write == (uint8_t)is_write);
+    if (*fresh) {
+        slot->pc = pc;
+        slot->addr = addr;
+        slot->write = (uint8_t)is_write;
+        slot->count = 1u;
+    } else if (slot->count != UINT32_MAX) {
+        slot->count++;
+    }
+    slot->value = val;
+    slot->bytes = (uint8_t)bytes;
+    slot->seq = ++*seq;
+    return slot;
+}
+
+/* The unmodelled table: unmapped addresses and storage-only stubs. */
+static void note_unmodelled(s5l8900_t *m, uint32_t addr, uint32_t val,
+                            unsigned bytes, bool is_write, const s5l_stub_t *stub) {
+    bool fresh;
+    s5l_access_entry_t *e = log_access(m->unmodelled, &m->unmodelled_seq,
+                                       m->dma_bus_active ? 0u : m->cpu.r[15],
+                                       addr, val, bytes, is_write, &fresh);
+    if (fresh) {
+        e->kind = stub ? S5L_ACCESS_STUB : S5L_ACCESS_UNMAPPED;
+        e->region = stub ? stub->name : soc_region_name(addr);
+    }
+}
+
+/* The all-device table: every access that reaches the device paths. */
+static void note_mmio(s5l8900_t *m, uint32_t addr, uint32_t val,
+                      unsigned bytes, bool is_write) {
+    /* A DMA controller's access has no pc. 0 keeps it out of every
+     * kernel-pc range below, which is what the report uses to find the
+     * driver that touched a device. */
+    const bool dma = m->dma_bus_active;
+    const uint32_t cpu_pc = dma ? 0u : m->cpu.r[15];
+    if (addr - S5L8900_AMC_BASE < S5L8900_AMC_SIZE ||
+        addr - S5L8900_SRAM_BASE < S5L8900_SRAM_SIZE) {
+        const uint32_t pc = cpu_pc;
+        if (pc >= 0xc0000000u) {
+            if (!m->audio_accesses || pc < m->audio_pc_lo) m->audio_pc_lo = pc;
+            if (!m->audio_accesses || pc > m->audio_pc_hi) m->audio_pc_hi = pc;
+            m->audio_accesses++;
+        }
+    }
+    bool fresh;
+    if (addr - S5L8900_I2S0_BASE < S5L8900_DEV_SIZE ||
+        addr - S5L8900_I2S1_BASE < S5L8900_DEV_SIZE) {
+        const uint32_t pc = cpu_pc;
+        if (pc >= 0xc0000000u) {
+            if (!m->pcm_accesses || pc < m->pcm_pc_lo) m->pcm_pc_lo = pc;
+            if (!m->pcm_accesses || pc > m->pcm_pc_hi) m->pcm_pc_hi = pc;
+            m->pcm_accesses++;
+        }
+        s5l_access_entry_t *p = log_access(m->pcm_recent, &m->pcm_seq, pc, addr,
+                                           val, bytes, is_write, &fresh);
+        if (fresh) {
+            p->kind = dma ? S5L_ACCESS_DMA : S5L_ACCESS_DEVICE;
+            p->region = addr < S5L8900_I2S1_BASE ? "i2s0" : "i2s1";
+        }
+    }
+    s5l_access_entry_t *e = log_access(m->mmio_recent, &m->mmio_seq,
+                                       cpu_pc, addr, val, bytes, is_write,
+                                       &fresh);
+    if (!fresh) return;
+    for (unsigned i = 0; i < NDEVICE_WINDOWS; i++) {
+        if (addr - DEVICE_WINDOWS[i].base < DEVICE_WINDOWS[i].size) {
+            e->kind = dma ? S5L_ACCESS_DMA : S5L_ACCESS_DEVICE;
+            e->region = DEVICE_WINDOWS[i].name;
+            return;
+        }
+    }
+    const s5l_stub_t *stub = find_stub(m, addr, 1u);
+    e->kind = stub ? S5L_ACCESS_STUB : S5L_ACCESS_UNMAPPED;
+    e->region = stub ? stub->name : soc_region_name(addr);
+}
+
 static void note_device(s5l8900_t *m, uint32_t addr, uint32_t val, bool is_write) {
     if (!m->trace_devices || m->dev_count >= S5L_DEVLOG) return;
     m->dev_addr[m->dev_count]     = addr;
@@ -353,6 +497,36 @@ static uint8_t *machine_host_ram(void *ctx, uint32_t pa, uint32_t len) {
     return m->ram + (pa - m->ram_base);
 }
 
+/*
+ * The direct-write consent, with one refusal: a range holding cached
+ * interpreter code. Every store into it must pass bus_write(), which is where
+ * the cache is invalidated; a host pointer would let a store bypass that.
+ */
+static uint8_t *machine_host_ram_write(void *ctx, uint32_t pa, uint32_t len) {
+    s5l8900_t *m = ctx;
+    if (m && m->ci && arm_ci_range_has_code(m->ci, pa, len)) return NULL;
+    return machine_host_ram(ctx, pa, len);
+}
+
+/*
+ * Inside a cached-interpreter run that may cross timebase edges (the event
+ * horizon in s5l8900_run), device time lags the CPU. Before any device sees
+ * an access, tick it up to the instruction making the access -- exactly the
+ * per-instruction ticks the literal loop would have delivered by then -- so
+ * every read and write observes the per-edge timeline. `ci_run_caught` moves
+ * before the tick, so a device the tick drives back onto the bus does not
+ * catch up twice. Runs before this access marks the machine dirty: the tick
+ * must refresh the state the access finds, and the access must stay dirty.
+ */
+static inline void ci_run_catch_up(s5l8900_t *m) {
+    if (!m->ci_run_open) return;
+    const unsigned at = arm_ci_run_position(m->ci);
+    if (at <= m->ci_run_caught) return;
+    const unsigned ticks = at - m->ci_run_caught;
+    m->ci_run_caught = at;
+    s5l8900_tick(m, ticks);
+}
+
 static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
     s5l8900_t *m = ctx;
 
@@ -361,6 +535,7 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         memcpy(&v, &m->ram[addr - m->ram_base], bytes);   /* little-endian host */
         return v;
     }
+    ci_run_catch_up(m);
     /*
      * Past the RAM aperture is a device, and this is the ONE place every guest
      * device access passes through — which is what makes `level_dirty` a
@@ -370,7 +545,21 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
      * VICADDRESS all change what a line asserts, and nine of the fifteen read
      * entry points take a non-const device pointer. Distinguishing the pure
      * ones would buy a store per MMIO read and cost the guarantee.
+     *
+     * With one exception, held by the compiler rather than by review: the
+     * timer, whose read entry point takes a CONST device pointer. The kernel
+     * reads its tick counter on every mach_absolute_time() -- hundreds of
+     * thousands of times a minute on a device -- and a dirty read costs a
+     * full device refresh and, under the cached interpreter, the end of the
+     * run. A const read cannot change a level, so skipping the flag here
+     * changes nothing the guest can observe.
      */
+    if (in_timer(addr, bytes)) {
+        uint32_t tv = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
+        note_mmio(m, addr, tv, bytes, false);
+        note_device(m, addr, tv, false);
+        return tv;
+    }
     m->level_dirty = true;
     uint32_t v;
     if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
@@ -414,8 +603,6 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
                          S5L_TVOUT_BANK_SIZE)) {
         v = s5l_tvout_read(&m->tvout, S5L_TVOUT_BANK_SDO,
                            addr - S5L8900_TVOUT_SDO_BASE, bytes);
-    } else if (in_timer(addr, bytes)) {
-        v = s5l_timer_read(&m->timer, addr - S5L8900_TIMER_BASE);
     } else if (in_power(addr, bytes)) {
         v = s5l_power_read(&m->power, addr - S5L8900_POWER_BASE);
     } else if (in_mbx(addr, bytes)) {
@@ -463,12 +650,16 @@ static uint32_t bus_read(void *ctx, uint32_t addr, unsigned bytes) {
         if (!s) {
             m->unmapped_reads++;
             note_unmapped(m, addr);
+            note_unmodelled(m, addr, 0, bytes, false, NULL);
+            note_mmio(m, addr, 0, bytes, false);
             note_device(m, addr, 0, false);
             return 0;
         }
         s->reads++;
         v = stub_read(s, addr, bytes);
+        note_unmodelled(m, addr, v, bytes, false, s);
     }
+    note_mmio(m, addr, v, bytes, false);
     note_device(m, addr, v, false);
     return v;
 }
@@ -478,9 +669,12 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
 
     if (in_ram(m, addr, bytes)) {
         memcpy(&m->ram[addr - m->ram_base], &val, bytes);
+        if (m->ci) arm_ci_note_ram_write(m->ci, addr, bytes);
         return;
     }
+    ci_run_catch_up(m);
     m->level_dirty = true;      /* a device store; see bus_read() */
+    note_mmio(m, addr, val, bytes, true);
     if ((bytes == 1u || bytes == 2u || bytes == 4u) && (addr & 3u) == 0u &&
         in_dev(addr, bytes, S5L8900_UART0_BASE)) {
         note_device(m, addr, val, true);
@@ -578,12 +772,12 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
     }
     if (mmio_data(addr, bytes, S5L8900_I2S0_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
-        s5l_i2s_write(&m->i2s[0], addr - S5L8900_I2S0_BASE, val);
+        s5l_i2s_store(&m->i2s[0], addr - S5L8900_I2S0_BASE, val, bytes);
         return;
     }
     if (mmio_data(addr, bytes, S5L8900_I2S1_BASE, S5L8900_DEV_SIZE)) {
         note_device(m, addr, val, true);
-        s5l_i2s_write(&m->i2s[1], addr - S5L8900_I2S1_BASE, val);
+        s5l_i2s_store(&m->i2s[1], addr - S5L8900_I2S1_BASE, val, bytes);
         return;
     }
     if (mmio_data(addr, bytes, S5L8900_SPI0_BASE, S5L8900_DEV_SIZE)) {
@@ -633,18 +827,46 @@ static void bus_write(void *ctx, uint32_t addr, uint32_t val, unsigned bytes) {
         if (s) {
             s->writes++;
             note_device(m, addr, val, true);
+            note_unmodelled(m, addr, val, bytes, true, s);
             stub_write(s, addr, val, bytes);
             return;
         }
     }
     m->unmapped_writes++;
     note_unmapped(m, addr);
+    note_unmodelled(m, addr, val, bytes, true, NULL);
     note_device(m, addr, val, true);
 }
 
-static uint32_t r32(void *c, uint32_t a) { return bus_read(c, a, 4); }
-static uint16_t r16(void *c, uint32_t a) { return (uint16_t)bus_read(c, a, 2); }
-static uint8_t  r8 (void *c, uint32_t a) { return (uint8_t) bus_read(c, a, 1); }
+/*
+ * bus_read()'s own first test, repeated here so a plain RAM read -- a page
+ * table walk, an interpreter load, a VFP transfer -- does not pay for the
+ * call into a function big enough to save half the register file. Identical
+ * by construction: bus_read() returns exactly this for the same range.
+ */
+static uint32_t r32(void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 4u)) {
+        uint32_t v;
+        memcpy(&v, &m->ram[a - m->ram_base], 4u);
+        return v;
+    }
+    return bus_read(c, a, 4);
+}
+static uint16_t r16(void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 2u)) {
+        uint16_t v;
+        memcpy(&v, &m->ram[a - m->ram_base], 2u);
+        return v;
+    }
+    return (uint16_t)bus_read(c, a, 2);
+}
+static uint8_t  r8 (void *c, uint32_t a) {
+    const s5l8900_t *m = c;
+    if (in_ram(m, a, 1u)) return m->ram[a - m->ram_base];
+    return (uint8_t)bus_read(c, a, 1);
+}
 /*
  * THE DMA REQUEST LINE, which this machine answers on its peripherals' behalf.
  *
@@ -664,7 +886,6 @@ static uint8_t  r8 (void *c, uint32_t a) { return (uint8_t) bus_read(c, a, 1); }
  */
 static bool dma_dst_ready(void *ctx, uint32_t dst, unsigned width) {
     const s5l8900_t *m = ctx;
-    (void)width;
     for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) {
         static const uint32_t base[] = {
             S5L8900_SPI0_BASE, S5L8900_SPI1_BASE, S5L8900_SPI2_BASE
@@ -673,8 +894,15 @@ static bool dma_dst_ready(void *ctx, uint32_t dst, unsigned width) {
         if (dst == base[i] + SPI_TXDATA)
             return m->spi[i].tx_level < S5L_SPI_FIFO_DEPTH;
     }
-    if (dst == S5L8900_I2S0_BASE + S5L_I2S_TX_FIFO_OFF) {
-        if (m->audio_ready) return m->audio_ready(m->audio_ctx);
+    /* The two I2S transmit FIFOs ask for data while they have room, and
+     * they make room one frame per edge of their frame clock. See the I2S
+     * block in soc.h. i2s0 is the codec's, so the host sink can also hold it
+     * back. */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        if (dst != s5l_i2s_fifo_pa(i, S5L_I2S_FIFO_TX)) continue;
+        if (!s5l_i2s_tx_room(&m->i2s[i], width)) return false;
+        if (i == 0u && m->audio_ready) return m->audio_ready(m->audio_ctx);
+        return true;
     }
     return true;
 }
@@ -697,7 +925,7 @@ bool s5l8900_set_direct_ram_writes(s5l8900_t *m, bool enabled) {
         memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
         return false;
     }
-    m->bus.host_ram_write = enabled ? machine_host_ram : NULL;
+    m->bus.host_ram_write = enabled ? machine_host_ram_write : NULL;
     /* A pointer granted under an earlier frontend contract must never survive
      * a mode change. Generation tags cannot express revoked consent. */
     memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
@@ -971,11 +1199,42 @@ static s5l_wake_kind_t wake_edge_spi1(const s5l8900_t *m, uint32_t *ticks) {
  * CASCADE VIC line, not 155. wake_line_enabled() rejects anything at or above
  * 32 * S5L8900_VIC_COUNT, so a source written as `{ "multitouch", 155, ... }`
  * would return false silently and could never wake the core.
+ *
+ * THE ONE EXCEPTION IS AN I2S FRAME CLOCK. It moves on guest time alone, so it
+ * can produce an edge while the core sleeps, and startTransfer() sleeps
+ * waiting for exactly two of them. While a controller's clock runs and the
+ * guest has unmasked its line (group 4 for i2s0, group 5 for i2s1), that group
+ * names the clock's next level change. Either direction, because the guest
+ * may have made the line level-sensitive; a change that asserts nothing only
+ * ends the WFI early, which ARM permits. Masked, it names nothing: the line
+ * cannot reach the cascade, and the stock driver masks it again as soon as it
+ * has its two edges.
  */
-static s5l_wake_kind_t wake_edge_gpio(const s5l8900_t *m, uint32_t *ticks) {
-    (void)m; (void)ticks;
-    return S5L_WAKE_NEVER;
+static s5l_wake_kind_t wake_edge_gpio_group(const s5l8900_t *m, unsigned group,
+                                            uint32_t *ticks) {
+    bool have = false;
+    uint32_t best = 0u;
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        const unsigned line = i == 0u ? S5L_GPIOIC_LINE_I2S0
+                                      : S5L_GPIOIC_LINE_I2S1;
+        if (line >> 5 != group) continue;
+        if (!(m->gpioic.en[group] & (1u << (line & 31u)))) continue;
+        uint32_t t = s5l_i2s_ticks_to_toggle(&m->i2s[i], m->tb_hz);
+        if (!t) continue;                  /* clock stopped */
+        if (!have || t < best) { best = t; have = true; }
+    }
+    if (!have) return S5L_WAKE_NEVER;
+    *ticks = best;
+    return S5L_WAKE_AT;
 }
+#define WAKE_EDGE_GPIO(g)                                                     \
+    static s5l_wake_kind_t wake_edge_gpio##g(const s5l8900_t *m,              \
+                                             uint32_t *ticks) {               \
+        return wake_edge_gpio_group(m, g##u, ticks);                          \
+    }
+WAKE_EDGE_GPIO(0) WAKE_EDGE_GPIO(1) WAKE_EDGE_GPIO(2) WAKE_EDGE_GPIO(3)
+WAKE_EDGE_GPIO(4) WAKE_EDGE_GPIO(5) WAKE_EDGE_GPIO(6)
+#undef WAKE_EDGE_GPIO
 
 /*
  * uart4's receive line, and the answer docs/derivations.md §23.5.1 asked for:
@@ -1021,16 +1280,64 @@ static s5l_wake_kind_t wake_edge_uart4(const s5l8900_t *m, uint32_t *ticks) {
  * any source is consulted) or there is no transfer in flight at all. There is
  * no future edge to name.
  *
- * That would stop being true the day this model paces transfers against a
- * peripheral's DMA request line instead of completing them in one call, which
- * is exactly the change the burst note in soc.h says has not been made. This
- * entry is where that change would be felt: it would have to start answering
- * S5L_WAKE_AT with the remaining distance, or the machine would fast-forward
- * straight over the completion.
+ * That stopped being true for one kind of channel: one that feeds an I2S
+ * transmit FIFO, which takes data only as fast as its frame clock drains it
+ * (see the I2S block in soc.h). Such a channel is in flight across a WFI, and
+ * its item ends -- raising terminal count if the item asks -- at a frame edge
+ * that can be computed: the item's remaining bytes, less the room the FIFO
+ * has now, drained one frame per edge. That edge is named here. An item
+ * without the interrupt bit ends the WFI for nothing, once per item, which
+ * ARM permits. Every other channel still finishes inside the refresh that
+ * starts it, so it still names nothing.
  */
-static s5l_wake_kind_t wake_edge_dmac(const s5l8900_t *m, uint32_t *ticks) {
-    (void)m; (void)ticks;
-    return S5L_WAKE_NEVER;
+static unsigned dmac_paced_fifo(const s5l8900_t *m, const s5l_pl080_chan_t *ch) {
+    /* A channel paced by a running I2S frame clock: its destination is a TX
+     * FIFO and does not move. Returns the controller index, or
+     * S5L8900_I2S_COUNT. */
+    if ((ch->cfg & (PL080_CFG_EN | PL080_CFG_HALT)) != PL080_CFG_EN)
+        return S5L8900_I2S_COUNT;
+    if (ch->ctrl & PL080_CTRL_DI) return S5L8900_I2S_COUNT;
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++)
+        if (ch->dst == s5l_i2s_fifo_pa(i, S5L_I2S_FIFO_TX) &&
+            s5l_i2s_clocking(&m->i2s[i]))
+            return i;
+    return S5L8900_I2S_COUNT;
+}
+
+static s5l_wake_kind_t wake_edge_dmac_n(const s5l8900_t *m, unsigned n,
+                                        uint32_t *ticks) {
+    const s5l_pl080_t *d = &m->dmac[n];
+    if (!(d->config & PL080_CONFIG_EN)) return S5L_WAKE_NEVER;
+    bool have = false;
+    uint32_t best = 0u;
+    for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++) {
+        const s5l_pl080_chan_t *ch = &d->ch[c];
+        const unsigned i = dmac_paced_fifo(m, ch);
+        if (i >= S5L8900_I2S_COUNT) continue;
+        const s5l_i2s_t *i2s = &m->i2s[i];
+        const uint32_t sw = (ch->ctrl >> PL080_CTRL_SWIDTH_SHIFT) &
+                            PL080_CTRL_WIDTH_MASK;
+        const uint64_t left = (uint64_t)(ch->ctrl & PL080_CTRL_SIZE_MASK)
+                              << (sw > 2u ? 0u : sw);
+        const uint64_t room = S5L_I2S_TX_FIFO_BYTES - i2s->tx_fill;
+        /* Nothing left, or room for all of it: the next refresh finishes the
+         * item unless the host sink holds it, so wake at the next frame. */
+        const uint64_t k = left > room
+            ? (left - room + S5L_I2S_FRAME_BYTES - 1u) / S5L_I2S_FRAME_BYTES
+            : 1u;
+        const uint32_t t = s5l_i2s_ticks_to_frame(i2s, k, m->tb_hz);
+        if (!t) continue;
+        if (!have || t < best) { best = t; have = true; }
+    }
+    if (!have) return S5L_WAKE_NEVER;
+    *ticks = best;
+    return S5L_WAKE_AT;
+}
+static s5l_wake_kind_t wake_edge_dmac0(const s5l8900_t *m, uint32_t *ticks) {
+    return wake_edge_dmac_n(m, 0u, ticks);
+}
+static s5l_wake_kind_t wake_edge_dmac1(const s5l8900_t *m, uint32_t *ticks) {
+    return wake_edge_dmac_n(m, 1u, ticks);
 }
 
 static const s5l_wake_source_t WAKE_SOURCES[] = {
@@ -1041,16 +1348,16 @@ static const s5l_wake_source_t WAKE_SOURCES[] = {
     { "spi1",  S5L8900_IRQ_SPI1,  wake_edge_spi1  },
     /* Group order, so entry k is group k. The lines are /arm-io/gpio's own
      * `interrupts` = {33,32,31,3,2,1,0}; group 4 -> VIC line 2 carries touch. */
-    { "gpio-group0", 33u, wake_edge_gpio },
-    { "gpio-group1", 32u, wake_edge_gpio },
-    { "gpio-group2", 31u, wake_edge_gpio },
-    { "gpio-group3",  3u, wake_edge_gpio },
-    { "gpio-group4",  2u, wake_edge_gpio },
-    { "gpio-group5",  1u, wake_edge_gpio },
-    { "gpio-group6",  0u, wake_edge_gpio },
+    { "gpio-group0", 33u, wake_edge_gpio0 },
+    { "gpio-group1", 32u, wake_edge_gpio1 },
+    { "gpio-group2", 31u, wake_edge_gpio2 },
+    { "gpio-group3",  3u, wake_edge_gpio3 },
+    { "gpio-group4",  2u, wake_edge_gpio4 },
+    { "gpio-group5",  1u, wake_edge_gpio5 },
+    { "gpio-group6",  0u, wake_edge_gpio6 },
     { "uart4-rx", S5L8900_IRQ_UART4, wake_edge_uart4 },
-    { "dmac0", S5L8900_IRQ_DMAC0, wake_edge_dmac },
-    { "dmac1", S5L8900_IRQ_DMAC1, wake_edge_dmac },
+    { "dmac0", S5L8900_IRQ_DMAC0, wake_edge_dmac0 },
+    { "dmac1", S5L8900_IRQ_DMAC1, wake_edge_dmac1 },
 };
 #define NWAKE_SOURCES (sizeof WAKE_SOURCES / sizeof WAKE_SOURCES[0])
 
@@ -1453,6 +1760,13 @@ bool s5l8900_init(s5l8900_t *m, uint32_t ram_base, uint32_t ram_size) {
              * duplicate declaration here would be refused as an overlap and
              * silently counted as a failure rather than shadowing them. */
             { S5L8900_SPI2_BASE,   S5L8900_DEV_SIZE,   "spi2"      },
+            /* AppleAMC (soc.h), and the on-chip SRAM its reg[1] names, which
+             * the same driver reads. SRAM is memory, so storage is its real
+             * behaviour; it is declared only when DRAM does not already cover
+             * it (-R above 416 MB does, and the declaration then fails and is
+             * counted, leaving the historical alias). */
+            { S5L8900_AMC_BASE,    S5L8900_AMC_SIZE,   "amc"       },
+            { S5L8900_SRAM_BASE,   S5L8900_SRAM_SIZE,  "sram"      },
         };
         for (unsigned i = 0; i < sizeof STUBS / sizeof STUBS[0]; i++)
             if (!s5l8900_add_stub(m, STUBS[i].base, STUBS[i].size, STUBS[i].name))
@@ -1531,14 +1845,8 @@ void s5l8900_free(s5l8900_t *m) {
     free(m->mbx.edram);
     m->mbx.edram = NULL;
     s5l_nor_free(&m->nor);
-    if (m->block_cache) {
-        arm_block_cache_destroy(m->block_cache);
-        m->block_cache = NULL;
-    }
-    if (m->ir_cache) {
-        arm_ir_cache_destroy(m->ir_cache);
-        m->ir_cache = NULL;
-    }
+    arm_ci_destroy(m->ci);
+    m->ci = NULL;
 }
 
 void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
@@ -1547,6 +1855,7 @@ void s5l8900_load(s5l8900_t *m, uint32_t addr, const void *data, size_t len) {
     if (len > 0xffffffffu) return;
     if (!in_ram(m, addr, (uint32_t)len)) return;
     memcpy(&m->ram[addr - m->ram_base], data, len);
+    if (m->ci) arm_ci_note_ram_write(m->ci, addr, (uint32_t)len);
 }
 
 /*
@@ -1646,6 +1955,7 @@ bool s5l8900_wake_from_standby(s5l8900_t *m) {
      * instant from any pre-sleep host-clock anchor. Lifetime evidence counters
      * remain intact, including the monotonic retired-instruction count above. */
     s5l8900_static_a64_invalidate_derived(m);
+    if (m->ci) arm_ci_flush(m->ci);
     m->wfi_pace_yield = false;
     m->active_clock_last_host_ns = 0u;
     m->active_clock_guest_ticks_since_sync = 0u;
@@ -1718,6 +2028,7 @@ bool s5l8900_set_button(s5l8900_t *m, unsigned which, bool pressed) {
  * entire device graph into the interpreter loop. */
 static void s5l8900_refresh(s5l8900_t *m, uint32_t tb) {
     m->level_dirty = false;
+    m->refresh_count++;
 
     /* Devices advance, then the controllers recompute what the CPU sees. */
     bool timer_irq = s5l_timer_tick(&m->timer, tb);
@@ -1787,12 +2098,40 @@ static void s5l8900_refresh(s5l8900_t *m, uint32_t tb) {
      * request line below reads true rather than stale. */
     for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++) s5l_spi_step(&m->spi[i]);
 
+    /*
+     * The I2S frame clocks, before the DMA controllers so that the frames
+     * that elapsed have already made room in the TX FIFOs they feed. Each
+     * clock also drives its GPIO-IC line: startTransfer() will not start DMA
+     * until it has seen two edges there. See the I2S block in soc.h.
+     *
+     * A refresh can cover many frames. The line only needs one rising edge to
+     * latch, so a refresh that crossed any pulses it and then leaves the wire
+     * at the clock's current level. A stopped clock drives nothing: nothing
+     * is on the wire until configure() has run.
+     */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        s5l_i2s_t *i2s = &m->i2s[i];
+        if (!s5l_i2s_clocking(i2s)) continue;
+        const unsigned line = i == 0u ? S5L_GPIOIC_LINE_I2S0
+                                      : S5L_GPIOIC_LINE_I2S1;
+        if (s5l_i2s_advance(i2s, tb, m->tb_hz)) {
+            s5l_gpioic_set_line(&m->gpioic, line, false);
+            s5l_gpioic_set_line(&m->gpioic, line, true);
+        }
+        s5l_gpioic_set_line(&m->gpioic, line,
+                            s5l_i2s_frame_level(i2s, m->tb_hz));
+    }
+
+    m->dma_bus_active = true;
     for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
         bool dmac_irq = s5l_pl080_run(&m->dmac[i], &m->bus, dma_dst_ready, m);
         s5l_vic_set_line(&m->vic[0],
                          i == 0u ? S5L8900_IRQ_DMAC0 : S5L8900_IRQ_DMAC1,
                          dmac_irq);
     }
+    m->dma_bus_active = false;
+    /* Frames the FIFO could not supply and DMA did not pay for are lost. */
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) s5l_i2s_settle(&m->i2s[i]);
 
     /*
      * The GPIO interrupt cascade. Seven group outputs, seven VIC lines, and
@@ -1902,6 +2241,86 @@ static unsigned run_retirement_batch_limit(const s5l8900_t *m,
 }
 
 /*
+ * The cached interpreter's event horizon. The per-edge bound above exists so
+ * that no execution path defers the device graph across an edge; it cuts
+ * every engine run at ~68 instructions and makes the device refresh and the
+ * engine's re-entry a large share of host time. But an edge at which nothing
+ * can happen needs no refresh at that instant, provided that
+ *
+ *   - no enabled interrupt can be raised before the run ends: the run stops
+ *     exactly at the instruction whose tick crosses the next edge any enabled
+ *     wake source names (the table WFI already relies on, whose devices all
+ *     advance algebraically, so one tick of N edges is N ticks of one);
+ *   - nothing advances per refresh rather than per edge: the PL080s and SPI
+ *     ports move data on every refresh while a transfer is in flight, so a
+ *     run only extends while both are idle (they finish in the refresh after
+ *     the guest store that starts them);
+ *   - everything the guest observes is caught up first: every device access
+ *     ticks the devices to the accessing instruction (ci_run_catch_up), and
+ *     every non-timer access ends the run after it (level_dirty), exactly as
+ *     today. Host inputs arrive between s5l8900_run() calls.
+ *
+ * The run is also bounded, to keep host-side latency (frames, touches) as it
+ * was at the chunk level. Anything unknown falls back to the next edge.
+ */
+#define S5L8900_CI_HORIZON_MAX_INSNS 16384u
+
+static bool horizon_devices_idle(const s5l8900_t *m) {
+    /* A channel feeding a running I2S frame clock's FIFO moves per frame
+     * edge, not per refresh, and a refresh that spans several frames moves
+     * what several refreshes would have (the credit in s5l_i2s_advance()).
+     * Its item ends are named by the dmac wake sources, so it does not stop
+     * the horizon. That matters: audio can play for as long as the guest
+     * runs. */
+    for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
+        const s5l_pl080_t *d = &m->dmac[i];
+        if (!(d->config & PL080_CONFIG_EN)) continue;
+        for (unsigned c = 0; c < S5L_PL080_CHANNELS; c++)
+            if ((d->ch[c].cfg & (PL080_CFG_EN | PL080_CFG_HALT)) == PL080_CFG_EN &&
+                dmac_paced_fifo(m, &d->ch[c]) >= S5L8900_I2S_COUNT)
+                return false;
+    }
+    for (unsigned i = 0; i < S5L8900_SPI_COUNT; i++)
+        if (m->spi[i].tx_level) return false;
+    return true;
+}
+
+static unsigned ci_horizon_batch_limit(s5l8900_t *m, unsigned remaining) {
+    const unsigned edge = retirement_batch_limit(m, remaining);
+    if (!edge || edge >= remaining || m->ci_horizon_off) return edge;
+    if (m->ci_horizon_key != m->refresh_count + 1u) {
+        uint32_t at = 0u;
+        m->ci_horizon_idle = horizon_devices_idle(m);
+        m->ci_horizon_kind = (uint8_t)s5l8900_next_wake(m, WAKE_SOURCES,
+                                                        NWAKE_SOURCES, &at);
+        m->ci_horizon_edges = at;
+        m->ci_horizon_key = m->refresh_count + 1u;
+    }
+    const s5l_wake_kind_t kind = (s5l_wake_kind_t)m->ci_horizon_kind;
+    const uint32_t edges = m->ci_horizon_edges;
+    if (!m->ci_horizon_idle || kind == S5L_WAKE_UNKNOWN) return edge;
+    uint64_t limit = remaining;
+    if (kind == S5L_WAKE_AT) {
+        /* The first instruction count whose ticks cross `edges` edges:
+         * floor((tb_accum + k * tb_hz) / cpu_hz) >= edges. For one edge this
+         * is retirement_batch_limit()'s own `until_edge`. */
+        const uint64_t need = ((uint64_t)edges * m->cpu_hz - m->tb_accum +
+                               m->tb_hz - 1u) / m->tb_hz;
+        if (need < limit) limit = need;
+    }
+    if (limit > S5L8900_CI_HORIZON_MAX_INSNS)
+        limit = S5L8900_CI_HORIZON_MAX_INSNS;
+    return limit > edge ? (unsigned)limit : edge;
+}
+
+bool s5l8900_set_ci_horizon(s5l8900_t *m, bool enabled) {
+    if (!m) return false;
+    m->ci_horizon_off = !enabled;
+    m->ci_horizon_key = 0u;
+    return true;
+}
+
+/*
  * Collapse only the calls to s5l8900_tick(), never ARM execution itself.
  *
  * User mode is the safety boundary: WFI and privileged host SVC can advance
@@ -1913,7 +2332,7 @@ static unsigned interpreter_tick_batch_limit(const s5l8900_t *m,
                                               unsigned remaining,
                                               bool active_clock) {
     if ((m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR ||
-        m->pre_step_hook || m->cpu.abort_pending)
+        m->pre_step_hook)
         return 0u;
 #if defined(S5LBOX_STATIC_A64_ENGINE)
     if (s5l8900_static_a64_is_enabled(m)) return 0u;
@@ -2162,7 +2581,7 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
          * expensive timebase/input eligibility gate: the old order paid a
          * 64-bit divide and several scattered loads on every interpreted guest
          * instruction even though no signed state had ever been allocated. */
-        if (s5l8900_static_a64_is_enabled(m)) {
+        if (!m->ci && s5l8900_static_a64_is_enabled(m)) {
             bool known_negative = false;
             arm_status_t engine_status = ARM_OK;
             unsigned boundary_retired = 0u;
@@ -2211,54 +2630,49 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
         }
 #endif
 
-        /* Acceleration Backends (Cached Block, JIT & Micro-Op IR) */
-        if (!m->pre_step_hook &&
-            (m->cpu_backend == S5L8900_CPU_BACKEND_CACHED_BLOCK ||
-             m->cpu_backend == S5L8900_CPU_BACKEND_JIT) && m->block_cache &&
-            !m->cpu.abort_pending &&
-            !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
-            !(m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I))) {
-            bool thumb = (m->cpu.cpsr & ARM_CPSR_T) != 0;
-            bool priv = (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-            arm_basic_block_t *block = arm_block_cache_lookup(m->block_cache, m->cpu.r[15], thumb, priv);
-            if (!block) {
-                block = arm_block_compile(m->block_cache, &m->cpu, m->cpu.r[15], thumb, priv);
-            }
-            if (block && block->insn_count > 0 && block->insn_count <= (max_steps - n)) {
-                unsigned retired = 0;
-                st = arm_block_exec(&m->cpu, block, &retired);
-                if (retired > 0) {
-                    n += retired;
-                    run_clock_retired(m, &active_clock, &active_pending_retired, retired,
-                                      st != ARM_OK,
-                                      m->level_dirty || ext_inputs(m) != m->ext_seen);
-                    if (st != ARM_OK) break;
-                    continue;
+        /*
+         * The cached interpreter (arm_ci.h). It receives exactly the budget
+         * the signed engine and the tick batch below receive -- never past
+         * the next timebase edge, and nothing at all while a device level or
+         * host input is dirty -- so one s5l8900_tick() for the whole batch is
+         * the same device timeline the literal loop produces. It never runs
+         * SVC, CP14/CP15 (WFI included) or anything else that can advance
+         * device time; for those it stops with STEP and the one-instruction
+         * path at the bottom of this loop runs arm_step() + tick(1). Unlike
+         * the interpreter batch it may run privileged code, because the
+         * instructions that made that unsafe are exactly the ones it refuses.
+         */
+        bool single_step = false;
+        if (m->ci && !m->pre_step_hook) {
+            unsigned batch = active_clock
+                ? run_retirement_batch_limit(m, max_steps - n, true)
+                : ci_horizon_batch_limit(m, max_steps - n);
+            if (batch) {
+                arm_ci_stop_t why = ARM_CI_STOP_BUDGET;
+                arm_status_t est = ARM_OK;
+                /* Open for the exact-time horizon only: in active-clock mode
+                 * device time is sampled from the host, not per instruction. */
+                m->ci_run_open = !active_clock;
+                m->ci_run_caught = 0u;
+                unsigned ran = arm_ci_run(m->ci, &m->cpu, batch, &est, &why);
+                m->ci_run_open = false;
+                if (ran) {
+                    /* Whatever device accesses inside the run already ticked,
+                     * the run's own tick does not repeat. */
+                    const unsigned rest = ran > m->ci_run_caught
+                                        ? ran - m->ci_run_caught : 0u;
+                    n += ran;
+                    if (rest)
+                        run_clock_retired(m, &active_clock,
+                                          &active_pending_retired, rest,
+                                          est != ARM_OK,
+                                          m->level_dirty ||
+                                          ext_inputs(m) != m->ext_seen);
                 }
+                if (est != ARM_OK) { st = est; break; }
+                if (why != ARM_CI_STOP_STEP) continue;
             }
-        } else if (!m->pre_step_hook &&
-                   m->cpu_backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && m->ir_cache &&
-                   !m->cpu.abort_pending &&
-                   !(m->cpu.fiq_line && !(m->cpu.cpsr & ARM_CPSR_F)) &&
-                   !(m->cpu.irq_line && !(m->cpu.cpsr & ARM_CPSR_I))) {
-            bool thumb = (m->cpu.cpsr & ARM_CPSR_T) != 0;
-            bool priv = (m->cpu.cpsr & ARM_CPSR_MODE_MASK) != ARM_MODE_USR;
-            arm_ir_block_t *block = arm_ir_cache_lookup(m->ir_cache, m->cpu.r[15], thumb, priv);
-            if (!block) {
-                block = arm_ir_compile_block(m->ir_cache, &m->cpu, m->cpu.r[15], thumb, priv);
-            }
-            if (block && block->insn_count > 0 && block->insn_count <= (max_steps - n)) {
-                unsigned retired = 0;
-                st = arm_ir_exec(&m->cpu, block, &retired);
-                if (retired > 0) {
-                    n += retired;
-                    run_clock_retired(m, &active_clock, &active_pending_retired, retired,
-                                      st != ARM_OK,
-                                      m->level_dirty || ext_inputs(m) != m->ext_seen);
-                    if (st != ARM_OK) break;
-                    continue;
-                }
-            }
+            single_step = true;
         }
 
         /* A limit of one cannot save a tick call, so retain the smaller
@@ -2268,7 +2682,7 @@ unsigned s5l8900_run(s5l8900_t *m, unsigned max_steps, arm_status_t *status) {
          * User mode. The final lump contains only successfully retired
          * instructions; a non-OK arm_step() receives no device tick, matching
          * the literal loop exactly. */
-        unsigned limit = interpreter_tick_batch_limit(
+        unsigned limit = single_step ? 0u : interpreter_tick_batch_limit(
             m, max_steps - n, active_clock);
         if (limit > 1u) {
             unsigned retired = 0u;
@@ -2330,17 +2744,47 @@ uint64_t s5l8900_interpreter_tick_batched_retired(const s5l8900_t *m) {
     return m ? m->interpreter_tick_batched_retired : 0u;
 }
 
-void s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend) {
-    if (!m) return;
-    m->cpu_backend = backend;
-    if ((backend == S5L8900_CPU_BACKEND_CACHED_BLOCK || backend == S5L8900_CPU_BACKEND_JIT) && !m->block_cache) {
-        m->block_cache = arm_block_cache_create(0);
-    } else if (backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED && !m->ir_cache) {
-        m->ir_cache = arm_ir_cache_create(0);
+bool s5l8900_set_cpu_backend(s5l8900_t *m, s5l8900_cpu_backend_t backend) {
+    if (!m) return false;
+    if (backend == S5L8900_CPU_BACKEND_INTERPRETER) {
+        arm_ci_destroy(m->ci);
+        m->ci = NULL;
+        m->cpu_backend = backend;
+        return true;
     }
+    if (!m->ci) {
+        arm_ci_config_t cfg = {
+            .ram = m->ram, .ram_base = m->ram_base, .ram_size = m->ram_size,
+            .level_dirty = &m->level_dirty,
+        };
+        m->ci = arm_ci_create(&cfg);
+        if (!m->ci) {
+            m->cpu_backend = S5L8900_CPU_BACKEND_INTERPRETER;
+            return false;
+        }
+    }
+    /* Direct write pointers granted before the engine existed may point at
+     * what is about to become cached code; the engine refuses new ones. */
+    memset(m->cpu.dwrite, 0, sizeof m->cpu.dwrite);
+    m->cpu_backend = backend;
+    return true;
+}
+
+void s5l8900_note_ram_write(s5l8900_t *m, uint32_t pa, uint32_t len) {
+    if (m && m->ci) arm_ci_note_ram_write(m->ci, pa, len);
+}
+
+void s5l8900_ram_replaced(s5l8900_t *m) {
+    if (m && m->ci) arm_ci_flush(m->ci);
+}
+
+void s5l8900_ram_written_callback(void *machine, uint64_t pa, uint64_t len) {
+    s5l8900_t *m = machine;
+    if (!m || !m->ci || pa > 0xffffffffu) return;
+    if (len > 0xffffffffu - pa) len = 0xffffffffu - pa + 1u;
+    arm_ci_note_ram_write(m->ci, (uint32_t)pa, (uint32_t)len);
 }
 
 s5l8900_cpu_backend_t s5l8900_get_cpu_backend(const s5l8900_t *m) {
     return m ? m->cpu_backend : S5L8900_CPU_BACKEND_INTERPRETER;
 }
-

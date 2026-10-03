@@ -140,13 +140,14 @@ static void test_applied_rows_reach_the_request(void) {
           "turning memory-reg off did not set no_memory_node");
     CHECK(!report.row[lcd].effective && !report.row[mem].effective,
           "a row turned off still reports as effective");
-    /* The two request opt-outs, the SIX nubs, and live NAT are applied rows.
+    /* The two request opt-outs, the SEVEN nubs, and live NAT are applied rows.
+     * `amc` joined them on 2026-09-24.
      * Counted rather than left open so that
      * a row quietly joining them has to be a deliberate edit here -- which is
      * what this is: `multitouch` was added on 2026-07-29 and it is applied
      * like the rest, even at its default, because "left matched because you
      * asked for it" is the switch working rather than being ignored. */
-    CHECK(report.applied == 9u, "%u rows applied, expected 9", report.applied);
+    CHECK(report.applied == 10u, "%u rows applied, expected 10", report.applied);
 
     /* Nothing else in the request may be touched. no_framebuffer in
      * particular: the app never turns the display off, and a mapping that
@@ -230,7 +231,7 @@ static void test_untouched_installation_reaches_the_machine(void) {
      * same here.
      */
     static const char *const NUBS[] = {
-        "mbx", "sha1", "baseband", "spi2", "usb-otg"
+        "mbx", "sha1", "baseband", "spi2", "usb-otg", "amc"
     };
     const unsigned nub_n = (unsigned)(sizeof NUBS / sizeof NUBS[0]);
 
@@ -247,7 +248,7 @@ static void test_untouched_installation_reaches_the_machine(void) {
               "\"%s\" is applied and still carries a caveat", NUBS[i]);
     }
 
-    /* Cleared is the default for all five, so all five are struck, and the
+    /* Cleared is the default for all six, so all six are struck, and the
      * request points at exactly the list the report published. */
     CHECK(report.unmatch_count == nub_n,
           "%u nodes un-matched at defaults, expected %u",
@@ -282,10 +283,10 @@ static void test_untouched_installation_reaches_the_machine(void) {
         }
     }
 
-    /* By path, not by count: five of the wrong nodes would pass a count. */
+    /* By path, not by count: six of the wrong nodes would pass a count. */
     static const char *const PATHS[] = {
         "arm-io/mbx", "arm-io/sha1", "baseband", "arm-io/spi2",
-        "arm-io/usb-otg"
+        "arm-io/usb-otg", "arm-io/amc"
     };
     for (unsigned i = 0; i < nub_n; i++) {
         bool found = false;
@@ -312,7 +313,7 @@ static void test_untouched_installation_reaches_the_machine(void) {
     CHECK(request.unmatch == NULL,
           "an empty list is published as a pointer rather than NULL");
     CHECK(report.overridden == want,
-          "matching all five nubs leaves %u overrides, expected %u",
+          "matching every nub leaves %u overrides, expected %u",
           report.overridden, want);
 }
 

@@ -18,12 +18,12 @@
 #define VM_DEFAULT_MBX                true
 #define VM_DEFAULT_CA_SOFTWARE_RENDER false
 #define VM_MBX_DETAIL \
-    "On only in the separately labelled S5LBox MBX phone experiment. It " \
+    "On only in the separately labelled NEON MBX phone experiment. It " \
     "uses a separate app container so its first machine gets a fresh MBX work " \
     "image rather than silently reusing the normal app's CPU-renderer image. " \
     "The path is still experimental: no phone run has proved 30 fps."
 #define VM_CA_RENDER_DETAIL \
-    "Off only in the separately labelled S5LBox MBX phone experiment, paired " \
+    "Off only in the separately labelled NEON MBX phone experiment, paired " \
     "with MBX on before its first work image is created. The normal app keeps " \
     "Apple's CPU renderer on. Changing this after an image exists cannot " \
     "convert that image and is not a controlled comparison."
@@ -66,6 +66,11 @@ static const vm_option_t VM_OPTIONS[] = {
     { "usb-otg", "USB OTG  ·  /arm-io/usb-otg",
       "Off: AppleSynopsysOTGDevice reads unmodelled configuration registers, "
       "derives a self-inconsistent endpoint count and panics.",
+      false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
+    { "amc", "Audio decoder  ·  /arm-io/amc",
+      "Off: AppleAMC_r1 is Apple's hardware AAC/MP3 decoder and its DSP is "
+      "not modelled, so a ringtone sent to it fails and plays silence. Hidden, "
+      "the guest has only its software decoders to use.",
       false, VM_OPT_GROUP_HARDWARE, VM_OPT_IMPL_HARNESS },
     { "multitouch", "Touchscreen  ·  /arm-io/spi1/multi-touch",
       "On. The digitizer is bootloaded exactly as the real part is -- Apple's "
@@ -134,7 +139,7 @@ static const char *const VM_OPTION_GROUP_NOTE[VM_OPT_GROUP_COUNT] = {
     "Device-tree hardware presented to the guest. Touch is present by default. "
     "MBX is now a working but not finally accepted experiment; SHA-1, baseband, "
     "SPI2 and USB remain hidden because their individual rows name measured "
-    "boot failures. The guest therefore still sees less hardware than a real "
+    "boot failures, and the audio decoder because it plays silence. The guest therefore still sees less hardware than a real "
     "iPhone in the default configuration.",
 
     "Work iBoot would have done, done by the emulator instead because it jumps "

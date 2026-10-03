@@ -2042,10 +2042,15 @@ _Static_assert(offsetof(a64_compact_raw_context_t, flat_ram) == 0u &&
                             window_cache) == 192u &&
                    sizeof(a64_compact_raw_context_t) == 320u,
                "compact raw native context layout drifted");
+/* The generated code reaches the thread-ID words through context->cp15 at
+ * 44 + 4 * opc2 (gen_a64_static.py, .La64cr_cp15_c13_access), so those three
+ * offsets are the contract. 76 bytes since the ARMv7-only PAR, CSSELR and
+ * L2AUXCR were appended after them; nothing here indexes past tpidrprw, and
+ * this engine only ever runs the ARM1176, where they stay zero. */
 _Static_assert(offsetof(arm_cp15_t, tpidrurw) == 52u &&
                    offsetof(arm_cp15_t, tpidruro) == 56u &&
                    offsetof(arm_cp15_t, tpidrprw) == 60u &&
-                   sizeof(arm_cp15_t) == 64u,
+                   sizeof(arm_cp15_t) == 76u,
                "compact raw CP15 thread-ID layout drifted");
 
 extern int a64_static_execute(uint32_t *regs, uint32_t *cpsr,

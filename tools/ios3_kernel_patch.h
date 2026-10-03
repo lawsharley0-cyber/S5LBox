@@ -31,6 +31,10 @@
 #define IOS3_KERNEL_PATCH_BSD_ROOT_VA UINT32_C(0xc01a1b5a)
 #define IOS3_KERNEL_PATCH_MD_READ_VA UINT32_C(0xc0074140)
 #define IOS3_KERNEL_PATCH_MD_WRITE_VA UINT32_C(0xc00741e6)
+/* _cs_enforcement_disable in __DATA (file offset 0x205aac), read only by
+ * _vm_fault_enter; ships as 0 and nothing in the kernelcache writes it. See
+ * docs/activation.md A.2-A.3. */
+#define IOS3_KERNEL_PATCH_CS_ENFORCEMENT_VA UINT32_C(0xc020daac)
 
 /* Smallest RAM aperture, starting at IOS3_KERNEL_PATCH_RAM_BASE, that contains
  * every byte of every file-backed segment in the supported kernel. Real boots
@@ -53,7 +57,9 @@ typedef enum {
     IOS3_KERNEL_PATCH_SITE_BSD_ROOT,
     IOS3_KERNEL_PATCH_SITE_MD_READ,
     IOS3_KERNEL_PATCH_SITE_MD_WRITE,
-    IOS3_KERNEL_PATCH_SITE_RAW_WATCHER
+    IOS3_KERNEL_PATCH_SITE_RAW_WATCHER,
+    /* Only with ios3_kernel_patch_request_t::disable_codesign_page_kill. */
+    IOS3_KERNEL_PATCH_SITE_CS_ENFORCEMENT
 } ios3_kernel_patch_site_t;
 
 typedef enum {
@@ -113,6 +119,16 @@ typedef struct {
     size_t ram_size;
     uint64_t ram_base;
     uint32_t virt_base;
+    /*
+     * Also set _cs_enforcement_disable to 1, in the same all-or-nothing
+     * transaction. The cs_enforcement_disable boot-arg does not reach this
+     * global (AMFI keeps its own copy), so with it 0 _vm_fault_enter still
+     * kills a process whose signed code pages fail their hashes -- a
+     * third-party app whose signature no longer matches its code -- even
+     * when AMFI permits the exec. Set only together with the guest
+     * code-signing policy (s5l_bringup_request_t::guest_codesign_disabled).
+     */
+    bool disable_codesign_page_kill;
 } ios3_kernel_patch_request_t;
 
 /*
@@ -145,8 +161,9 @@ typedef struct {
 /*
  * Validate the complete build identity, exact segment topology, loaded file
  * bytes and zero-fill tails, fixed mapping, and every expected byte at all five
- * patch sites (including the raw-mdev entry/completion SVC pair) before
- * applying any replacement.
+ * patch sites (including the raw-mdev entry/completion SVC pair), and the
+ * sixth when disable_codesign_page_kill is set, before applying any
+ * replacement.
  * Any rejection leaves the kernel file and guest RAM unchanged. The
  * implementation performs no allocation.
  */

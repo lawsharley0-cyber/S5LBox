@@ -465,13 +465,23 @@ static ksyms_status_t prelink_load(ksyms_t *ks, const macho_t *m) {
             if (st != KSYMS_OK) return st;
         } else if (!strcmp(pending, "_PrelinkExecutableLoadAddr")) {
             /*
-             * The later (iOS 4+/OS X) spelling. If it ever turns up here the
-             * assumption above is wrong and the map would silently be built
-             * from the wrong key — so say so instead.
+             * The later spelling of the same thing: where the kext's text is
+             * in the kernel's address space. iOS 6's kernelcache (iPhone 3GS
+             * 10B500) uses it, with _PrelinkExecutableSourceAddr beside it;
+             * its first kext loads at exactly __PRELINK_TEXT's start. An image
+             * carrying both spellings with different values is ambiguous, so
+             * that is refused rather than resolved by key order.
              */
-            return plfail(&pl, tag_at, KSYMS_ERR_PLIST,
-                          "this image uses _PrelinkExecutableLoadAddr, not "
-                          "_PrelinkExecutable — teach ksyms.c the newer layout");
+            uint32_t load = 0;
+            st = parse_int(&pl, tag_at, val, vlen, &load);
+            if (st != KSYMS_OK) return st;
+            if (got_exec && cur.addr != load)
+                return plfail(&pl, tag_at, KSYMS_ERR_PLIST,
+                              "_PrelinkExecutable 0x%08x and "
+                              "_PrelinkExecutableLoadAddr 0x%08x disagree",
+                              cur.addr, load);
+            cur.addr = load;
+            got_exec = true;
         }
     }
 

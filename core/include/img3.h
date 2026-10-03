@@ -71,6 +71,7 @@ typedef struct {
 
     const uint8_t *data;    /* DATA tag payload (points into the input) */
     uint32_t       data_len;
+    uint32_t       data_room; /* bytes the DATA tag holds, padding included */
 
     img3_kbag_t kbag;
     bool        has_shsh;
@@ -91,13 +92,30 @@ img3_status_t img3_parse(const uint8_t *buf, size_t len, img3_t *out);
  * uses img.kbag.iv.
  *
  * `key_bits` must match the parsed KBAG and `out_cap` must cover img.data_len
- * bytes. Only whole 16-byte blocks are decrypted; an unaligned tail is copied
- * through verbatim, matching Apple's container convention. `out_len` receives
- * the number of bytes written.
+ * bytes. When the payload ends inside a block, the tag's padding normally
+ * holds the rest of that block's ciphertext (the 3GS's iPhone OS 3.1.3
+ * device tree: 42840 bytes in a 42848-byte tag), and then the whole block is
+ * decrypted and only `data_len` bytes kept, as iBoot does. A tag with no such
+ * padding has its unaligned tail copied through verbatim. `out_len` receives
+ * the number of bytes written. `out` may be img->data (decrypting in place).
  */
 bool img3_decrypt_data_iv(const img3_t *img, const uint8_t *key, unsigned key_bits,
                           const uint8_t iv[16], uint8_t *out, size_t out_cap,
                           uint32_t *out_len);
+
+/*
+ * The same, choosing what happens to an unaligned tail: `decrypt_tail` false
+ * always copies it through verbatim, which is what the tools that produced
+ * the iPhone 3G's accepted kernel.macho did (docs/BOOT_CHAIN.md: its
+ * kernelcache's last block stays ciphertext, and unlzss reports the 42-byte
+ * zero-fill that is part of the accepted hash). A kernelcache's tail is
+ * compressed padding past the end of the kernel, so either choice boots; the
+ * accepted hash needs this one. A device tree's tail is its last property,
+ * so it must be decrypted.
+ */
+bool img3_decrypt_data_iv_tail(const img3_t *img, const uint8_t *key, unsigned key_bits,
+                               const uint8_t iv[16], uint8_t *out, size_t out_cap,
+                               uint32_t *out_len, bool decrypt_tail);
 
 /* Human-readable status, for logs and the app UI. */
 const char *img3_strerror(img3_status_t st);

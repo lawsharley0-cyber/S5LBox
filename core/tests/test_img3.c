@@ -227,6 +227,60 @@ static void test_decrypt_data_roundtrip(void) {
     CHECK(memcmp(out, plain, sizeof plain) == 0, "decrypted payload mismatch");
 }
 
+/* The 3GS's iPhone OS 3.1.3 device tree: 42840 bytes of DATA in a tag padded
+ * to 42848, so the last block's ciphertext is all there and must be
+ * decrypted, not copied. */
+static void test_decrypt_padded_tail(void) {
+    static const uint8_t key[16] = {
+        0x0f,0x1e,0x2d,0x3c,0x4b,0x5a,0x69,0x78,
+        0x87,0x96,0xa5,0xb4,0xc3,0xd2,0xe1,0xf0
+    };
+    uint8_t iv[16];
+    for (unsigned i = 0; i < 16; i++) iv[i] = (uint8_t)(0x10 + i);
+    for (unsigned plain_len = 5; plain_len <= 37; plain_len += 32) {
+        uint8_t plain[48] = {0}, cipher[48];
+        for (unsigned i = 0; i < plain_len; i++) plain[i] = (uint8_t)(i * 7 + 3);
+        const uint32_t padded = (plain_len + 15u) & ~15u;
+        aes_ctx_t ctx;
+        aes_init(&ctx, key, 128);
+        aes_cbc_encrypt(&ctx, iv, plain, cipher, padded);
+
+        uint8_t kbag[24 + 16];
+        memset(kbag, 0, sizeof kbag);
+        kbag[0] = 1; kbag[4] = 128;
+        memcpy(&kbag[8], iv, 16);
+        img_begin(0x64747265u);
+        img_tag(IMG3_TAG_KBAG, kbag, sizeof kbag);
+        const uint32_t at = img_tag(IMG3_TAG_DATA, cipher, padded);
+        put32(at + 8, plain_len);                  /* data length < tag room */
+        img_finish();
+
+        img3_t img;
+        CHECK(img3_parse(g_buf, g_len, &img) == IMG3_OK, "parse failed");
+        CHECK(img.data_len == plain_len && img.data_room == padded, "data %u room %u",
+              img.data_len, img.data_room);
+        uint8_t out[48];
+        uint32_t out_len = 0;
+        CHECK(img3_decrypt_data_iv(&img, key, 128, iv, out, plain_len, &out_len) &&
+              out_len == plain_len && memcmp(out, plain, plain_len) == 0,
+              "a %u-byte payload's last block was not decrypted", plain_len);
+        /* Copying the tail instead leaves its stored ciphertext. */
+        out_len = 0;
+        CHECK(img3_decrypt_data_iv_tail(&img, key, 128, iv, out, plain_len, &out_len, false) &&
+              out_len == plain_len && memcmp(out, plain, plain_len & ~15u) == 0 &&
+              memcmp(out + (plain_len & ~15u), cipher + (plain_len & ~15u),
+                     plain_len & 15u) == 0,
+              "a copied %u-byte tail is the stored bytes", plain_len);
+        /* In place, as the app's importer decrypts: the tail must still chain
+         * from the prefix's last CIPHERTEXT block. */
+        out_len = 0;
+        CHECK(img3_decrypt_data_iv(&img, key, 128, iv, (uint8_t *)img.data, plain_len,
+                                   &out_len) &&
+              out_len == plain_len && memcmp(img.data, plain, plain_len) == 0,
+              "in place, a %u-byte payload's last block was not decrypted", plain_len);
+    }
+}
+
 static void test_decrypt_requires_kbag(void) {
     static const uint8_t key[16] = {0};
     img_begin(0x69626f74u);
@@ -389,6 +443,7 @@ int main(void) {
     test_reject_partial_trailing_tag();
     test_truncated_kbag_ignored();
     test_decrypt_data_roundtrip();
+    test_decrypt_padded_tail();
     test_decrypt_requires_kbag();
     test_decrypt_checks_output_capacity();
     test_null_output_struct_is_refused();

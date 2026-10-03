@@ -40,7 +40,13 @@
 #import "VMSettings.h"
 #import "VMFramePublication.h"
 #import "VMAudioOutput.h"
+#import "arm_ci.h"
+#import "guest_profile.h"
+#import "VMDriverDump.h"
+#import "ksyms.h"
+#import "rootfs_work.h"
 
+#import <CommonCrypto/CommonDigest.h>
 #import <mach/mach.h>
 #import <pthread.h>
 #import <time.h>
@@ -53,6 +59,10 @@
 // At a few million instructions a second this is roughly 15-30 ms, which keeps
 // pause latency short without paying the flag check too often.
 static const unsigned kVMChunkInstructions = 100000;
+/* Guest profile tables: 128 Ki (pc, process) slots and 32 Ki distinct call
+ * stacks (about 2 MiB); a quarter of each is kept free. */
+static const unsigned kVMProfileSlotsLog2 = 17u;
+static const unsigned kVMProfileStacksLog2 = 15u;
 
 // Publish a snapshot at most this often. The UI redraws at 30 Hz; going faster
 // would only copy the same pixels twice.
@@ -126,6 +136,10 @@ static uint64_t vm_now_ns(void) {
 - (void)noteDroppedButton;
 - (void)drainOneTouch_emulatorThread;
 - (void)drainOneButton_emulatorThread;
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired
+                                    runNs:(uint64_t)runNs
+                                   idleNs:(uint64_t)idleNs
+                                 threadNs:(uint64_t)threadNs;
 - (void)beginCheckpointInputQuiesce_emulatorThread;
 - (BOOL)checkpointInputIsQuiescent_emulatorThread;
 - (void)publishBlankSnapshotLocked;
@@ -284,6 +298,46 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     vm_button_momentary_holds_t _momentaryHolds;
     BOOL              _droppedButtonLogged;
     VMAudioOutput    *_audioOutput;
+    /*
+     * Diagnostics copied by the emulator thread between chunks (the only time
+     * it may read the machine) and formatted on request by the UI thread,
+     * both under _lock: the cached interpreter's counters since this run
+     * started, and the machine's recent unmodelled hardware accesses.
+     */
+    BOOL                    _diagCiActive;
+    arm_ci_stats_t          _diagCiStats;
+    uint64_t                _diagRetired;
+    s5l_access_entry_t _diagUnmodelled[S5L_ACCESS_LOG];
+    s5l_access_entry_t _diagMmio[S5L_ACCESS_LOG];
+    /* Where the emulator thread's time went since this run started: inside
+     * s5l8900_run, of which asleep in guest idle (paced WFI), and in total. */
+    uint64_t                _diagRunNs, _diagIdleNs, _diagThreadNs;
+    /* The machine's permanent record of kernel pcs that touched the audio
+     * block (s5l8900_t::audio_pc_lo/hi), for -audioDriverExcerpt. */
+    uint32_t                _diagAudioPcLo, _diagAudioPcHi;
+    uint64_t                _diagAudioAccesses;
+    /* The PCM output path the same way (s5l8900_t::pcm_*), plus the state of
+     * the two DMA controllers and I2S windows that carry it. */
+    s5l_access_entry_t      _diagPcm[S5L_ACCESS_LOG];
+    uint32_t                _diagPcmPcLo, _diagPcmPcHi;
+    uint64_t                _diagPcmAccesses;
+    s5l_pl080_t             _diagDmac[S5L8900_DMAC_COUNT];
+    s5l_i2s_t               _diagI2s[S5L8900_I2S_COUNT];
+    s5l_wm8991_t            _diagCodec;
+    NSString               *_diagBackendNote;  /* why the cached interpreter is off */
+    /*
+     * The guest profile (guest_profile.h): the guest pc after every full
+     * chunk, i.e. one sample per kVMChunkInstructions retired. Its own lock,
+     * so a sample never waits on the UI formatting the status line; taken by
+     * the emulator thread a few thousand times a second, uncontended.
+     * _profileShort counts chunks that ended early (guest idle, a stop) and
+     * so were not sampled.
+     */
+    pthread_mutex_t         _profileLock;
+    BOOL                    _profileReady;
+    gprof_t                 _profile;
+    uint64_t                _profileShort;
+    uint64_t                _profileSinceNs;
 }
 
 + (uint64_t)physFootprintBytes {
@@ -310,6 +364,15 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     _mode    = @"";
     _bringUpNote = @"";
     _instanceID = [identifier copy];
+    if (pthread_mutex_init(&_profileLock, NULL) == 0) {
+        _profileReady = gprof_init(&_profile, kVMProfileSlotsLog2) &&
+                        gprof_init_stacks(&_profile, kVMProfileStacksLog2);
+        if (!_profileReady) {
+            gprof_free(&_profile);
+            pthread_mutex_destroy(&_profileLock);
+        }
+    }
+    _profileSinceNs = vm_now_ns();
     return self;
 }
 
@@ -320,6 +383,10 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     [_audioOutput stop];
     _audioOutput = nil;
     free(_snapshot);
+    if (_profileReady) {
+        gprof_free(&_profile);
+        pthread_mutex_destroy(&_profileLock);
+    }
     if (_lockReady) pthread_mutex_destroy(&_lock);
 }
 
@@ -541,7 +608,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
                       selector:@selector(provisionRootFilesystem:)
                         object:where] : nil;
             if (worker) {
-                worker.name = @"S5LBox rootfs provisioning";
+                worker.name = @"NEON rootfs provisioning";
                 worker.qualityOfService = NSQualityOfServiceUtility;
                 [worker start];
             } else {
@@ -803,10 +870,27 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
 }
 
 - (void)configureCpuBackend {
-    NSString *backendPref = [[NSUserDefaults standardUserDefaults] stringForKey:@"vm.cpu.backend"];
+    /* Through VMSettings, so an unset preference gets its default there. */
+    NSString *backendPref = [[VMSettings sharedSettings] cpuBackend];
     s5l8900_cpu_backend_t backend = S5L8900_CPU_BACKEND_INTERPRETER;
-    if ([self isForcedInterpreterEnabled]) {
+    BOOL forced = [self isForcedInterpreterEnabled];
+    BOOL wantsCached = [backendPref isEqualToString:@"cached"] ||
+                       [backendPref isEqualToString:@"block"] ||
+                       [backendPref isEqualToString:@"cached-block"] ||
+                       [backendPref isEqualToString:@"ir"] ||
+                       [backendPref isEqualToString:@"micro-op"] ||
+                       [backendPref isEqualToString:@"jit"];
+    NSString *why;
+    if (forced) {
         backend = S5L8900_CPU_BACKEND_INTERPRETER;
+        why = wantsCached
+            ? @"Force Interpreter is ON for this machine, so the Cached Interpreter "
+              @"setting is ignored and the compact engine is off too: this is the "
+              @"slowest configuration. Turn it off from the machine menu "
+              @"(Force Interpreter) and restart."
+            : @"Force Interpreter is ON for this machine: reference interpreter only, "
+              @"compact engine off. Turn it off from the machine menu to restore speed.";
+        [self appendConsole:[NSString stringWithFormat:@"[vm] %@\n", why]];
     } else if ([backendPref isEqualToString:@"cached"] || [backendPref isEqualToString:@"block"] || [backendPref isEqualToString:@"cached-block"]) {
         backend = S5L8900_CPU_BACKEND_CACHED_BLOCK;
     } else if ([backendPref isEqualToString:@"ir"] || [backendPref isEqualToString:@"micro-op"]) {
@@ -814,11 +898,23 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
     } else if ([backendPref isEqualToString:@"jit"]) {
         backend = S5L8900_CPU_BACKEND_JIT;
     }
+    if (!forced)
+        why = backend == S5L8900_CPU_BACKEND_INTERPRETER
+            ? @"Standard backend selected in Settings (reference interpreter plus "
+              @"the compact engine where built). The default, Cached Interpreter, "
+              @"measured about twice as fast on device; choose it in "
+              @"Settings > Diagnostics > CPU Execution Backend."
+            : nil;
     s5l8900_set_cpu_backend(&_machine, backend);
     s5l8900_set_direct_ram_writes(&_machine, true);
-    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "interpreter" :
-                        (backend == S5L8900_CPU_BACKEND_IR_OPTIMIZED) ? "micro-op IR" :
-                        (backend == S5L8900_CPU_BACKEND_JIT) ? "ARM64 native JIT" : "cached blocks (fastmem)";
+    pthread_mutex_lock(&_lock);
+    _diagBackendNote = why;
+    pthread_mutex_unlock(&_lock);
+    /* IR_OPTIMIZED and JIT are retired names kept for saved settings; the
+     * core runs both on the cached interpreter (see soc.h). */
+    const char *bname = (backend == S5L8900_CPU_BACKEND_INTERPRETER) ? "standard (reference interpreter + compact engine where built)" :
+                        (backend == S5L8900_CPU_BACKEND_CACHED_BLOCK) ? "cached interpreter" :
+                        "cached interpreter (older setting)";
     [self appendConsole:[NSString stringWithFormat:@"[vm] CPU execution backend: %s\n", bname]];
 }
 
@@ -951,7 +1047,7 @@ static void vm_audio_tx_callback(void *ctx, uint32_t word) {
         [self appendConsole:@"[vm] could not allocate the emulator thread\n"];
         return NO;
     }
-    thread.name = @"S5LBox emulator";
+    thread.name = @"NEON emulator";
     thread.qualityOfService = NSQualityOfServiceUserInitiated;
     thread.stackSize = 512 * 1024;
 
@@ -1654,6 +1750,11 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
 
 - (void)threadMain:(id)unused {
     (void)unused;
+    /* The engine counters describe this run, like `retired` below. */
+    if (_machine.ci) arm_ci_reset_stats(_machine.ci);
+    const uint64_t threadStartNs = vm_now_ns();
+    const uint64_t idleBaseNs = _machine.wfi_paced_wait_ns;
+    uint64_t runNs = 0;
     double lastPublish = vm_now();
     uint64_t retired = 0, retiredAtLastPublish = 0;
     arm_status_t status = ARM_OK;
@@ -1772,7 +1873,21 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 [self drainOneButton_emulatorThread];
             }
 
-            retired += s5l8900_run(&_machine, kVMChunkInstructions, &status);
+            {
+                const uint64_t t0 = vm_now_ns();
+                const unsigned ran =
+                    s5l8900_run(&_machine, kVMChunkInstructions, &status);
+                retired += ran;
+                runNs += vm_now_ns() - t0;
+                if (_profileReady) {
+                    pthread_mutex_lock(&_profileLock);
+                    if (ran == kVMChunkInstructions && status == ARM_OK)
+                        [self profileSample_emulatorThread];
+                    else
+                        _profileShort++;
+                    pthread_mutex_unlock(&_profileLock);
+                }
+            }
 
             /* Taken here precisely because the chunk has ENDED: the machine is
              * between instructions, this thread owns it, and no lock is held. */
@@ -1811,6 +1926,20 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                             (unsigned)spin.count[i]];
                     }
                     uint32_t base = region << kVMSpinRegionShift;
+                    /* What the loop is waiting on, when it is hardware we do
+                     * not model: the most recent distinct unmodelled accesses,
+                     * with their pcs and repeat counts. */
+                    char unmodelled[1024], devices[2048];
+                    (void)s5l_access_log_describe(_machine.mmio_recent,
+                                                  S5L_ACCESS_LOG, 16u,
+                                                  devices, sizeof devices);
+                    (void)s5l_access_log_describe(_machine.unmodelled,
+                                                  S5L_ACCESS_LOG, 6u,
+                                                  unmodelled, sizeof unmodelled);
+                    [self appendConsole:[NSString stringWithFormat:
+                        @"[stall] recent hardware accesses, any device:\n%s"
+                        @"[stall] recent unmodelled hardware accesses:\n%s",
+                        devices, unmodelled]];
                     [self appendConsole:[NSString stringWithFormat:
                         @"[stall] at %.1f M insn the guest is looping in %u "
                         @"region%@: 0x%08x-0x%08x took %u of %u samples, cpsr "
@@ -1892,6 +2021,10 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
                 double instantRate = elapsed > 0
                     ? (double)(retired - retiredAtLastPublish) / elapsed : 0.0;
                 [self publishRetired:retired rate:instantRate status:status];
+                [self publishDiagnostics_emulatorThread:retired
+                                                  runNs:runNs
+                                                 idleNs:_machine.wfi_paced_wait_ns - idleBaseNs
+                                               threadNs:vm_now_ns() - threadStartNs];
                 lastPublish = now;
                 retiredAtLastPublish = retired;
             }
@@ -2144,6 +2277,961 @@ static bool vm_spin_already_reported(const vm_spin_t *s, uint32_t region) {
     }
     pthread_mutex_unlock(&_lock);
     return out;
+}
+
+/* Emulator thread only, between chunks. */
+- (void)publishDiagnostics_emulatorThread:(uint64_t)retired
+                                    runNs:(uint64_t)runNs
+                                   idleNs:(uint64_t)idleNs
+                                 threadNs:(uint64_t)threadNs {
+    arm_ci_stats_t stats;
+    BOOL active = _machine.ci != NULL;
+    if (active) arm_ci_get_stats(_machine.ci, &stats);
+    else memset(&stats, 0, sizeof stats);
+    pthread_mutex_lock(&_lock);
+    _diagCiActive = active;
+    _diagCiStats = stats;
+    _diagRetired = retired;
+    _diagRunNs = runNs;
+    _diagIdleNs = idleNs;
+    _diagThreadNs = threadNs;
+    memcpy(_diagUnmodelled, _machine.unmodelled, sizeof _diagUnmodelled);
+    memcpy(_diagMmio, _machine.mmio_recent, sizeof _diagMmio);
+    _diagAudioPcLo = _machine.audio_pc_lo;
+    _diagAudioPcHi = _machine.audio_pc_hi;
+    _diagAudioAccesses = _machine.audio_accesses;
+    memcpy(_diagPcm, _machine.pcm_recent, sizeof _diagPcm);
+    _diagPcmPcLo = _machine.pcm_pc_lo;
+    _diagPcmPcHi = _machine.pcm_pc_hi;
+    _diagPcmAccesses = _machine.pcm_accesses;
+    memcpy(_diagDmac, _machine.dmac, sizeof _diagDmac);
+    memcpy(_diagI2s, _machine.i2s, sizeof _diagI2s);
+    memcpy(&_diagCodec, &_machine.codec, sizeof _diagCodec);
+    pthread_mutex_unlock(&_lock);
+}
+
+- (NSString *)diagnosticsDescription {
+    arm_ci_stats_t stats;
+    s5l_access_entry_t unmodelled[S5L_ACCESS_LOG], mmio[S5L_ACCESS_LOG];
+    pthread_mutex_lock(&_lock);
+    BOOL active = _diagCiActive;
+    uint64_t retired = _diagRetired;
+    NSString *note = _diagBackendNote;
+    const uint64_t runNs = _diagRunNs, idleNs = _diagIdleNs, threadNs = _diagThreadNs;
+    stats = _diagCiStats;
+    memcpy(unmodelled, _diagUnmodelled, sizeof unmodelled);
+    memcpy(mmio, _diagMmio, sizeof mmio);
+    pthread_mutex_unlock(&_lock);
+
+    char engine[1024], devices[4096], missing[4096], timing[512];
+    {
+        /* Busy = executing guest instructions (inside the machine, not
+         * asleep in guest idle). A low busy share means the guest is idle or
+         * the thread is starved; a high one with a low rate means the CPU
+         * emulation itself is the limit. */
+        const double thread = threadNs / 1e9, run = runNs / 1e9, idle = idleNs / 1e9;
+        const double busy = run > idle ? run - idle : 0.0;
+        (void)snprintf(timing, sizeof timing,
+            "Emulator thread over %.0f s: %.0f%% executing guest code, %.0f%% asleep "
+            "while the guest idles (WFI), %.0f%% outside the machine. Rate while "
+            "executing: %.1f M insn/s.\n",
+            thread,
+            thread > 0 ? 100.0 * busy / thread : 0.0,
+            thread > 0 ? 100.0 * (run - busy) / thread : 0.0,
+            thread > 0 ? 100.0 * (thread > run ? thread - run : 0.0) / thread : 0.0,
+            busy > 0 ? retired / busy / 1e6 : 0.0);
+    }
+    if (active)
+        (void)arm_ci_describe_stats(&stats, retired, engine, sizeof engine);
+    else
+        (void)snprintf(engine, sizeof engine, "Cached interpreter not running.\n");
+    (void)s5l_access_log_describe(mmio, S5L_ACCESS_LOG, 32u, devices, sizeof devices);
+    (void)s5l_access_log_describe(unmodelled, S5L_ACCESS_LOG, 32u,
+                                  missing, sizeof missing);
+    return [NSString stringWithFormat:
+        @"%s\nCPU engine:\n%s%@%@\n"
+        @"Recent hardware accesses, any device (most recent first):\n%s\n"
+        @"Recent accesses to unmodelled hardware (most recent first):\n%s",
+        timing, engine, active || !note ? @"" : note, active || !note ? @"" : @"\n",
+        devices, missing];
+}
+
+/*
+ * The kernel code around every guest pc that touched the audio block (AMC
+ * registers and SRAM), from this machine's own RAM: the kernel maps
+ * 0xc0000000 -> physical 0x08000000 linearly. Opt-in and copied by the
+ * user; it is their firmware and it is never stored by NEON. Code pages do
+ * not change while the guest runs, so reading them from this thread is safe.
+ */
+/* The lowest and highest kernel pc seen touching the audio block (AMC
+ * registers or its SRAM): the machine's permanent record, widened by the
+ * rolling access logs. NO when no kernel code has touched it. */
+- (BOOL)audioPcRangeLo:(uint32_t *)outLo hi:(uint32_t *)outHi
+              accesses:(uint64_t *)outAccesses {
+    s5l_access_entry_t logs[2 * S5L_ACCESS_LOG];
+    pthread_mutex_lock(&_lock);
+    memcpy(logs, _diagMmio, sizeof _diagMmio);
+    memcpy(logs + S5L_ACCESS_LOG, _diagUnmodelled, sizeof _diagUnmodelled);
+    const uint64_t accesses = _diagAudioAccesses;
+    const uint32_t seenLo = _diagAudioPcLo, seenHi = _diagAudioPcHi;
+    pthread_mutex_unlock(&_lock);
+
+    /* The machine's permanent record first; the rolling logs only add to it. */
+    uint32_t lo = accesses ? seenLo : UINT32_MAX, hi = accesses ? seenHi : 0u;
+    for (size_t i = 0; i < 2u * S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &logs[i];
+        if (!e->count) continue;
+        const BOOL amc = e->addr >= S5L8900_AMC_BASE && e->addr - S5L8900_AMC_BASE < S5L8900_AMC_SIZE;
+        const BOOL sram = e->addr >= S5L8900_SRAM_BASE && e->addr - S5L8900_SRAM_BASE < S5L8900_SRAM_SIZE;
+        if (!amc && !sram) continue;
+        if (e->pc < 0xc0000000u || e->pc >= 0xc0800000u) continue;
+        if (e->pc < lo) lo = e->pc;
+        if (e->pc > hi) hi = e->pc;
+    }
+    *outLo = lo;
+    *outHi = hi;
+    *outAccesses = accesses;
+    return lo <= hi;
+}
+
+- (NSString *)audioDriverExcerpt {
+    uint32_t lo = 0, hi = 0;
+    uint64_t accesses = 0;
+    if (![self audioPcRangeLo:&lo hi:&hi accesses:&accesses])
+        return @"No kernel code has touched the audio block yet in this run. Play a sound (Settings > Sounds), then try again.";
+    /* The register accessors are small leaf functions; the driver logic that
+     * calls them (firmware load, start sequence, the "could not start DMA"
+     * decision) lies before them in the same kext, so take 16 KiB before the
+     * first pc and 8 KiB after the last; bounded at 32 KiB. */
+    uint32_t start = (lo - 0x4000u) & ~0xfu, end = (hi + 0x2000u + 0xfu) & ~0xfu;
+    if (end - start > 0x8000u) end = start + 0x8000u;
+    const uint64_t pa = (uint64_t)start - 0xc0000000u + 0x08000000u;
+    if (!_machine.ram || pa < _machine.ram_base ||
+        pa + (end - start) > (uint64_t)_machine.ram_base + _machine.ram_size)
+        return @"The kernel is not where this build expects it in guest RAM.";
+    NSData *bytes = [NSData dataWithBytes:_machine.ram + (pa - _machine.ram_base) length:end - start];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+    return [NSString stringWithFormat:
+        @"NEON audio driver excerpt (kernel code from this machine's own firmware, for register analysis; not stored by NEON)\n"
+        @"va=0x%08x len=0x%x sha256=%@ pcs=0x%08x..0x%08x accesses=%llu\n%@\n",
+        start, end - start, hex, lo, hi, (unsigned long long)accesses,
+        [bytes base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+}
+
+/*
+ * WHERE THE GUEST'S INSTRUCTIONS WENT: the pcs sampled since the previous
+ * call (or since this engine was made), named by library and function.
+ *
+ * Kernel addresses are named from the imported kernelcache (ksyms.h: kernel
+ * symbols, and which prelinked kext owns an address). User addresses are
+ * named from the dyld shared cache FILE on the pristine rootfs.img -- every
+ * framework and libSystem lives there, at the same address in every process
+ * -- read-only, the same way the Crash Logs screen reads the work image.
+ * Code nothing can name is reported as its 256-byte block, with the address,
+ * rather than attributed to the nearest symbol.
+ *
+ * Each sample stands for kVMChunkInstructions retired instructions, so a
+ * share of samples is a share of guest instructions. Chunks that ended early
+ * (the guest went idle, or the run stopped) are counted, not sampled: this is
+ * a profile of busy time.
+ */
+/* The imported kernelcache's symbols and kext map, or NULL. ksyms points into
+ * *keep, which the caller must hold for as long as it uses the result. */
+static ksyms_t *VMLoadKernelSymbols(NSString *firmwareDir, NSData **keep) {
+    *keep = nil;
+    if (!firmwareDir.length) return NULL;
+    NSData *kernel = [NSData dataWithContentsOfFile:
+                         [firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_KERNEL_FILE]
+                                            options:NSDataReadingMappedIfSafe error:NULL];
+    ksyms_t *ks = kernel.length ? calloc(1, sizeof *ks) : NULL;
+    if (!ks) return NULL;
+    (void)ksyms_load(ks, kernel.bytes, kernel.length);
+    *keep = kernel;
+    return ks;
+}
+
+static void VMFreeKernelSymbols(ksyms_t *ks) {
+    if (!ks) return;
+    ksyms_free(ks);
+    free(ks);
+}
+
+static NSString *VMProfileBlock(uint32_t pc) {
+    return [NSString stringWithFormat:@"code @0x%08x (256 B)", pc & ~0xffu];
+}
+
+static void VMProfileAdd(NSMutableDictionary<NSString *, NSNumber *> *d,
+                         NSString *key, uint64_t n) {
+    d[key] = @(d[key].unsignedLongLongValue + n);
+}
+
+static NSArray<NSString *> *VMProfileTop(NSDictionary<NSString *, NSNumber *> *d,
+                                         NSUInteger limit) {
+    NSArray<NSString *> *keys = [d keysSortedByValueUsingComparator:
+        ^NSComparisonResult(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+    return keys.count > limit ? [keys subarrayWithRange:NSMakeRange(0, limit)] : keys;
+}
+
+/*
+ * "Which process": each program's share, named by its exec path, then the
+ * top functions inside the busiest ones. Counts are samples taken while one
+ * of its address spaces (TTBR0) was loaded, so a process's kernel share is
+ * the kernel working for it (system calls, faults, interrupts that landed
+ * during its slice). A program seen in more than one address space was
+ * started more than once in the window -- a daemon that keeps crashing and
+ * being relaunched shows up here as a count, not as rows to add up.
+ */
+static NSString *VMProfileProcesses(const gprof_t *w,
+                                    NSArray<NSMutableDictionary<NSString *, NSNumber *> *> *procFunctions,
+                                    double total) {
+    NSMutableString *out = [NSMutableString string];
+    /* Group by name; index 0 and the unnamed spaces are groups of their own. */
+    NSString *const kUnnamed = @"(no exec path readable: kernel task or not yet mapped)";
+    NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *groups = [NSMutableDictionary dictionary];
+    for (uint32_t i = 0; i < w->nproc; i++) {
+        if (!w->proc[i].samples) continue;
+        NSString *name = i == 0 ? @"(MMU off, or past the process table)"
+                       : w->proc[i].name[0] ? [NSString stringWithUTF8String:w->proc[i].name] : kUnnamed;
+        if (!name.length) name = kUnnamed;                   /* not UTF-8 */
+        NSMutableArray<NSNumber *> *members = groups[name];
+        if (!members) groups[name] = members = [NSMutableArray array];
+        [members addObject:@(i)];
+    }
+    uint64_t (^samplesOf)(NSString *) = ^uint64_t(NSString *name) {
+        uint64_t n = 0;
+        for (NSNumber *i in groups[name]) n += w->proc[i.unsignedIntValue].samples;
+        return n;
+    };
+    NSArray<NSString *> *order = [groups.allKeys sortedArrayUsingComparator:
+        ^NSComparisonResult(NSString *a, NSString *b) {
+            const uint64_t ca = samplesOf(a), cb = samplesOf(b);
+            return ca == cb ? [a compare:b] : (ca > cb ? NSOrderedAscending : NSOrderedDescending);
+        }];
+    NSString *(^label)(NSString *) = ^NSString *(NSString *name) {
+        NSArray<NSNumber *> *members = groups[name];
+        const uint32_t first = members.firstObject.unsignedIntValue;
+        if (first == 0) return name;
+        return members.count == 1
+            ? [NSString stringWithFormat:@"%@  (ttbr0 %08x)", name, w->proc[first].ttbr0]
+            : [NSString stringWithFormat:@"%@  (%lu address spaces)", name, (unsigned long)members.count];
+    };
+    [out appendFormat:@"\nBy process (the address spaces samples ran in, by exec path; %u seen%s; "
+                      @"\"seen a-b%%\" is where in the window it was first and last sampled)\n",
+        w->nproc - 1u, w->proc_full ? ", table full" : ""];
+    /* "seen a-b%": where in the window its first and latest samples fell,
+     * so a program still busy when the report was taken reads "...-100%". */
+    for (NSUInteger k = 0; k < order.count && k < 16; k++) {
+        uint64_t n = 0, user = 0, first = UINT64_MAX, last = 0;
+        for (NSNumber *i in groups[order[k]]) {
+            const gprof_proc_t *e = &w->proc[i.unsignedIntValue];
+            n += e->samples;
+            user += e->user;
+            if (e->first && e->first < first) first = e->first;
+            if (e->last > last) last = e->last;
+        }
+        NSString *span = w->samples && first <= last
+            ? [NSString stringWithFormat:@"  seen %.0f-%.0f%%", 100.0 * (first - 1u) / w->samples,
+                                         100.0 * last / w->samples]
+            : @"";
+        [out appendFormat:@"%6.2f%%  %@  [user %.0f%%]%@\n", 100.0 * n / total,
+            label(order[k]), 100.0 * user / n, span];
+    }
+    [out appendString:@"\nTop functions in the busiest processes\n"];
+    for (NSUInteger k = 0; k < order.count && k < 6; k++) {
+        if (100.0 * samplesOf(order[k]) / total < 1.0) break;
+        [out appendFormat:@"%@\n", label(order[k])];
+        NSMutableDictionary<NSString *, NSNumber *> *f = [NSMutableDictionary dictionary];
+        for (NSNumber *i in groups[order[k]]) {
+            NSDictionary<NSString *, NSNumber *> *one = procFunctions[i.unsignedIntValue];
+            for (NSString *key in one) VMProfileAdd(f, key, one[key].unsignedLongLongValue);
+        }
+        for (NSString *key in VMProfileTop(f, 6))
+            [out appendFormat:@"  %6.2f%%  %@\n", 100.0 * f[key].unsignedLongLongValue / total, key];
+    }
+    return out;
+}
+
+/*
+ * What the call stacks add: inclusive time (a function and everything it
+ * called, each function counted once per stack) and, for the hottest
+ * functions, the call paths that reach them. A return address names the
+ * call site, so it is looked up two bytes back (inside the calling
+ * function even when the call is its last instruction).
+ */
+static NSString *VMProfileStacks(const gprof_t *w,
+                                 void (^classify)(uint32_t, NSString **, NSString **),
+                                 NSArray<NSString *> *hottest, double total) {
+    if (!w->stack || !w->stack_samples) return @"";
+    NSMutableDictionary<NSNumber *, NSString *> *names = [NSMutableDictionary dictionary];
+    NSString *(^nameOf)(uint32_t) = ^NSString *(uint32_t a) {
+        NSNumber *key = @(a);
+        NSString *n = names[key];
+        if (!n) {
+            NSString *image = nil, *function = nil;
+            classify(a, &image, &function);
+            n = [NSString stringWithFormat:@"%@  %@", image, function];
+            names[key] = n;
+        }
+        return n;
+    };
+    NSMutableDictionary<NSString *, NSNumber *> *inclusive = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *paths =
+        [NSMutableDictionary dictionary];
+    for (NSString *f in hottest) paths[f] = [NSMutableDictionary dictionary];
+    for (uint32_t i = 0; i < w->stack_cap; i++) {
+        const gprof_stack_t *e = &w->stack[i];
+        if (!e->count || !e->depth) continue;
+        NSMutableArray<NSString *> *chain = [NSMutableArray array];
+        for (unsigned k = 0; k < e->depth; k++) {
+            const uint32_t a = k && e->frame[k] >= 2u ? e->frame[k] - 2u : e->frame[k];
+            NSString *n = nameOf(a);
+            if (![chain.lastObject isEqualToString:n]) [chain addObject:n];
+        }
+        for (NSString *f in [NSSet setWithArray:chain]) VMProfileAdd(inclusive, f, e->count);
+        NSMutableDictionary<NSString *, NSNumber *> *into = paths[chain[0]];
+        if (into) {
+            const NSUInteger callers = MIN((NSUInteger)6, chain.count - 1u);
+            NSString *path = callers
+                ? [[chain subarrayWithRange:NSMakeRange(1, callers)] componentsJoinedByString:@"\n        <- "]
+                : @"(no caller recorded)";
+            VMProfileAdd(into, path, e->count);
+        }
+    }
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"\nInclusive (the function and everything it called; %llu stacks, %llu not kept: table full)\n",
+        (unsigned long long)w->stack_samples, (unsigned long long)w->stack_dropped];
+    for (NSString *key in VMProfileTop(inclusive, 30))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * inclusive[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nCall paths into the hottest functions (r7 frame chain, innermost caller first)\n"];
+    for (NSString *f in hottest) {
+        NSMutableDictionary<NSString *, NSNumber *> *into = paths[f];
+        [out appendFormat:@"%@\n", f];
+        for (NSString *key in VMProfileTop(into, 4))
+            [out appendFormat:@"  %6.2f%%  <- %@\n", 100.0 * into[key].unsignedLongLongValue / total, key];
+    }
+    return out;
+}
+
+static NSString *VMGuestProfileReport(const gprof_t *window, uint64_t shortChunks,
+                                      double seconds, NSString *firmwareDir,
+                                      NSString *revision) {
+    NSMutableString *out = [NSMutableString string];
+    const uint64_t kept = window->samples - window->dropped;
+    [out appendFormat:
+        @"NEON guest profile (the guest pc sampled after every %u retired instructions)\n"
+        @"Build: %@\nWindow: %.1f s, %llu samples = %.1f M instructions; %llu shorter chunks (guest idle or a stop) not sampled\n",
+        kVMChunkInstructions, revision, seconds,
+        (unsigned long long)window->samples,
+        window->samples * (double)kVMChunkInstructions / 1e6,
+        (unsigned long long)shortChunks];
+    if (!window->samples) {
+        [out appendString:@"\nNo samples yet. Use the guest for 30-60 seconds, then copy the profile again.\n"];
+        return out;
+    }
+    [out appendFormat:@"User mode %.1f%%, kernel %.1f%%; %llu samples dropped (table full)\n",
+        100.0 * window->user / window->samples,
+        100.0 * (window->samples - window->user) / window->samples,
+        (unsigned long long)window->dropped];
+
+    /* Names: the kernelcache for kernel pcs. ksyms points into these bytes,
+     * so they must outlive every ksyms call below, not just the last use ARC
+     * can see. */
+    NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
+    ksyms_t *ks = VMLoadKernelSymbols(firmwareDir, &kernel);
+    const BOOL ksLoaded = ks != NULL;
+    if (ksLoaded)
+        [out appendFormat:@"Kernel names: %u symbols (%s), %u kexts (%s)\n",
+            ks->nsym, ksyms_strerror(ks->sym_status), ks->nkext,
+            ksyms_strerror(ks->prelink_status)];
+    else
+        [out appendString:@"Kernel names: unavailable (no imported kernel.macho)\n"];
+
+    /* ...and the dyld shared cache for user pcs. */
+    static const char kCachePath[] =
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv6";
+    uint8_t *cacheBytes = NULL;
+    gprof_cache_t cache;
+    BOOL cacheOpen = NO;
+    memset(&cache, 0, sizeof cache);
+    char rootfs[VM_FW_BOOT_PATH_CAPACITY];
+    rootfs_work_result_t *rr = calloc(1, sizeof *rr);
+    if (rr && firmwareDir.length &&
+        [[firmwareDir stringByAppendingPathComponent:@VM_FW_BOOT_ROOTFS_FILE]
+            getFileSystemRepresentation:rootfs maxLength:sizeof rootfs]) {
+        size_t got = 0;
+        uint64_t size = 0;
+        rootfs_work_status_t rs =
+            rootfs_work_read_file(rootfs, kCachePath, NULL, 0, &got, &size, rr);
+        if (rs == ROOTFS_WORK_OK && size && size <= (UINT64_C(512) << 20)) {
+            cacheBytes = malloc((size_t)size);
+            if (cacheBytes)
+                rs = rootfs_work_read_file(rootfs, kCachePath, cacheBytes,
+                                           (size_t)size, &got, &size, rr);
+        }
+        if (rs == ROOTFS_WORK_OK && cacheBytes && got) {
+            cacheOpen = gprof_cache_open(&cache, cacheBytes, got);
+            [out appendFormat:@"User names: dyld shared cache, %.1f MB, %u images%s%s\n",
+                got / 1048576.0, cacheOpen ? cache.nimage : 0u,
+                cache.detail[0] ? "; " : "", cache.detail];
+        } else {
+            [out appendFormat:@"User names: unavailable (%s: %s)\n",
+                rootfs_work_status_name(rs), rr->detail[0] ? rr->detail : "no detail"];
+        }
+    } else {
+        [out appendString:@"User names: unavailable (no imported rootfs.img)\n"];
+    }
+    free(rr);
+
+    NSMutableDictionary<NSString *, NSNumber *> *images = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, NSNumber *> *functions = [NSMutableDictionary dictionary];
+    /* A pc can have one slot per process; the address list sums them. */
+    NSMutableDictionary<NSNumber *, NSNumber *> *addresses = [NSMutableDictionary dictionary];
+    NSMutableArray<NSMutableDictionary<NSString *, NSNumber *> *> *procFunctions =
+        [NSMutableArray arrayWithCapacity:window->nproc];
+    for (uint32_t i = 0; i < window->nproc; i++)
+        [procFunctions addObject:[NSMutableDictionary dictionary]];
+    /* Library and function for one address, the same naming everywhere
+     * below. Only the report's own thread uses it, so the caches need no lock. */
+    gprof_cache_t *cacheRef = &cache;   /* symbolizing fills its tables */
+    void (^classify)(uint32_t, NSString **, NSString **) =
+        ^(uint32_t pc, NSString **imageOut, NSString **functionOut) {
+        NSString *image = nil, *function = nil;
+        if (pc >= 0xffff0000u) {
+            image = @"exception vectors";
+            function = VMProfileBlock(pc);
+        } else if (pc >= 0xc0000000u) {
+            const kext_t *kext = ksLoaded ? ksyms_kext_at(ks, pc) : NULL;
+            if (kext) {
+                image = [NSString stringWithUTF8String:kext->bundle] ?: @"(kext)";
+                function = VMProfileBlock(pc);
+            } else {
+                char name[256];
+                const char *r = ksLoaded ? ksyms_resolve(ks, pc, name, sizeof name) : "?";
+                image = @"mach_kernel";
+                if (r[0] == '?' || !strncmp(r, "__PRELINK_TEXT", 14)) {
+                    function = VMProfileBlock(pc);
+                } else {
+                    const char *plus = strstr(r, "+0x");
+                    function = [[NSString alloc] initWithBytes:r
+                        length:plus ? (NSUInteger)(plus - r) : strlen(r)
+                        encoding:NSUTF8StringEncoding] ?: VMProfileBlock(pc);
+                }
+            }
+        } else {
+            gprof_image_t *img = cacheOpen ? gprof_cache_image_at(cacheRef, pc) : NULL;
+            if (img) {
+                uint32_t off = 0;
+                const char *sym = gprof_cache_symbolize(cacheRef, img, pc, 0x8000u, &off);
+                image = [NSString stringWithUTF8String:gprof_basename(img->path)] ?: @"(image)";
+                function = sym ? ([NSString stringWithUTF8String:sym] ?: VMProfileBlock(pc))
+                               : VMProfileBlock(pc);
+            } else if (pc >= 0x2fe00000u && pc < 0x30000000u) {
+                image = @"dyld (by address)";
+                function = VMProfileBlock(pc);
+            } else {
+                image = @"user code outside the shared cache (app or plugin)";
+                function = VMProfileBlock(pc);
+            }
+        }
+        *imageOut = image;
+        *functionOut = function;
+    };
+    for (uint32_t i = 0; i < window->cap; i++) {
+        const gprof_slot_t *slot = &window->slot[i];
+        if (!slot->count) continue;
+        const uint32_t pc = slot->pc;
+        NSString *image = nil, *function = nil;
+        classify(pc, &image, &function);
+        NSString *both = [NSString stringWithFormat:@"%@  %@", image, function];
+        VMProfileAdd(images, image, slot->count);
+        VMProfileAdd(functions, both, slot->count);
+        if (slot->proc < procFunctions.count)
+            VMProfileAdd(procFunctions[slot->proc], both, slot->count);
+        NSNumber *key = @(pc);
+        addresses[key] = @(addresses[key].unsignedLongLongValue + slot->count);
+    }
+    NSArray<NSNumber *> *hot = [addresses keysSortedByValueUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+        return [b compare:a];
+    }];
+
+    const double total = (double)kept;
+    [out appendString:@"\nBy library / kext (share of sampled instructions)\n"];
+    for (NSString *key in VMProfileTop(images, 16))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * images[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nBy function\n"];
+    for (NSString *key in VMProfileTop(functions, 40))
+        [out appendFormat:@"%6.2f%%  %@\n", 100.0 * functions[key].unsignedLongLongValue / total, key];
+    [out appendString:@"\nHottest single addresses\n"];
+    for (NSUInteger i = 0; i < hot.count && i < 12; i++)
+        [out appendFormat:@"%6.2f%%  0x%08x\n",
+            100.0 * addresses[hot[i]].unsignedLongLongValue / total, hot[i].unsignedIntValue];
+
+    [out appendString:VMProfileProcesses(window, procFunctions, total)];
+    [out appendString:VMProfileStacks(window, classify, VMProfileTop(functions, 3), total)];
+
+    if (cacheOpen) gprof_cache_close(&cache);
+    free(cacheBytes);
+    VMFreeKernelSymbols(ks);
+    return out;
+}
+
+/*
+ * One profile sample, attributed to the process it ran in (guest_profile.h):
+ * the address space is the TTBR0, and its name is read from the guest's own
+ * RAM -- a page-table walk and one 8 KiB scan -- only when TTBR0 changed since
+ * the last sample or kVMProfileReread samples have passed, so a task that
+ * exits and hands its tables to a new one is noticed. The call stack is the
+ * r7 frame chain, read the same way. Emulator thread, with _profileLock held,
+ * between chunks.
+ */
+static const uint16_t kVMProfileReread = 64u;
+static const uint32_t kVMUserStackTop = 0x30000000u;   /* iPhone OS 3 USRSTACK */
+
+- (void)profileSample_emulatorThread {
+    const arm_cp15_t *cp = &_machine.cpu.cp15;
+    const bool mmu = (cp->sctlr & 1u) != 0;
+    const uint32_t ttbr0 = mmu ? cp->ttbr0 : 0u;
+    uint16_t proc = 0;
+    if (mmu && !gprof_proc_cached(&_profile, ttbr0, kVMProfileReread, &proc)) {
+        char path[GPROF_NAME_MAX];
+        const gprof_ram_t pathRam = { _machine.ram, _machine.ram_base, _machine.ram_size };
+        gprof_exec_path(&pathRam, cp->ttbr0, cp->ttbr1, cp->ttbcr, kVMUserStackTop,
+                        path, sizeof path);
+        proc = gprof_proc_intern(&_profile, ttbr0, path);
+    }
+    const uint32_t pc = _machine.cpu.r[15];
+    gprof_note_in(&_profile, pc,
+                  (_machine.cpu.cpsr & ARM_CPSR_MODE_MASK) == ARM_MODE_USR, proc);
+    uint32_t frames[GPROF_STACK_MAX];
+    const gprof_ram_t ram = { _machine.ram, _machine.ram_base, _machine.ram_size };
+    const unsigned depth = mmu
+        ? gprof_backtrace(&ram, cp->ttbr0, cp->ttbr1, cp->ttbcr, pc,
+                          _machine.cpu.r[14], _machine.cpu.r[7], frames, GPROF_STACK_MAX)
+        : 0u;
+    gprof_note_stack(&_profile, frames, depth, proc);
+}
+
+- (void)guestProfileReportWithCompletion:(void (^)(NSString *report))completion {
+    if (!completion) return;
+    gprof_t *window = calloc(1, sizeof *window);
+    BOOL have = NO;
+    uint64_t shortChunks = 0, sinceNs = 0;
+    const uint64_t nowNs = vm_now_ns();
+    if (_profileReady && window && gprof_init(window, kVMProfileSlotsLog2) &&
+        gprof_init_stacks(window, kVMProfileStacksLog2)) {
+        pthread_mutex_lock(&_profileLock);
+        have = gprof_copy(window, &_profile);
+        shortChunks = _profileShort;
+        sinceNs = _profileSinceNs;
+        if (have) {
+            gprof_reset(&_profile);
+            _profileShort = 0;
+            _profileSinceNs = nowNs;
+        }
+        pthread_mutex_unlock(&_profileLock);
+    }
+    if (!have) {
+        if (window) gprof_free(window);
+        free(window);
+        completion(@"The guest profile is unavailable: its table could not be allocated.");
+        return;
+    }
+    NSString *firmwareDir = [[VMSettings sharedSettings] firmwareDirectory];
+    NSString *revision = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"S5LBoxSourceRevision"] ?: @"development";
+    const double seconds = (nowNs - sinceNs) / 1e9;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *text;
+        @autoreleasepool {
+            text = VMGuestProfileReport(window, shortChunks, seconds, firmwareDir, revision);
+        }
+        gprof_free(window);
+        free(window);
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(text); });
+    });
+}
+
+/*
+ * The whole kexts of the audio paths, from this machine's RAM, with the
+ * kernel functions they reference named. The kernel's linear mapping is
+ * copied here, on the caller's thread, so nothing reads guest RAM after this
+ * returns; cutting out each kext and naming run in the background.
+ */
+/* How much of the kernel's linear mapping is copied: the kernel and every
+ * prelinked kext (the last ones end below 0xc0800000 on iPhone OS 3.1.3), so
+ * any kext can be cut out once the load map is read. A kext window around the
+ * pcs is not enough: AppleEmbeddedAudio and AppleARMPL080DMAC are dumped by
+ * name, and an I2S driver's pcs say nothing about where the AMC's kext is. */
+static const uint32_t kVMKernelWindow = 0x01000000u;
+
+/* Always dumped when the kernelcache names them: the PCM output driver that
+ * prints "could not start DMA", and the DMA controller driver under it. */
+static const char *const kVMAudioKextNames[] = {
+    /* The button driver: how the guest learns the Ring/Silent switch's
+     * position at boot. docs/audio.md, "System sounds play". */
+    "com.apple.driver.AppleM68Buttons",
+};
+
+/* Kexts already analysed, printed by name only. Their dumps differ from run
+ * to run (they include live data), so a hash cannot skip them, and they were
+ * most of the report's length. docs/audio.md has the analysis. */
+static const char *const kVMAnalysedBundles[] = {
+    "com.apple.driver.AppleEmbeddedAudio",
+    "com.apple.driver.AppleARMPL080DMAC",
+    "com.apple.driver.AppleS5L8900X",
+};
+
+/* SHA-256 of kexts already analysed from an earlier report: printed by name
+ * and hash only, so the report stays small enough to paste. A kext whose
+ * bytes differ in any way is dumped in full. */
+static const char *const kVMAnalysedKexts[] = {
+    /* AppleAMC_r1 from iPhone OS 3.1.3: docs/audio.md, 2026-09-24. */
+    "d3611f38c830ab6918e312abd200c368529c0823158dff1554c0b33cfe29626f",
+};
+
+/* Bytes for the report: raw DEFLATE (RFC 1951; zlib's wbits=-15 inflates it),
+ * then base64, since code compresses to about half and SRAM is mostly
+ * zeros. Plain base64 if compression is refused, and the header says which. */
+static NSString *VMPackedBase64(NSData *raw) {
+    NSError *error = nil;
+    NSData *packed = [raw compressedDataUsingAlgorithm:NSDataCompressionAlgorithmZlib
+                                                 error:&error];
+    if (packed.length)
+        return [NSString stringWithFormat:@"deflate-raw+base64 (%lu -> %lu bytes; inflate with zlib wbits=-15):\n%@\n",
+            (unsigned long)raw.length, (unsigned long)packed.length,
+            [packed base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+    return [NSString stringWithFormat:@"base64 (%lu bytes, uncompressed):\n%@\n",
+        (unsigned long)raw.length,
+        [raw base64EncodedStringWithOptions:NSDataBase64Encoding76CharacterLineLength]];
+}
+
+static NSString *VMDriverKextText(const uint8_t *bytes, uint32_t va, uint32_t len,
+                                  const char *label, const ksyms_t *ks) {
+    NSMutableString *out = [NSMutableString string];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes, (CC_LONG)len, digest);
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < sizeof digest; i++) [hex appendFormat:@"%02x", digest[i]];
+    [out appendFormat:@"--- %s va=0x%08x len=0x%x sha256=%@\n", label, va, len, hex];
+    for (size_t i = 0; i < sizeof kVMAnalysedKexts / sizeof kVMAnalysedKexts[0]; i++) {
+        if (![hex isEqualToString:@(kVMAnalysedKexts[i])]) continue;
+        [out appendString:@"bytes omitted: identical to a copy already analysed\n"];
+        return out;
+    }
+
+    enum { kMaxRefs = 16384 };
+    vm_driver_ref_t *refs = calloc(kMaxRefs, sizeof *refs);
+    size_t total = 0, n = 0;
+    if (refs && ks)
+        n = vm_driver_collect_refs(bytes, va, len, 0xc0000000u, 0xc1000000u,
+                                   refs, kMaxRefs, &total);
+    NSMutableString *named = [NSMutableString string];
+    unsigned kept = 0;
+    for (size_t i = 0; i < n; i++) {
+        const vm_driver_ref_t *r = &refs[i];
+        const char *kind = r->kinds == (VM_DRIVER_REF_CALL | VM_DRIVER_REF_WORD) ? "c+w"
+                         : r->kinds == VM_DRIVER_REF_CALL ? "call" : "word";
+        char name[256];
+        const kext_t *other = ksyms_kext_at(ks, r->target);
+        if (other) {
+            /* Other kexts have no symbols; a call into one is still worth
+             * knowing (IOAudioFamily, say), a data word usually is not. */
+            if (!(r->kinds & VM_DRIVER_REF_CALL)) continue;
+            snprintf(name, sizeof name, "%s+0x%x", other->bundle, r->target - other->addr);
+        } else {
+            const char *resolved = ksyms_resolve(ks, r->target, name, sizeof name);
+            /* Only an exact function entry: decoding every alignment turns
+             * data into "branches" that land mid-function. */
+            if (resolved[0] == '?' || strstr(resolved, "+0x") || !strncmp(resolved, "__PRELINK", 9))
+                continue;
+        }
+        [named appendFormat:@"0x%08x %-4s x%u %s\n", r->target, kind, r->count, name];
+        kept++;
+    }
+    free(refs);
+    [out appendFormat:@"kernel references named: %u (of %zu distinct candidates)\n%@",
+        kept, total, named];
+    [out appendString:VMPackedBase64([NSData dataWithBytes:bytes length:len])];
+    return out;
+}
+
+/*
+ * The kernel's SHA-1, from _SHA1Init to the first symbol after the last of
+ * its entry points (capped at 16 KiB): the code-signing check behind every
+ * executable page-in (cs_validate_page -> SHA1UpdateUsePhysicalAddress) and
+ * about 14% of guest time in the bc45a3f profiles. Its static block
+ * transform has no symbol of its own; profiles name it _SHA1Init. Copied so
+ * a native implementation can be checked against the exact code it would
+ * replace. nil when the symbols are missing or outside the copied window.
+ */
+static NSString *VMKernelSha1Text(const ksyms_t *ks, const uint8_t *window,
+                                  uint32_t start, uint32_t end) {
+    static const char *const kNames[] = {
+        "_SHA1Init", "_SHA1Update", "_SHA1UpdateUsePhysicalAddress", "_SHA1Final",
+    };
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (size_t i = 0; i < sizeof kNames / sizeof kNames[0]; i++) {
+        const uint32_t v = ksyms_value(ks, kNames[i]) & ~1u;
+        if (!v) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (lo > hi) return nil;
+    uint32_t stop = hi + 0x400u;            /* no later symbol: a fixed tail */
+    for (unsigned i = 0; i < ks->nsym; i++) {
+        const uint32_t v = ks->sym[i].value & ~1u;
+        if (v > hi && v < stop) stop = v;
+    }
+    if (stop - lo > 0x4000u) stop = lo + 0x4000u;
+    if (lo < start || stop > end) return nil;
+    return [NSString stringWithFormat:
+        @"KERNEL CODE FOR SPEED WORK (this machine's own kernel, for analysis; not stored by NEON)\n"
+        @"SHA-1 behind code-signing page checks: _SHA1Init 0x%08x .. 0x%08x\n%@",
+        lo, stop, VMDriverKextText(window + (lo - start), lo, stop - lo, "mach_kernel SHA-1", ks)];
+}
+
+/*
+ * The audio block's own storage as the driver left it. AMC and its SRAM are
+ * storage stubs (machine.c), not device models, so this is exactly what the
+ * kernel wrote: the AMC registers as a list of the non-zero ones, and the
+ * SRAM as the offsets of its non-empty 1 KiB chunks plus the whole image,
+ * compressed -- whatever the driver uploaded there, firmware or samples.
+ * Copied under no lock: the emulator may be writing, and for a diagnostic a
+ * torn word is acceptable.
+ */
+static NSData *VMStubBytes(const s5l8900_t *m, uint32_t base) {
+    for (unsigned i = 0; i < m->stub_count && i < S5L_STUB_MAX; i++) {
+        const s5l_stub_t *st = &m->stubs[i];
+        if (st->base != base || !st->regs || !st->nregs) continue;
+        NSMutableData *d = [NSMutableData dataWithLength:(NSUInteger)st->nregs * 4u];
+        uint8_t *out = d.mutableBytes;
+        for (uint32_t r = 0; r < st->nregs; r++) {          /* byte i at bits 8i */
+            const uint32_t w = st->regs[r];
+            out[4u * r] = (uint8_t)w;          out[4u * r + 1u] = (uint8_t)(w >> 8);
+            out[4u * r + 2u] = (uint8_t)(w >> 16); out[4u * r + 3u] = (uint8_t)(w >> 24);
+        }
+        [d setLength:st->size];
+        return d;
+    }
+    return nil;
+}
+
+static NSString *VMAudioBlockText(NSData *amc, NSData *sram) {
+    NSMutableString *out = [NSMutableString stringWithString:
+        @"AUDIO BLOCK STATE (what the kernel wrote to AMC and its SRAM; storage stubs, not a device model)\n"];
+    if (!amc) [out appendString:@"amc: no storage window on this machine\n"];
+    else {
+        const uint8_t *b = amc.bytes;
+        unsigned nonzero = 0;
+        NSMutableString *regs = [NSMutableString string];
+        for (NSUInteger off = 0; off + 4u <= amc.length; off += 4u) {
+            const uint32_t v = (uint32_t)b[off] | (uint32_t)b[off + 1u] << 8 |
+                               (uint32_t)b[off + 2u] << 16 | (uint32_t)b[off + 3u] << 24;
+            if (!v) continue;
+            nonzero++;
+            [regs appendFormat:@"  +0x%04lx = 0x%08x\n", (unsigned long)off, v];
+        }
+        [out appendFormat:@"amc 0x%08x len 0x%lx: %u non-zero registers\n%@",
+            S5L8900_AMC_BASE, (unsigned long)amc.length, nonzero, regs];
+    }
+    if (!sram) [out appendString:@"sram: no storage window on this machine\n"];
+    else {
+        const uint8_t *b = sram.bytes;
+        NSMutableString *chunks = [NSMutableString string];
+        unsigned kept = 0;
+        for (NSUInteger off = 0; off < sram.length; off += 1024u) {
+            const NSUInteger len = MIN((NSUInteger)1024u, sram.length - off);
+            BOOL any = NO;
+            for (NSUInteger i = 0; i < len && !any; i++) any = b[off + i] != 0;
+            if (!any) continue;
+            kept++;
+            [chunks appendFormat:@"%s+0x%05lx", kept == 1u ? "" : " ", (unsigned long)off];
+        }
+        [out appendFormat:@"sram 0x%08x len 0x%lx: %u non-empty 1 KiB chunks%@%@\n",
+            S5L8900_SRAM_BASE, (unsigned long)sram.length, kept,
+            kept ? @" at " : @"", chunks];
+        if (kept) [out appendString:VMPackedBase64(sram)];
+    }
+    return out;
+}
+
+/* The same record for the PCM output path: kernel pcs that touched either
+ * I2S window. NO when none has. */
+- (BOOL)pcmPcRangeLo:(uint32_t *)outLo hi:(uint32_t *)outHi
+            accesses:(uint64_t *)outAccesses {
+    s5l_access_entry_t log[S5L_ACCESS_LOG];
+    pthread_mutex_lock(&_lock);
+    memcpy(log, _diagPcm, sizeof log);
+    const uint64_t accesses = _diagPcmAccesses;
+    const uint32_t seenLo = _diagPcmPcLo, seenHi = _diagPcmPcHi;
+    pthread_mutex_unlock(&_lock);
+    uint32_t lo = accesses ? seenLo : UINT32_MAX, hi = accesses ? seenHi : 0u;
+    for (size_t i = 0; i < S5L_ACCESS_LOG; i++) {
+        const s5l_access_entry_t *e = &log[i];
+        if (!e->count || e->pc < 0xc0000000u || e->pc >= 0xc0800000u) continue;
+        if (e->pc < lo) lo = e->pc;
+        if (e->pc > hi) hi = e->pc;
+    }
+    *outLo = lo;
+    *outHi = hi;
+    *outAccesses = accesses;
+    return lo <= hi;
+}
+
+/* What the PCM output path's devices hold, formatted from the copies the
+ * emulator thread published: the I2S access log, both PL080s, both I2S
+ * windows, the codec's written registers and the Ring/Silent switch. */
+- (NSString *)pcmPathStateText {
+    s5l_access_entry_t log[S5L_ACCESS_LOG];
+    s5l_pl080_t dmac[S5L8900_DMAC_COUNT];
+    s5l_i2s_t i2s[S5L8900_I2S_COUNT];
+    s5l_wm8991_t codec;
+    pthread_mutex_lock(&_lock);
+    memcpy(log, _diagPcm, sizeof log);
+    memcpy(dmac, _diagDmac, sizeof dmac);
+    memcpy(i2s, _diagI2s, sizeof i2s);
+    memcpy(&codec, &_diagCodec, sizeof codec);
+    const uint64_t accesses = _diagPcmAccesses;
+    const BOOL silent = _buttons[VMButtonRingerSilent];
+    pthread_mutex_unlock(&_lock);
+    NSMutableString *out = [NSMutableString stringWithFormat:
+        @"PCM PATH STATE (the I2S windows and the DMA controllers that feed them)\n"
+        @"I2S accesses from kernel code: %llu. Most recent distinct accesses first:\n",
+        (unsigned long long)accesses];
+    char text[4096];
+    (void)s5l_access_log_describe(log, S5L_ACCESS_LOG, S5L_ACCESS_LOG, text, sizeof text);
+    [out appendFormat:@"%s", text];
+    static const char *const dmacNames[S5L8900_DMAC_COUNT] = { "dmac0", "dmac1" };
+    for (unsigned i = 0; i < S5L8900_DMAC_COUNT; i++) {
+        (void)s5l_pl080_describe(&dmac[i], dmacNames[i], text, sizeof text);
+        [out appendFormat:@"%s", text];
+    }
+    static const char *const i2sNames[S5L8900_I2S_COUNT] = { "i2s0", "i2s1" };
+    for (unsigned i = 0; i < S5L8900_I2S_COUNT; i++) {
+        (void)s5l_i2s_describe(&i2s[i], i2sNames[i], text, sizeof text);
+        [out appendFormat:@"%s", text];
+    }
+    /* The codec the samples go to, and the switch that silences system
+     * sounds: the two things between "the engine runs" and "a sound plays"
+     * that a report can see. */
+    (void)s5l_wm8991_describe(&codec, text, sizeof text);
+    [out appendFormat:@"%s", text];
+    [out appendFormat:@"Ring/Silent switch as set in the app: %@\n",
+        silent ? @"Silent" : @"Ring (or never moved)"];
+    return out;
+}
+
+- (void)audioDriverDumpWithCompletion:(void (^)(NSString *text))completion {
+    if (!completion) return;
+    NSData *amcBytes = VMStubBytes(&_machine, S5L8900_AMC_BASE);
+    NSData *sramBytes = VMStubBytes(&_machine, S5L8900_SRAM_BASE);
+    NSString *pcmState = [self pcmPathStateText];
+    uint32_t lo = 0, hi = 0, pcmLo = 0, pcmHi = 0;
+    uint64_t accesses = 0, pcmAccesses = 0;
+    const BOOL amcSeen = [self audioPcRangeLo:&lo hi:&hi accesses:&accesses];
+    const BOOL pcmSeen = [self pcmPcRangeLo:&pcmLo hi:&pcmHi accesses:&pcmAccesses];
+    /* The whole kernelcache region, so any kext can be cut out of it once the
+     * load map is read (off this thread): the kernel maps 0xc0000000 ->
+     * physical 0x08000000 linearly. */
+    const uint32_t kbase = 0xc0000000u, pbase = 0x08000000u;
+    const uint64_t ramLo = _machine.ram_base, ramHi = ramLo + _machine.ram_size;
+    uint32_t start = kbase, end = kbase + kVMKernelWindow;
+    if ((uint64_t)pbase < ramLo) start += (uint32_t)(ramLo - pbase);
+    if ((uint64_t)end - kbase + pbase > ramHi) end = (uint32_t)(ramHi - pbase + kbase);
+    if (!_machine.ram || end <= start) {
+        completion([NSString stringWithFormat:@"AUDIO DRIVER: the kernel is not where this build expects it in guest RAM.\n\n%@\n%@",
+                    pcmState, VMAudioBlockText(amcBytes, sramBytes)]);
+        return;
+    }
+    const uint64_t pa = (uint64_t)start - kbase + pbase;
+    NSData *window = [NSData dataWithBytes:_machine.ram + (pa - ramLo) length:end - start];
+    NSString *firmwareDir = [[VMSettings sharedSettings] firmwareDirectory];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableString *out = [NSMutableString string];
+        @autoreleasepool {
+            [out appendString:@"AUDIO DRIVER (kernel code from this machine's own firmware, for register analysis; not stored by NEON)\n"];
+            if (amcSeen)
+                [out appendFormat:@"audio pcs=0x%08x..0x%08x accesses=%llu\n", lo, hi,
+                    (unsigned long long)accesses];
+            else
+                [out appendString:@"audio pcs: no kernel code has touched the AMC or its SRAM in this run\n"];
+            if (pcmSeen)
+                [out appendFormat:@"pcm pcs=0x%08x..0x%08x accesses=%llu\n", pcmLo, pcmHi,
+                    (unsigned long long)pcmAccesses];
+            else
+                [out appendString:@"pcm pcs: no kernel code has touched the I2S windows in this run\n"];
+            NS_VALID_UNTIL_END_OF_SCOPE NSData *kernel = nil;
+            ksyms_t *ks = VMLoadKernelSymbols(firmwareDir, &kernel);
+            enum { kMaxKexts = 8 };
+            const kext_t *kexts[kMaxKexts];
+            unsigned nk = 0;
+            const uint32_t owners[4] = { lo, hi, pcmLo, pcmHi };
+            const BOOL ownerSeen[4] = { amcSeen, amcSeen, pcmSeen, pcmSeen };
+            for (unsigned i = 0; ks && i < 4u; i++) {
+                const kext_t *k = ownerSeen[i] ? ksyms_kext_at(ks, owners[i]) : NULL;
+                BOOL dup = NO;
+                for (unsigned j = 0; j < nk; j++) dup |= kexts[j] == k;
+                if (k && !dup && nk < kMaxKexts) kexts[nk++] = k;
+            }
+            for (size_t n = 0; ks && n < sizeof kVMAudioKextNames / sizeof kVMAudioKextNames[0]; n++) {
+                for (unsigned i = 0; i < ks->nkext; i++) {
+                    const kext_t *k = &ks->kext[i];
+                    if (!k->has_exec || strcmp(k->bundle, kVMAudioKextNames[n])) continue;
+                    BOOL dup = NO;
+                    for (unsigned j = 0; j < nk; j++) dup |= kexts[j] == k;
+                    if (!dup && nk < kMaxKexts) kexts[nk++] = k;
+                    break;
+                }
+            }
+            BOOL any = NO;
+            for (unsigned i = 0; i < nk; i++) {
+                const kext_t *k = kexts[i];
+                uint32_t ks0 = k->addr, ks1 = k->addr + k->size;
+                BOOL clipped = ks0 < start || ks1 > end;
+                if (ks0 < start) ks0 = start;
+                if (ks1 > end) ks1 = end;
+                if (ks1 <= ks0) continue;
+                BOOL analysed = NO;
+                for (size_t b = 0; b < sizeof kVMAnalysedBundles / sizeof kVMAnalysedBundles[0]; b++)
+                    analysed |= strcmp(k->bundle, kVMAnalysedBundles[b]) == 0;
+                if (analysed) {
+                    [out appendFormat:@"--- %s va=0x%08x len=0x%x: already analysed, bytes omitted\n",
+                        k->bundle, k->addr, k->size];
+                    any = YES;
+                    continue;
+                }
+                char label[160];
+                snprintf(label, sizeof label, "%s%s", k->bundle,
+                         clipped ? " (clipped to the copied window)" : "");
+                [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (ks0 - start),
+                                                   ks0, ks1 - ks0, label, ks)];
+                any = YES;
+            }
+            if (!any && amcSeen) {
+                /* No kext map: the old excerpt's window, named as such. */
+                uint32_t w0 = (lo - 0x4000u) & ~0xfu, w1 = (hi + 0x2000u + 0xfu) & ~0xfu;
+                if (w0 < start) w0 = start;
+                if (w1 > end) w1 = end;
+                if (w1 - w0 > 0x8000u) w1 = w0 + 0x8000u;
+                if (w1 > w0)
+                    [out appendString:VMDriverKextText((const uint8_t *)window.bytes + (w0 - start),
+                                                       w0, w1 - w0,
+                                                       ks ? "window (no kext owns these pcs)"
+                                                          : "window (no kernel.macho to map kexts)",
+                                                       ks)];
+            } else if (!any) {
+                [out appendString:ks ? @"no audio kext found in the kernelcache's load map\n"
+                                     : @"no kernel.macho to map kexts\n"];
+            }
+            NSString *hot = ks ? VMKernelSha1Text(ks, (const uint8_t *)window.bytes, start, end) : nil;
+            VMFreeKernelSymbols(ks);
+            [out appendFormat:@"\n%@\n%@", pcmState, VMAudioBlockText(amcBytes, sramBytes)];
+            if (hot) [out appendFormat:@"\n=== %@", hot];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(out); });
+    });
 }
 
 - (NSString *)audioStatusDescription {

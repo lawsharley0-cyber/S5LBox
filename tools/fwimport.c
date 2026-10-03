@@ -83,7 +83,9 @@ static void *out_open(void *ctx, const char *name) {
     char path[1200];
     if (!safe_name(name)) return NULL;
     snprintf(path, sizeof path, "%s/%s", o->dir, name);
-    return fopen(path, "wb");
+    /* Read back as well as written: the root filesystem's disk image is
+     * staged here and then read through the decrypting reader. */
+    return fopen(path, "w+b");
 }
 static bool out_write(void *ctx, void *h, const uint8_t *d, size_t n) {
     (void)ctx;
@@ -143,6 +145,7 @@ int main(int argc, char **argv) {
             "  --kernel <key> <iv>    IMG3 key and IV for the kernelcache\n"
             "  --devicetree <key> <iv>  the same for the device tree\n"
             "  --rootfs <key>         the root filesystem key\n"
+            "  --3gs                  accept iPhone 3GS (iOS 6 preview) firmware\n"
             "\n"
             "Keys are taken from the command line and held in memory only.\n"
             "They are never written anywhere, and nor is the archive.\n"
@@ -174,8 +177,11 @@ int main(int argc, char **argv) {
     vm_fw_keys_clear(&keys);
     bool have_keys = false;
     const char *outdir = NULL;
+    bool accept_3gs = false;
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--out") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--3gs")) {
+            accept_3gs = true;
+        } else if (!strcmp(argv[i], "--out") && i + 1 < argc) {
             outdir = argv[++i];
         } else if (!strcmp(argv[i], "--kernel") && i + 2 < argc) {
             if (vm_fw_keys_set_img3(&keys, VM_FW_KERNEL, argv[i + 1],
@@ -222,6 +228,7 @@ int main(int argc, char **argv) {
     in.files       = outdir ? &files : NULL;
     in.keys        = have_keys ? &keys : NULL;
     in.progress    = on_progress;
+    in.accept_iphone_3gs = accept_3gs;
 
     vm_fw_report_t rep;
     memset(&rep, 0, sizeof rep);
