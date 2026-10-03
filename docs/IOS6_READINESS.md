@@ -990,6 +990,63 @@ list, the memory-disk patch), so the phone runs what was measured here.
 
 An iOS 6 kernel in the folder still boots the preview, as before.
 
+#### Sound (#60)
+
+The first app build on a phone booted and ran but was silent. Three things
+stood between iPhone OS 3.1.3 and the speaker, found in that order with
+boot3gs's `-X` (who called this) and `-C` (which blocks ran) and the kernel's
+own code:
+
+1. **The codec's driver never finished starting.** AppleCS42L61Audio
+   waits for the "mikey" platform function, which AppleCD3272Mikey
+   publishes only once the CD3272 headset controller answers on i2c0
+   (0x39). Mikey and the CS42L61 (0x4A) are now register files on i2c0.
+2. **The sample rate came out as 0 Hz.** A clock-change message
+   (0xE3FF8001, from AppleS5L8920X) makes the audio driver ask the codec's
+   "mclk_frequency" function for the master clock, which the audio complex
+   reports by reading its NCO back (+0x18, +0x1C at 0x84300000; see
+   n88.h, "Sound"), and divide it by the 64 bits of a frame. Unmodelled, the
+   NCO read 0, the rate was 0, and the codec refused it (0xE00002C2,
+   AppleEmbeddedAudio+0x3cc0). The audio complex and the I2S ports are now
+   stored and read back, and the NCO also sets the rate the model plays at.
+3. **CDMA could not play a sound.** iPhone OS feeds i2s0 through CDMA
+   channel 21, a peripheral request with the port's address as its FIFO.
+   The engine completed every peripheral request at once, so a sound's
+   whole chain vanished in an instant; worse, AppleCDMA stops a channel
+   with CSR bit 2 and waits for bit 21, which nothing set, so the first
+   sound's stop hung its thread in a loop. CDMA now has *paced* channels
+   (cdma.h): a channel whose FIFO is an I2S port runs through its chain
+   only as the port plays it, one 4-octet frame (16-bit left and right;
+   the channel's transfer size is 2 octets) per period of the sample rate,
+   raising bit 20 past each descriptor marked 0x300 (the end of a queued
+   command) and stopping, done, at the terminator; it answers the pause
+   (bit 5) the driver uses to read the play position (+0x10) and the stop
+   (bit 2, acknowledged in bit 21). The next frame boundary that raises a
+   line is a time event like the decrementer, so a waiting core wakes for
+   it and the interrupt arrives when the sound has played, not before.
+
+Measured with boot3gs `-A` (i2s0 to a WAV file): after a slide to unlock
+the guest plays 20,939 frames that correlate 0.94 with the root
+filesystem's own `unlock.caf` (20,800 frames, 44.1 kHz) at zero lag and a
+gain of 0.92 (the system volume), and the lock button gives 17,556 frames
+correlating 0.95 with `lock.caf` (17,600 frames). The difference is the
+system's output processing, not the path: the format, the rate and the
+order of the samples are the file's. Unlike the 3G, no move of the ring
+switch is needed first; with the switch at silent the unlock is silent, as
+on a phone.
+
+In the app, VMN88Engine hands i2s0's frames to the same VMAudioOutput the
+3G machines use (44.1 kHz 16-bit stereo; another rate is matched by
+repeating or dropping frames), paused with the machine. When the host is
+slower than the guest needs, the speaker runs dry and fills with silence;
+nothing waits for it.
+
+Not yet: the microphone (a peripheral-to-memory request on these
+channels), the headset (Mikey reads as nothing plugged in), the voice and
+baseband ports (i2s1 and i2s2 play their frames nowhere), and the codec's
+own registers have no effect (the volume the guest sets is already in its
+samples).
+
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 
 This was the step the keybag work stopped short of. It turns out not to

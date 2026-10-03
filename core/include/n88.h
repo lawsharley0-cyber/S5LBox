@@ -203,9 +203,12 @@
 /*
  * The I2C controllers (s5l8920_i2c.h): /arm-io/i2c0 at 0x83200000, line
  * 0x13, and /arm-io/i2c2 at 0x83400000, line 0x11. On i2c0, as the tree
- * places them: the LIS331DL accelerometer (0x1D) and the D1755 PMU (0x74).
- * The other devices there (compass, CS42L61 codec, Mikey, tethered) and
- * i2c2's light sensor do not acknowledge.
+ * places them: the LIS331DL accelerometer (0x1D), the D1755 PMU (0x74), the
+ * CS42L61 codec (0x4A) and the CD3272 "Mikey" headset controller (0x39),
+ * each a register file. The codec's driver does not finish starting until
+ * Mikey answers: it waits for Mikey's driver to publish its "mikey"
+ * platform function, which needs a device on the bus. The other devices
+ * there (compass, tethered) and i2c2's light sensor do not acknowledge.
  */
 #define N88_I2C0_PA       UINT32_C(0x83200000)
 #define N88_I2C2_PA       UINT32_C(0x83400000)
@@ -213,6 +216,52 @@
 #define N88_I2C2_LINE     0x11u
 #define N88_ACCEL_ADDR    0x1du
 #define N88_PMU_ADDR      0x74u
+#define N88_MIKEY_ADDR    0x39u
+#define N88_CODEC_ADDR    0x4au
+
+/*
+ * Sound, as iPhone OS 3.1.3 plays it on the 3GS. Read from the kernelcache:
+ *
+ * The audio complex (/arm-io/audio-complex, AppleS5L8920XAudioComplex: reg
+ * 0x84300000 + 0x5000 and 0x84400000 + 0x1000) makes the I2S ports' master
+ * clock with an NCO: to set a frequency f (0xc067832c) the driver writes
+ * +0x18 = 2f, +0x1c = 2f - ref (ref the "ncoRef" it logs, N88_NCOREF_HZ) and
+ * +0x14 = 0xD00; to report one (0xc06784f4) it reads +0x18 and +0x1c back
+ * and returns ref * [+0x18] / ([+0x18] - [+0x1c]) / 2. The codec's driver
+ * asks for that frequency (its "mclk_frequency" platform function) and
+ * divides it by the bits in a frame (64: 32-bit slots, two of them, from
+ * i2s0/audio0's reg) to get the sample rate it then sets; a window that
+ * reads 0 makes that rate 0 Hz, which the codec refuses (0xE00002C2), and
+ * nothing plays. So both windows are stored and read back, and the NCO
+ * decides the rate the ports play at (N88_AUDIO_HZ until it is set).
+ *
+ * The I2S ports (AppleS5L8920XI2SController: i2s0 at 0x84500000, the
+ * codec's; i2s1 and i2s2, voice and baseband, after it): configured with
+ * stores the driver never reads back; stored likewise. Their sample path is
+ * CDMA (cdma.h, "paced channels"): the audio complex starts a channel
+ * (21 for i2s0) whose FIFO address is the port's base. Each port plays one
+ * frame -- N88_AUDIO_FRAME_BYTES, 16-bit left then right: the channel's
+ * transfer size, +0x4 = 0xA6, is 2 octets -- per period of the sample rate
+ * from a running channel; i2s0's go to the sink (n88_set_audio_sink), the
+ * others nowhere. With no running channel a port's frames pass silently.
+ */
+#define N88_ACX_AHB_PA    UINT32_C(0x84300000)
+#define N88_ACX_AHB_SIZE  UINT32_C(0x5000)
+#define N88_ACX_APB_PA    UINT32_C(0x84400000)
+#define N88_ACX_APB_SIZE  UINT32_C(0x1000)
+#define N88_ACX_NCO_A     0x18u
+#define N88_ACX_NCO_B     0x1cu
+#define N88_I2S_PA        UINT32_C(0x84500000)
+#define N88_I2S_SIZE      UINT32_C(0x1000)
+#define N88_I2S_PORTS     3u
+#define N88_AUDIO_HZ      44100u
+#define N88_AUDIO_BITS_PER_FRAME 64u
+#define N88_AUDIO_FRAME_BYTES    4u
+
+/* i2s0's frames as it plays them: `count` frames, each a 32-bit word with the
+ * left sample in the low half, at `rate` frames a second. Called on the
+ * machine's thread. */
+typedef void (*n88_audio_fn)(void *ctx, const uint32_t *frames, size_t count, uint32_t rate);
 
 #define N88_SPI0_PA       UINT32_C(0x82000000)
 #define N88_SPI0_SIZE     UINT32_C(0x1000)
@@ -379,6 +428,18 @@ typedef struct n88 {
     s5l8920_i2c_t i2c0, i2c2;       /* the I2C controllers                    */
     i2c_regfile_t accel;            /* LIS331DL on i2c0                       */
     i2c_regfile_t pmu;              /* D1755 on i2c0                          */
+    i2c_regfile_t mikey;            /* CD3272 (headset) on i2c0               */
+    i2c_regfile_t codec;            /* CS42L61 on i2c0                        */
+    uint32_t acx_ahb[N88_ACX_AHB_SIZE / 4u];    /* the audio complex, stored */
+    uint32_t acx_apb[N88_ACX_APB_SIZE / 4u];
+    uint32_t i2s[N88_I2S_PORTS][N88_I2S_SIZE / 4u];
+    uint64_t audio_tick;            /* the timebase tick sound is played to   */
+    uint64_t audio_frac;            /* and the fraction of a frame past it    */
+    uint64_t audio_due;             /* the cycle a channel next raises a line */
+    uint64_t audio_frames;          /* i2s0 frames played from memory         */
+    uint64_t audio_silent;          /* and with nothing to play               */
+    n88_audio_fn audio_fn;
+    void        *audio_ctx;
     s5l8920_dart_t dart0, dart1;    /* I/O address translation                */
     s5l8920_dsim_t dsim;            /* the MIPI-DSI master                    */
     uint8_t  *scanout;              /* the screen gathered through dart0      */
@@ -494,6 +555,11 @@ bool n88_asleep(const n88_t *m);
 /* Set the RTC to `seconds` since the Unix epoch, from now on in guest time. */
 void     n88_set_rtc(n88_t *m, uint32_t seconds);
 uint32_t n88_rtc(const n88_t *m);
+
+/* Where i2s0's frames go (NULL: nowhere). Kept across n88_boot. */
+void n88_set_audio_sink(n88_t *m, n88_audio_fn fn, void *ctx);
+/* The rate the ports play at now: the NCO's, or N88_AUDIO_HZ. */
+uint32_t n88_audio_rate(const n88_t *m);
 
 /* The bus, for tests and the harness: the same routing the CPU sees. */
 uint32_t n88_read32(n88_t *m, uint32_t pa);

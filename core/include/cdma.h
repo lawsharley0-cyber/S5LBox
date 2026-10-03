@@ -71,10 +71,36 @@
  *   driver starts channel 18 before it sets the port's DMA bit (SETUP 0x4018,
  *   then 0x4058), which on hardware is the request line the channel waits on.
  *
- * Not modelled: time (a request completes when it can run: a memory-to-
- * memory pair when its second channel starts, a peripheral one at once),
- * peripheral-to-memory transfers, pausing, and the IV the hardware leaves
- * behind (the driver writes it for every request).
+ * PACED CHANNELS: AUDIO. iPhone OS 3.1.3 plays sound through channel 21
+ * (the audio complex's `dma-channels`, 0x15..0x18): CSR 0x18 then 0x19,
+ * +0x4 = 0xA6, +0x8 = the I2S port (0x84500000 for i2s0, the codec's), and
+ * a chain built by AppleCDMA's queue routine (0xc05252a8): each queued
+ * command is one or more data descriptors in the ring, the last of them
+ * marked 0x300 (a one-descriptor command is 0x303, the first of a longer one
+ * 0x003), with a zero-command terminator after the newest. Its interrupt
+ * handler (0xc0525450) acknowledges CSR bits 19 and 20 together and
+ * completes every command before CAR's index, and it never restarts the
+ * channel; so the engine must carry on past a marked descriptor on its own,
+ * raising bit 20 there, and stop only at the terminator (bit 19, CAR left
+ * on it, where the next queued command is linked before CSR = 0x19 starts
+ * it again). Two more controls, from the same kext:
+ *   - position (0xc05254c0): CSR |= 0x20 (bit 5, pause), wait while the
+ *     state reads 1, then read +0x10 -- the address of the next octet in the
+ *     descriptor at CAR -- to split that descriptor, and restart with bit 5
+ *     clear and bit 0 set; the engine reloads from CAR.
+ *   - stop (0xc05255d0): CSR |= 4 (bit 2), wait for bit 21, then CSR = 2
+ *     (abort) and CSR |= 0x18.
+ * A device that drains its FIFO at its own pace (cdma_set_paced) claims
+ * such a channel: starting it delivers nothing, and the device takes the
+ * data as it plays with cdma_pull(); cdma_bytes_to_event() says how much it
+ * may take before the channel next raises a line. The same CSR semantics
+ * (bits 2, 5, 20, 21) apply to every channel; only a paced channel can be
+ * caught running when the driver asks.
+ *
+ * Not modelled: time for anything but a paced channel (a request completes
+ * when it can run: a memory-to-memory pair when its second channel starts,
+ * a peripheral one at once), peripheral-to-memory transfers, and the IV the
+ * hardware leaves behind (the driver writes it for every request).
  *
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
@@ -92,21 +118,29 @@
 #define CDMA_CSR             0x00u
 #define CDMA_DAR             0x08u      /* a peripheral request's FIFO      */
 #define CDMA_DBR             0x0cu
+#define CDMA_CUR             0x10u      /* the next octet, in the desc at CAR */
 #define CDMA_CAR             0x14u
 #define CDMA_ERR             0x18u
 
 #define CDMA_CSR_GO          (1u << 0)
 #define CDMA_CSR_ABORT       (1u << 1)
+#define CDMA_CSR_STOP        (1u << 2)  /* acknowledged in CDMA_CSR_STOPPED  */
 #define CDMA_CSR_IRQ_ENABLE  (1u << 3)
+#define CDMA_CSR_PAUSE       (1u << 5)
 #define CDMA_CSR_M2M         (1u << 7)
 #define CDMA_CSR_CTX_SHIFT   8u
 #define CDMA_CSR_RUNNING     (1u << 16)
+#define CDMA_CSR_PAUSED      (2u << 16)
 #define CDMA_CSR_STATE       (3u << 16)
 #define CDMA_CSR_ERROR       (1u << 18)
 #define CDMA_CSR_DONE        (1u << 19)
+#define CDMA_CSR_SEGMENT     (1u << 20) /* a marked descriptor finished      */
+#define CDMA_CSR_STOPPED     (1u << 21)
+#define CDMA_CSR_STATUS      (CDMA_CSR_ERROR | CDMA_CSR_DONE | CDMA_CSR_SEGMENT)
 
 #define CDMA_CMD_DATA        3u
-#define CDMA_CMD_LAST        (1u << 8)
+#define CDMA_CMD_LAST        (1u << 8)  /* ends a request; a paced channel's
+                                         * interrupt point (see above)      */
 
 #define CDMA_AES_ENCRYPT     (1u << 16)
 #define CDMA_AES_CBC         (1u << 17)
@@ -130,6 +164,10 @@ typedef bool (*cdma_mem_fn)(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, 
  * when such a device took it, false when no device is there. */
 typedef bool (*cdma_periph_fn)(void *ctx, uint32_t fifo, const uint8_t *data, uint32_t len);
 
+/* True when the device whose FIFO is at `fifo` drains it at its own pace and
+ * pulls its requests with cdma_pull(). */
+typedef bool (*cdma_paced_fn)(void *ctx, uint32_t fifo);
+
 typedef struct {
     uint32_t    ch[CDMA_CHANNELS][8];   /* each channel's registers +0..+0x1c */
     uint32_t    enabled[2];             /* the global page's enable bits      */
@@ -138,10 +176,13 @@ typedef struct {
     void       *mem_ctx;
     cdma_periph_fn periph;
     void          *periph_ctx;
+    cdma_paced_fn  paced;
+    void          *paced_ctx;
     uint8_t    *buf;                    /* one transfer, CDMA_MAX_TRANSFER    */
 
     uint64_t    transfers, octets, aes_ops, hardware_key_ops, errors;
     uint64_t    periph_transfers, periph_octets, periph_unclaimed;
+    uint64_t    paced_octets;
 } cdma_t;
 
 /* false if the transfer buffer cannot be allocated. */
@@ -155,13 +196,29 @@ void cdma_set_peripheral(cdma_t *d, cdma_periph_fn fn, void *ctx);
  * that was not ready to take it when the channel started (a FIFO whose DMA
  * request is not yet enabled), call when that changes. */
 void cdma_retry(cdma_t *d);
+/* Which FIFOs are paced (NULL: none). */
+void cdma_set_paced(cdma_t *d, cdma_paced_fn fn, void *ctx);
+
+/* True while channel n is a running paced request. */
+bool cdma_paced_running(const cdma_t *d, unsigned n);
+/* Up to `len` octets of paced channel n's data into `out`, as its device
+ * plays them: the channel moves through its chain, raising CDMA_CSR_SEGMENT
+ * past each marked descriptor and stopping, done, at the terminator (or in
+ * error at a descriptor that is not memory). Returns how many it delivered,
+ * fewer than `len` once it stops. */
+uint32_t cdma_pull(cdma_t *d, unsigned n, uint8_t *out, uint32_t len);
+/* How many octets paced channel n delivers before it next raises a line (a
+ * marked descriptor finishing, or the last one before the terminator), at
+ * most `cap`; 0 when it is not running. */
+uint32_t cdma_bytes_to_event(const cdma_t *d, unsigned n, uint32_t cap);
 
 uint32_t cdma_read(cdma_t *d, uint32_t off);
 void     cdma_write(cdma_t *d, uint32_t off, uint32_t v);
 uint32_t cdma_aes_read(const cdma_t *d, uint32_t off);
 void     cdma_aes_write(cdma_t *d, uint32_t off, uint32_t v);
 
-/* Channel n's interrupt level: done or error with its interrupt enabled. */
+/* Channel n's interrupt level: done, error or a marked descriptor finished,
+ * with its interrupt enabled. */
 bool cdma_irq(const cdma_t *d, unsigned n);
 
 #endif /* NEON_CDMA_H */

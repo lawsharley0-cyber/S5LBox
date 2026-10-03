@@ -134,8 +134,11 @@ static int input_at(uint32_t reg) {
     return -1;
 }
 
+static void audio_update(n88_t *m);
+
 /* Everything time moves: expire the decrementer if its interval has passed
- * (line 6), start display frames that are due (line 0x25). */
+ * (line 6), start display frames that are due (line 0x25), play the I2S
+ * ports up to now (their CDMA channels' lines). */
 static void timer_update(n88_t *m) {
     const uint64_t now = n88_timer_count(m);
     if (m->timer.armed && now - m->timer.start >= m->timer.interval) {
@@ -147,18 +150,21 @@ static void timer_update(n88_t *m) {
                      m->timer.pending && (m->timer.ctrl & 1u));
     m2clcd_advance(&m->clcd, now);
     s5l_vic_set_line(&m->vic[N88_CLCD_LINE / 32u], N88_CLCD_LINE % 32u, m2clcd_irq(&m->clcd));
+    audio_update(m);
     irq_update(m);
     gpio_lines(m);
 }
 
-/* The first cycle at which time raises a line -- the decrementer expiring
- * or an enabled display frame starting -- or UINT64_MAX. */
+/* The first cycle at which time raises a line -- the decrementer expiring,
+ * an enabled display frame starting, or a playing CDMA channel reaching an
+ * interrupt -- or UINT64_MAX. */
 static uint64_t timer_due_cycles(const n88_t *m) {
     uint64_t due = m->timer.armed
         ? (m->timer.start + m->timer.interval) * N88_CYCLES_PER_TICK : UINT64_MAX;
     const uint64_t frame = m2clcd_due(&m->clcd);
     if (frame != UINT64_MAX && frame * N88_CYCLES_PER_TICK < due)
         due = frame * N88_CYCLES_PER_TICK;
+    if (m->audio_due < due) due = m->audio_due;
     return due;
 }
 
@@ -221,6 +227,18 @@ static bool in_sha1(uint32_t pa) {
     return pa >= N88_SHA1_PA && pa < N88_SHA1_PA + S5L_SHA1_SIZE;
 }
 
+static bool in_acx_ahb(uint32_t pa) {
+    return pa >= N88_ACX_AHB_PA && pa - N88_ACX_AHB_PA < N88_ACX_AHB_SIZE;
+}
+
+static bool in_acx_apb(uint32_t pa) {
+    return pa >= N88_ACX_APB_PA && pa - N88_ACX_APB_PA < N88_ACX_APB_SIZE;
+}
+
+static bool in_i2s(uint32_t pa) {
+    return pa >= N88_I2S_PA && pa - N88_I2S_PA < N88_I2S_PORTS * N88_I2S_SIZE;
+}
+
 /* The engine's view of memory: DRAM only, and a write tells the cached
  * interpreter, as a CPU store does, in case it lands on translated code. */
 static bool cdma_mem(void *ctx, uint32_t pa, uint8_t *buf, uint32_t len, bool write) {
@@ -268,6 +286,93 @@ static void cdma_lines(n88_t *m) {
     }
 }
 
+/* -------------------------------------------------------------- sound */
+/* See "Sound" in n88.h. */
+
+/* The I2S ports drain their FIFOs at the sample rate: CDMA paces a request
+ * whose FIFO is a port's. */
+static bool audio_fifo(void *ctx, uint32_t fifo) {
+    (void)ctx;
+    return in_i2s(fifo);
+}
+
+uint32_t n88_audio_rate(const n88_t *m) {
+    const uint32_t a = m->acx_ahb[N88_ACX_NCO_A / 4u], b = m->acx_ahb[N88_ACX_NCO_B / 4u];
+    const uint32_t step = a - b;               /* the driver's ref, mod 2^32 */
+    if (!a || !step) return N88_AUDIO_HZ;
+    const uint64_t mclk = (uint64_t)N88_NCOREF_HZ * a / step / 2u;
+    const uint64_t rate = mclk / N88_AUDIO_BITS_PER_FRAME;
+    return rate >= 4000u && rate <= 192000u ? (uint32_t)rate : N88_AUDIO_HZ;
+}
+
+void n88_set_audio_sink(n88_t *m, n88_audio_fn fn, void *ctx) {
+    if (!m) return;
+    m->audio_fn = fn;
+    m->audio_ctx = ctx;
+}
+
+/* How far ahead a playing channel is planned: past this many octets without
+ * an interrupt, time is looked at again anyway. */
+#define AUDIO_PLAN_CAP   (UINT32_C(1) << 16)
+#define AUDIO_CHUNK      1024u                  /* frames per pull */
+
+/* When the first playing channel next raises a line. */
+static void audio_plan(n88_t *m) {
+    m->audio_due = UINT64_MAX;
+    const uint32_t rate = n88_audio_rate(m);
+    for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
+        if (!cdma_paced_running(&m->cdma, n)) continue;
+        const uint32_t bytes = cdma_bytes_to_event(&m->cdma, n, AUDIO_PLAN_CAP);
+        uint64_t frames = (bytes + N88_AUDIO_FRAME_BYTES - 1u) / N88_AUDIO_FRAME_BYTES;
+        if (!frames) frames = 1u;
+        /* The first tick by which `frames` more have been played. */
+        const uint64_t need = frames * N88_TB_HZ - m->audio_frac;
+        const uint64_t due = (m->audio_tick + (need + rate - 1u) / rate) * N88_CYCLES_PER_TICK;
+        if (due < m->audio_due) m->audio_due = due;
+    }
+}
+
+/* Play the ports up to now: every frame period since the last call takes
+ * one frame from each port's playing channel. */
+static void audio_update(n88_t *m) {
+    const uint64_t now = n88_timer_count(m);
+    if (now <= m->audio_tick) return;
+    const uint32_t rate = n88_audio_rate(m);
+    const uint64_t num = (now - m->audio_tick) * rate + m->audio_frac;
+    const uint64_t frames = num / N88_TB_HZ;
+    m->audio_frac = num % N88_TB_HZ;
+    m->audio_tick = now;
+    if (!frames) return;
+    uint64_t played = 0;
+    bool any = false;
+    for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
+        if (!cdma_paced_running(&m->cdma, n)) continue;
+        any = true;
+        const bool codec = m->cdma.ch[n][CDMA_DAR / 4u] - N88_I2S_PA < N88_I2S_SIZE;
+        uint64_t left = frames;
+        while (left) {
+            uint8_t raw[AUDIO_CHUNK * N88_AUDIO_FRAME_BYTES];
+            uint32_t words[AUDIO_CHUNK];
+            const uint32_t want = left < AUDIO_CHUNK ? (uint32_t)left : AUDIO_CHUNK;
+            const uint32_t got =
+                cdma_pull(&m->cdma, n, raw, want * N88_AUDIO_FRAME_BYTES) / N88_AUDIO_FRAME_BYTES;
+            if (codec && got) {
+                for (uint32_t i = 0; i < got; i++) words[i] = ld32(raw + 4u * i);
+                if (m->audio_fn) m->audio_fn(m->audio_ctx, words, got, rate);
+                played += got;
+            }
+            left -= got;
+            if (got < want) break;              /* the request ended */
+        }
+    }
+    m->audio_frames += played;
+    m->audio_silent += frames - (played < frames ? played : frames);
+    if (any) {
+        cdma_lines(m);
+        audio_plan(m);
+    }
+}
+
 static void i2c_lines(n88_t *m) {
     s5l_vic_set_line(&m->vic[0], N88_I2C0_LINE, s5l8920_i2c_irq(&m->i2c0));
     s5l_vic_set_line(&m->vic[0], N88_I2C2_LINE, s5l8920_i2c_irq(&m->i2c2));
@@ -304,6 +409,8 @@ static void i2c_devices_reset(n88_t *m) {
     m->pmu.on_write = pmu_write;
     m->pmu.ctx = m;
     m->pmu.reg[N88_PMU_LDO] = N88_PMU_LDO_TOUCH;    /* matches the boot's power */
+    i2c_regfile_init(&m->mikey, N88_MIKEY_ADDR);
+    i2c_regfile_init(&m->codec, N88_CODEC_ADDR);
 }
 
 uint32_t n88_rtc(const n88_t *m) {
@@ -356,6 +463,7 @@ static void wake(n88_t *m, n88_input_t in) {
     m->cpu.r[15] = N88_DRAM_BASE;
     m->asleep = false;
     m->wakes++;
+    m->audio_tick = n88_timer_count(m);         /* nothing played asleep */
     timer_update(m);
 }
 
@@ -451,6 +559,18 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         if (in >= 0 && !pad_output(v)) v = (v & ~1u) | (input_level(m, (unsigned)in) ? 1u : 0u);
         return v;
     }
+    if (in_acx_ahb(pa)) {
+        m->mmio++;
+        return m->acx_ahb[(pa - N88_ACX_AHB_PA) >> 2];
+    }
+    if (in_acx_apb(pa)) {
+        m->mmio++;
+        return m->acx_apb[(pa - N88_ACX_APB_PA) >> 2];
+    }
+    if (in_i2s(pa)) {
+        m->mmio++;
+        return m->i2s[(pa - N88_I2S_PA) / N88_I2S_SIZE][((pa - N88_I2S_PA) % N88_I2S_SIZE) >> 2];
+    }
     m->level_dirty = true;
     if (pa == N88_UART0_PA + 0x10u) {           /* UTRSTAT: transmitter empty */
         m->mmio++;
@@ -473,7 +593,12 @@ static uint32_t mmio_read(n88_t *m, uint32_t pa, unsigned size) {
         return v;
     }
     if (in_cdma(pa)) {
+        /* A playing channel's position as of now. */
         m->mmio++;
+        if (m->audio_due != UINT64_MAX) {
+            audio_update(m);
+            irq_update(m);
+        }
         return cdma_read(&m->cdma, pa - N88_CDMA_PA);
     }
     if (in_clcd(pa)) {
@@ -564,8 +689,20 @@ static void mmio_write(n88_t *m, uint32_t pa, unsigned size, uint32_t v) {
     } else if (in_spi0(pa)) {
         s5l_spi_write(&m->spi0, pa - N88_SPI0_PA, v);
     } else if (in_cdma(pa)) {
+        /* Time is played up to the write first, so a channel it starts
+         * begins with the next frame, not with frames that passed idle. */
+        audio_update(m);
         cdma_write(&m->cdma, pa - N88_CDMA_PA, v);
         cdma_lines(m);
+        audio_plan(m);
+    } else if (in_acx_ahb(pa)) {
+        audio_update(m);                        /* at the old rate */
+        m->acx_ahb[(pa - N88_ACX_AHB_PA) >> 2] = v;
+        audio_plan(m);
+    } else if (in_acx_apb(pa)) {
+        m->acx_apb[(pa - N88_ACX_APB_PA) >> 2] = v;
+    } else if (in_i2s(pa)) {
+        m->i2s[(pa - N88_I2S_PA) / N88_I2S_SIZE][((pa - N88_I2S_PA) % N88_I2S_SIZE) >> 2] = v;
     } else if (in_cdma_aes(pa)) {
         cdma_aes_write(&m->cdma, pa - N88_CDMA_AES_PA, v);
     } else if (in_sha1(pa)) {
@@ -660,6 +797,7 @@ static bool b_wfi(void *c) {
     const uint64_t frame = m2clcd_due(&m->clcd);
     if (frame != UINT64_MAX && frame * N88_CYCLES_PER_TICK < due)
         due = frame * N88_CYCLES_PER_TICK;
+    if (m->audio_due < due) due = m->audio_due;
     if (due != UINT64_MAX && due > m->cpu.cycles) m->cpu.cycles = due;
     timer_update(m);
     return m->cpu.irq_line || m->cpu.fiq_line;
@@ -684,11 +822,16 @@ bool n88_init(n88_t *m, bool cached_engine) {
     }
     if (!cdma_init(&m->cdma, cdma_mem, m)) { n88_free(m); return false; }
     cdma_set_peripheral(&m->cdma, cdma_periph, m);
+    cdma_set_paced(&m->cdma, audio_fifo, m);
+    m->audio_due = UINT64_MAX;
     i2c_devices_reset(m);
     {
         const s5l_i2c_slave_t accel = i2c_regfile_slave(&m->accel);
         const s5l_i2c_slave_t pmu = i2c_regfile_slave(&m->pmu);
-        if (!s5l8920_i2c_attach(&m->i2c0, &accel) || !s5l8920_i2c_attach(&m->i2c0, &pmu)) {
+        const s5l_i2c_slave_t mikey = i2c_regfile_slave(&m->mikey);
+        const s5l_i2c_slave_t codec = i2c_regfile_slave(&m->codec);
+        if (!s5l8920_i2c_attach(&m->i2c0, &accel) || !s5l8920_i2c_attach(&m->i2c0, &pmu) ||
+            !s5l8920_i2c_attach(&m->i2c0, &mikey) || !s5l8920_i2c_attach(&m->i2c0, &codec)) {
             n88_free(m);
             return false;
         }
@@ -778,10 +921,11 @@ unsigned n88_run(n88_t *m, unsigned max_steps, arm_status_t *status) {
         return 0;
     }
     /* Every level change a device access makes is applied by mmio_write()
-     * as it happens; the only one time makes is the decrementer expiring. */
+     * as it happens; the ones time makes are timer_update()'s. */
     timer_update(m);
     while (n < max_steps) {
-        if (m->timer.armed || m2clcd_due(&m->clcd) != UINT64_MAX) timer_update(m);
+        if (m->timer.armed || m2clcd_due(&m->clcd) != UINT64_MAX || m->audio_due != UINT64_MAX)
+            timer_update(m);
         if (m->ci) {
             /* Never past the decrementer's expiry, so the timer line moves
              * at exactly the instruction it would under arm_step. */
@@ -1249,8 +1393,15 @@ n88_status_t n88_boot(n88_t *m, const n88_boot_t *req, char *detail, size_t cap)
     s5l8920_dart_reset(&m->dart0);
     s5l8920_dart_reset(&m->dart1);
     s5l8920_dsim_reset(&m->dsim);
+    memset(m->acx_ahb, 0, sizeof m->acx_ahb);
+    memset(m->acx_apb, 0, sizeof m->acx_apb);
+    memset(m->i2s, 0, sizeof m->i2s);
+    m->audio_frac = 0u;
+    m->audio_due = UINT64_MAX;
+    m->audio_frames = m->audio_silent = 0u;
     m->cpu.arch = ARM_ARCH_V7_A8;
     arm_reset(&m->cpu, &m->bus);
+    m->audio_tick = n88_timer_count(m);
     {
         /* After the CPU reset, whose cycle count is the clock. The display
          * as iBoot leaves it: running, showing the first

@@ -1362,6 +1362,91 @@ static void test_sleep_and_wake(void) {
     free(m);
 }
 
+/* Sound (n88.h): the audio complex's NCO read back and setting the rate,
+ * and channel 21 into i2s0 played at that rate to the sink, its interrupt
+ * when the marked descriptor has played -- which is when a waiting core
+ * wakes. */
+static uint32_t g_snd_frames, g_snd_rate, g_snd_first, g_snd_last;
+static void snd_sink(void *ctx, const uint32_t *frames, size_t count, uint32_t rate) {
+    (void)ctx;
+    if (!g_snd_frames && count) g_snd_first = frames[0];
+    if (count) g_snd_last = frames[count - 1u];
+    g_snd_frames += (uint32_t)count;
+    g_snd_rate = rate;
+}
+
+static void nco_set(n88_t *m, uint32_t f) {
+    n88_write32(m, N88_ACX_AHB_PA + N88_ACX_NCO_A, 2u * f);
+    n88_write32(m, N88_ACX_AHB_PA + N88_ACX_NCO_B, 2u * f - N88_NCOREF_HZ);
+    n88_write32(m, N88_ACX_AHB_PA + 0x14u, 0xd00u);
+}
+
+static void test_sound(void) {
+    static buf_t tree;
+    static uint8_t kernel[0x400];
+    build_tree(&tree, (tree_opts_t){ N88_COMPAT, sizeof N88_COMPAT, true, 128 });
+    const uint32_t code[] = { WFI, B_SELF };
+    const size_t klen = build_kernel(kernel, sizeof kernel, KVA_TEXT, code, 2);
+    n88_t *m = malloc(sizeof *m);
+    CHECK(m && n88_init(m, false), "init");
+    if (!m || !m->ram) { free(m); return; }
+    char d[160];
+    const n88_boot_t r = { .kernel = kernel, .kernel_size = klen,
+                           .devicetree = tree.b, .devicetree_size = tree.n };
+    CHECK(n88_boot(m, &r, d, sizeof d) == N88_OK, "boot: %s", d);
+    n88_set_audio_sink(m, snd_sink, NULL);
+    const uint64_t unmodelled = m->unmodelled;
+
+    CHECK(n88_audio_rate(m) == N88_AUDIO_HZ, "the default rate before the NCO is set");
+    nco_set(m, 8000u * N88_AUDIO_BITS_PER_FRAME);
+    CHECK(n88_read32(m, N88_ACX_AHB_PA + N88_ACX_NCO_A) == 2u * 512000u &&
+          n88_audio_rate(m) == 8000u, "the NCO reads back; 512 kHz is 8 kHz");
+    nco_set(m, 44100u * N88_AUDIO_BITS_PER_FRAME);
+    CHECK(n88_audio_rate(m) == 44100u, "2.8224 MHz is 44.1 kHz");
+    n88_write32(m, N88_I2S_PA + 0x408u, 0x78057805u);
+    n88_write32(m, N88_ACX_APB_PA, 0x00010002u);
+    CHECK(n88_read32(m, N88_I2S_PA + 0x408u) == 0x78057805u &&
+          n88_read32(m, N88_ACX_APB_PA) == 0x00010002u, "i2s0 and the APB window read back");
+
+    /* 1024 frames, one marked descriptor, then the terminator. */
+    const uint32_t ring = 0x40300000u, pcm = 0x40310000u, frames = 1024u;
+    for (uint32_t i = 0; i < frames; i++) put32(ram_at(m, pcm + 4u * i), i | (i + 1u) << 16);
+    const uint32_t d0[4] = { ring + 0x20u, 0x303u, pcm, 4u * frames }, d1[4] = { ring, 0, 0, 0 };
+    for (unsigned i = 0; i < 4u; i++) {
+        put32(ram_at(m, ring + 4u * i), d0[i]);
+        put32(ram_at(m, ring + 0x20u + 4u * i), d1[i]);
+    }
+    const unsigned line = N88_CDMA_LINE0 + 21u;
+    n88_write32(m, N88_VIC_PA + 0x10000u * (line / 32u) + VIC_INTENABLE, 1u << (line % 32u));
+    const uint32_t C = N88_CDMA_PA + (21u << 12);
+    const uint64_t t0 = m->cpu.cycles;
+    n88_write32(m, C + CDMA_CSR, 0x18u);
+    n88_write32(m, C + 0x4u, 0xa6u);
+    n88_write32(m, C + CDMA_DAR, N88_I2S_PA);
+    n88_write32(m, C + CDMA_CAR, ring);
+    n88_write32(m, C + CDMA_CSR, 0x19u);
+    CHECK(g_snd_frames == 0u && m->audio_due != UINT64_MAX, "started: nothing yet, a wake planned");
+    arm_status_t st;
+    n88_run(m, 3, &st);
+    const uint64_t want = (uint64_t)frames * N88_CPU_HZ / 44100u;
+    CHECK(m->cpu.cycles - t0 >= want && m->cpu.cycles - t0 < want + 2u * N88_CYCLES_PER_TICK +
+          N88_CPU_HZ / 44100u, "the core woke when 1024 frames had played (%llu cycles, %llu)",
+          (unsigned long long)(m->cpu.cycles - t0), (unsigned long long)want);
+    CHECK(g_snd_frames == frames && g_snd_rate == 44100u && g_snd_first == (0u | 1u << 16) &&
+          g_snd_last == ((frames - 1u) | frames << 16), "every frame, in order, at 44.1 kHz");
+    const uint32_t csr = n88_read32(m, C + CDMA_CSR);
+    CHECK((csr & CDMA_CSR_DONE) && (csr & CDMA_CSR_SEGMENT) &&
+          (s5l_vic_read(&m->vic[line / 32u], VIC_RAWINTR) & (1u << (line % 32u))) &&
+          n88_read32(m, C + CDMA_CAR) == ring + 0x20u, "done, line 0x3f up, CAR on the terminator");
+    CHECK(m->audio_frames == frames && m->audio_due == UINT64_MAX, "counted; nothing more planned");
+    n88_write32(m, C + CDMA_CSR, csr);
+    CHECK(!(s5l_vic_read(&m->vic[line / 32u], VIC_RAWINTR) & (1u << (line % 32u))),
+          "acknowledged");
+    CHECK(m->unmodelled == unmodelled, "every access modelled");
+    n88_free(m);
+    free(m);
+}
+
 int main(void) {
     test_bus_routing();
     test_timer_registers();
@@ -1378,6 +1463,7 @@ int main(void) {
     test_buttons_and_switch();
     test_pmu_clock_and_ldo();
     test_sleep_and_wake();
+    test_sound();
     test_boot_with_root();
     test_console_ring();
     test_devicetree_identity();

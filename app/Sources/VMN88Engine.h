@@ -17,7 +17,8 @@
 //    to that copy. Touch goes to the touch controller, and Home, Power, the
 //    volume buttons and the ring/silent switch to the board's pins, so a
 //    phone that has gone to sleep wakes with Home or Power. The clock starts
-//    at the host's time.
+//    at the host's time. Its sound (i2s0, n88.h "Sound") plays through the
+//    device's speaker; the guest's own volume buttons set how loud.
 //  - iOS 6 (10B500): the preview, as before -- the kernel paints its verbose
 //    boot log on the framebuffer iBoot would have set up, as far as a machine
 //    with no storage or input allows. No input.

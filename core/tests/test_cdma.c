@@ -309,6 +309,106 @@ static void test_retry_when_ready(void) {
     cdma_free(&d);
 }
 
+/* A paced channel, as iPhone OS 3.1.3 plays sound through channel 21 into
+ * i2s0 (cdma.h, "paced channels"): the device pulls the data as it plays,
+ * the channel runs past marked descriptors raising bit 20, stops at the
+ * terminator, and answers the driver's pause and stop. */
+static bool i2s_fifo(void *ctx, uint32_t fifo) {
+    (void)ctx;
+    return fifo == 0x84500000u;
+}
+
+static void test_paced_channel(void) {
+    cdma_t d;
+    CHECK(cdma_init(&d, mem, NULL), "init");
+    memset(g_ram, 0, sizeof g_ram);
+    for (unsigned i = 0; i < 0x5000u; i++) g_ram[0x3000 + i] = (uint8_t)(i * 7 + 3);
+    const uint32_t ring = RAM_PA + 0x8000;
+    for (unsigned i = 0; i < 128u; i++)
+        desc(ring + 32u * i, ring + 32u * ((i + 1u) & 127u), 0, 0, 0);
+    cdma_set_peripheral(&d, sink, NULL);
+    cdma_set_paced(&d, i2s_fifo, NULL);
+    g_takes = 0;
+    const unsigned n = 21;
+    cdma_write(&d, ch(n, CDMA_CSR), 0x18u);
+    cdma_write(&d, ch(n, 0x4), 0xa6u);
+    cdma_write(&d, ch(n, CDMA_DAR), 0x84500000u);
+    cdma_write(&d, ch(n, CDMA_CAR), ring);
+    /* Command A: descriptors 0 and 1, the last marked; 2 terminates. */
+    put32(ring + 0x24, 0x303u); put32(ring + 0x28, RAM_PA + 0x4000); put32(ring + 0x2c, 32u);
+    put32(ring + 0x04, 0x3u);   put32(ring + 0x08, RAM_PA + 0x3000); put32(ring + 0x0c, 64u);
+    cdma_write(&d, ch(n, CDMA_CSR), 0x19u);
+    CHECK(cdma_paced_running(&d, n) && g_takes == 0u && !cdma_irq(&d, n) &&
+          cdma_read(&d, ch(n, CDMA_CUR)) == RAM_PA + 0x3000u,
+          "started: nothing delivered, CUR at the first octet");
+    CHECK(cdma_bytes_to_event(&d, n, 1u << 16) == 96u, "the event is the marked descriptor's end");
+
+    uint8_t out[256];
+    CHECK(cdma_pull(&d, n, out, 40) == 40u && !memcmp(out, g_ram + 0x3000, 40) &&
+          cdma_read(&d, ch(n, CDMA_CUR)) == RAM_PA + 0x3028u && !cdma_irq(&d, n),
+          "40 octets from the first descriptor");
+    CHECK(cdma_pull(&d, n, out, 40) == 40u && !memcmp(out, g_ram + 0x3028, 24) &&
+          !memcmp(out + 24, g_ram + 0x4000, 16) && cdma_read(&d, ch(n, CDMA_CAR)) == ring + 0x20u &&
+          cdma_read(&d, ch(n, CDMA_CUR)) == RAM_PA + 0x4010u && !cdma_irq(&d, n),
+          "across into the second, CAR and CUR on it");
+    CHECK(cdma_bytes_to_event(&d, n, 1u << 16) == 16u, "16 left to the event");
+
+    /* Command B linked in place of the terminator while A plays; the kick
+     * changes nothing about where A is. */
+    put32(ring + 0x48, RAM_PA + 0x5000); put32(ring + 0x4c, 48u);
+    put32(ring + 0x44, 0x303u);
+    cdma_write(&d, ch(n, CDMA_CSR), 0x19u);
+    CHECK(cdma_read(&d, ch(n, CDMA_CUR)) == RAM_PA + 0x4010u, "a kick while running keeps CUR");
+    CHECK(cdma_pull(&d, n, out, 100) == 64u && !memcmp(out + 16, g_ram + 0x5000, 48),
+          "the rest of A, then B, then the terminator");
+    const uint32_t csr = cdma_read(&d, ch(n, CDMA_CSR));
+    CHECK(!(csr & CDMA_CSR_STATE) && (csr & CDMA_CSR_DONE) && (csr & CDMA_CSR_SEGMENT) &&
+          cdma_irq(&d, n) && cdma_read(&d, ch(n, CDMA_CAR)) == ring + 0x60u &&
+          g_takes == 0u, "done and marked, CAR on the terminator, nothing sent to a sink");
+    ack(&d, n);
+    CHECK(!cdma_irq(&d, n) && cdma_pull(&d, n, out, 4) == 0u, "acknowledged; idle");
+
+    /* Command C, then the driver's position read: pause, read CUR, split the
+     * descriptor, restart. */
+    put32(ring + 0x68, RAM_PA + 0x6000); put32(ring + 0x6c, 64u);
+    put32(ring + 0x64, 0x303u);
+    cdma_write(&d, ch(n, CDMA_CSR), 0x19u);
+    CHECK(cdma_pull(&d, n, out, 20) == 20u, "C plays");
+    cdma_write(&d, ch(n, CDMA_CSR), cdma_read(&d, ch(n, CDMA_CSR)) | CDMA_CSR_PAUSE);
+    CHECK((cdma_read(&d, ch(n, CDMA_CSR)) & CDMA_CSR_STATE) == CDMA_CSR_PAUSED &&
+          cdma_pull(&d, n, out, 4) == 0u && cdma_read(&d, ch(n, CDMA_CUR)) == RAM_PA + 0x6014u,
+          "paused: nothing plays, CUR is the position");
+    put32(ring + 0x68, RAM_PA + 0x6014); put32(ring + 0x6c, 44u);
+    cdma_write(&d, ch(n, CDMA_CSR),
+               (cdma_read(&d, ch(n, CDMA_CSR)) & ~UINT32_C(0x21)) | CDMA_CSR_GO);
+    CHECK(cdma_paced_running(&d, n) && cdma_pull(&d, n, out, 64) == 44u &&
+          !memcmp(out, g_ram + 0x6014, 44), "restarted from the split descriptor");
+    ack(&d, n);
+
+    /* Command D, stopped: bit 2 halts it and bit 21 says so; abort clears. */
+    put32(ring + 0x88, RAM_PA + 0x7000); put32(ring + 0x8c, 64u);
+    put32(ring + 0x84, 0x303u);
+    cdma_write(&d, ch(n, CDMA_CSR), 0x19u);
+    cdma_write(&d, ch(n, CDMA_CSR), cdma_read(&d, ch(n, CDMA_CSR)) | CDMA_CSR_STOP);
+    CHECK((cdma_read(&d, ch(n, CDMA_CSR)) & CDMA_CSR_STOPPED) && !cdma_paced_running(&d, n) &&
+          cdma_pull(&d, n, out, 4) == 0u, "stopped, and says so");
+    cdma_write(&d, ch(n, CDMA_CSR), CDMA_CSR_ABORT);
+    cdma_write(&d, ch(n, CDMA_CSR), cdma_read(&d, ch(n, CDMA_CSR)) | 0x18u);
+    CHECK(!(cdma_read(&d, ch(n, CDMA_CSR)) & (CDMA_CSR_STOPPED | CDMA_CSR_STATE)),
+          "abort clears the acknowledge");
+
+    /* A descriptor that is not memory ends the request in error. */
+    cdma_write(&d, ch(n, CDMA_CAR), ring + 0xa0u);
+    put32(ring + 0xa8, 0x10000000u); put32(ring + 0xac, 64u);
+    put32(ring + 0xa4, 0x303u);
+    cdma_write(&d, ch(n, CDMA_CSR), 0x19u);
+    CHECK(cdma_pull(&d, n, out, 8) == 0u &&
+          (cdma_read(&d, ch(n, CDMA_CSR)) & CDMA_CSR_ERROR) && cdma_irq(&d, n),
+          "an unmapped segment is an error");
+    CHECK(d.paced_octets == 40u + 40u + 64u + 20u + 44u, "every octet counted once");
+    cdma_free(&d);
+}
+
 int main(void) {
     printf("NEON CDMA + AES tests\n");
     test_copy_across_segments();
@@ -317,6 +417,7 @@ int main(void) {
     test_errors_and_abort();
     test_car_after_requests();
     test_retry_when_ready();
+    test_paced_channel();
     printf("  %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

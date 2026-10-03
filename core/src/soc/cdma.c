@@ -37,6 +37,11 @@ void cdma_set_peripheral(cdma_t *d, cdma_periph_fn fn, void *ctx) {
     d->periph_ctx = ctx;
 }
 
+void cdma_set_paced(cdma_t *d, cdma_paced_fn fn, void *ctx) {
+    d->paced = fn;
+    d->paced_ctx = ctx;
+}
+
 void cdma_reset(cdma_t *d) {
     memset(d->ch, 0, sizeof d->ch);
     memset(d->enabled, 0, sizeof d->enabled);
@@ -160,6 +165,103 @@ static void try_transfer(cdma_t *d, unsigned n) {
     finish(d, dst, !ok);
 }
 
+/* ------------------------------------------------------ paced channels */
+
+static bool is_paced(const cdma_t *d, unsigned n) {
+    return d->paced && !(d->ch[n][0] & CDMA_CSR_M2M) &&
+           d->paced(d->paced_ctx, d->ch[n][CDMA_DAR / 4u]);
+}
+
+typedef struct { uint32_t next, cmd, addr, len; } cdma_desc_t;
+
+static bool read_desc(const cdma_t *d, uint32_t at, cdma_desc_t *out) {
+    uint8_t raw[16];
+    if (!d->mem(d->mem_ctx, at, raw, sizeof raw, false)) return false;
+    out->next = rd32le(raw);
+    out->cmd = rd32le(raw + 4);
+    out->addr = rd32le(raw + 8);
+    out->len = (out->cmd & 3u) == CDMA_CMD_DATA ? rd32le(raw + 12) : 0u;
+    return true;
+}
+
+/* Paced channel n arrives at the descriptor at CAR, from the start of it
+ * when `reload` (a start, or a restart after a pause) and otherwise where
+ * CUR says. A terminator stops it, done; empty descriptors are passed over.
+ * False when it is no longer running. */
+static bool paced_settle(cdma_t *d, unsigned n, bool reload) {
+    uint32_t *c = d->ch[n];
+    for (unsigned i = 0; i < CDMA_MAX_DESCRIPTORS; i++) {
+        cdma_desc_t ds;
+        if (!read_desc(d, c[CDMA_CAR / 4u], &ds)) {
+            d->errors++;
+            finish(d, n, true);
+            return false;
+        }
+        if (ds.cmd == 0u) {
+            finish(d, n, false);
+            return false;
+        }
+        const uint32_t cur = c[CDMA_CUR / 4u];
+        if (reload || cur < ds.addr || cur - ds.addr > ds.len) c[CDMA_CUR / 4u] = ds.addr;
+        if (c[CDMA_CUR / 4u] - ds.addr < ds.len) return true;
+        /* Nothing left in this one: on to the next. */
+        if (ds.cmd & CDMA_CMD_LAST) c[0] |= CDMA_CSR_SEGMENT;
+        c[CDMA_CAR / 4u] = ds.next;
+        reload = true;
+    }
+    d->errors++;
+    finish(d, n, true);
+    return false;
+}
+
+bool cdma_paced_running(const cdma_t *d, unsigned n) {
+    return n > 0u && n < CDMA_CHANNELS &&
+           (d->ch[n][0] & CDMA_CSR_STATE) == CDMA_CSR_RUNNING && is_paced(d, n);
+}
+
+uint32_t cdma_pull(cdma_t *d, unsigned n, uint8_t *out, uint32_t len) {
+    uint32_t got = 0;
+    if (!cdma_paced_running(d, n)) return 0u;
+    uint32_t *c = d->ch[n];
+    while (got < len) {
+        if (!paced_settle(d, n, false)) break;
+        cdma_desc_t ds;
+        if (!read_desc(d, c[CDMA_CAR / 4u], &ds)) break;   /* settle read it */
+        const uint32_t cur = c[CDMA_CUR / 4u];
+        uint32_t take = ds.len - (cur - ds.addr);
+        if (take > len - got) take = len - got;
+        if (!d->mem(d->mem_ctx, cur, out + got, take, false)) {
+            d->errors++;
+            finish(d, n, true);
+            break;
+        }
+        got += take;
+        c[CDMA_CUR / 4u] = cur + take;
+        /* Finishing a descriptor moves on at once, so a request that has
+         * played its last octet is done the moment it has. */
+        if (cur + take - ds.addr == ds.len) (void)paced_settle(d, n, false);
+    }
+    d->paced_octets += got;
+    return got;
+}
+
+uint32_t cdma_bytes_to_event(const cdma_t *d, unsigned n, uint32_t cap) {
+    if (!cdma_paced_running(d, n)) return 0u;
+    const uint32_t *c = d->ch[n];
+    uint32_t at = c[CDMA_CAR / 4u], cur = c[CDMA_CUR / 4u], total = 0;
+    for (unsigned i = 0; i < CDMA_MAX_DESCRIPTORS && total < cap; i++) {
+        cdma_desc_t ds, after;
+        if (!read_desc(d, at, &ds) || ds.cmd == 0u) break;
+        const uint32_t done = i == 0u && cur >= ds.addr && cur - ds.addr <= ds.len
+                            ? cur - ds.addr : 0u;
+        total += ds.len - done;
+        if (ds.cmd & CDMA_CMD_LAST) break;
+        if (!read_desc(d, ds.next, &after) || after.cmd == 0u) break;
+        at = ds.next;
+    }
+    return total < cap ? total : cap;
+}
+
 /* A peripheral request on channel n: its chain's octets to the device at
  * its FIFO address. Unclaimed, it stays running. */
 static void try_peripheral(cdma_t *d, unsigned n) {
@@ -186,7 +288,9 @@ static void try_peripheral(cdma_t *d, unsigned n) {
 void cdma_retry(cdma_t *d) {
     for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
         const uint32_t csr = d->ch[n][CDMA_CSR / 4u];
-        if ((csr & CDMA_CSR_RUNNING) && !(csr & CDMA_CSR_M2M)) try_peripheral(d, n);
+        if ((csr & CDMA_CSR_STATE) == CDMA_CSR_RUNNING && !(csr & CDMA_CSR_M2M) &&
+            !is_paced(d, n))
+            try_peripheral(d, n);
     }
 }
 
@@ -217,18 +321,29 @@ void cdma_write(cdma_t *d, uint32_t off, uint32_t v) {
     if (r >= 8u) return;
     if (r != 0u) { d->ch[n][r] = v; return; }
     uint32_t *csr = &d->ch[n][0];
-    /* Status is write-one-to-clear; state is the engine's; the rest of the
-     * low half (interrupt enable, memory-to-memory, the AES context) is the
-     * driver's. */
-    uint32_t next = (*csr & ~(CDMA_CSR_ERROR | CDMA_CSR_DONE)) |
-                    (*csr & (CDMA_CSR_ERROR | CDMA_CSR_DONE) & ~v);
+    const uint32_t old = *csr;
+    /* Status is write-one-to-clear; state and the stop acknowledge are the
+     * engine's; the rest of the low half (interrupt enable, pause, memory-
+     * to-memory, the AES context) is the driver's. Bits 0-2 are commands:
+     * go, abort, and stop, which halts the channel and says so in bit 21. */
+    uint32_t next = (old & ~CDMA_CSR_STATUS) | (old & CDMA_CSR_STATUS & ~v);
     next = (next & ~UINT32_C(0xfff8)) | (v & UINT32_C(0xfff8));
-    if (v & CDMA_CSR_ABORT) next &= ~CDMA_CSR_STATE;
-    if (v & CDMA_CSR_GO) next = (next & ~CDMA_CSR_STATE) | CDMA_CSR_RUNNING;
+    if (v & CDMA_CSR_ABORT) next &= ~(CDMA_CSR_STATE | CDMA_CSR_STOPPED);
+    if (v & CDMA_CSR_STOP) next = (next & ~CDMA_CSR_STATE) | CDMA_CSR_STOPPED;
+    if (v & CDMA_CSR_GO)
+        next = (next & ~(CDMA_CSR_STATE | CDMA_CSR_STOPPED)) | CDMA_CSR_RUNNING;
+    if ((next & CDMA_CSR_PAUSE) && (next & CDMA_CSR_STATE) == CDMA_CSR_RUNNING)
+        next = (next & ~CDMA_CSR_STATE) | CDMA_CSR_PAUSED;
     *csr = next;
-    if (v & CDMA_CSR_GO) {
+    if ((v & CDMA_CSR_GO) && (next & CDMA_CSR_STATE) == CDMA_CSR_RUNNING) {
         if (next & CDMA_CSR_M2M) try_transfer(d, n);
-        else try_peripheral(d, n);
+        else if (is_paced(d, n)) {
+            /* A kick while it runs (a command linked behind it) changes
+             * nothing; from idle or a pause it starts again at CAR. */
+            if ((old & CDMA_CSR_STATE) != CDMA_CSR_RUNNING) (void)paced_settle(d, n, true);
+        } else {
+            try_peripheral(d, n);
+        }
     }
 }
 
@@ -243,5 +358,5 @@ void cdma_aes_write(cdma_t *d, uint32_t off, uint32_t v) {
 bool cdma_irq(const cdma_t *d, unsigned n) {
     if (n == 0u || n >= CDMA_CHANNELS) return false;
     const uint32_t csr = d->ch[n][0];
-    return (csr & CDMA_CSR_IRQ_ENABLE) && (csr & (CDMA_CSR_DONE | CDMA_CSR_ERROR));
+    return (csr & CDMA_CSR_IRQ_ENABLE) && (csr & CDMA_CSR_STATUS);
 }

@@ -26,6 +26,7 @@
  *           [-c "boot-args"] [-v] [-m dram.bin] [-u node/path]... [-e]
  *           [-r root.img [-P pristine.img [-a]]] [-w] [-F screen.ppm] [-B epoch]
  *           [-D x0,y0,x1,y1,t]... [-T x,y,t]... [-K name,t[,s]]... [-R s] [-S t]...
+ *           [-A out.wav] [-C lo,hi]... [-X addr]...
  * -v logs every unmodelled access instead of the first 400; -m saves all of
  * DRAM at the end (the kernel's message buffer is in there); -u un-matches a
  * device-tree node (replacing the default: "arm-io/iop", or for the 7E18
@@ -50,6 +51,13 @@
  * sets the RTC to s seconds since the Unix epoch (default: the host's
  * clock). -S t (up to eight) also writes the screen at guest time t, to the
  * -F path with ".<t>s.ppm" appended (the engine mode only).
+ * -A writes what i2s0 plays (n88_set_audio_sink) to a WAV file, 16-bit
+ * stereo at the rate it plays at; with or without it, the guest time each
+ * sound starts is reported, and the frames played at the end. -C lo,hi (up
+ * to four; single-step mode) prints each block in [lo,hi) the first time a
+ * branch enters it, and -X addr (up to four; single-step mode) the
+ * registers and the r7 backtrace each time a branch reaches addr, the first
+ * eight times: what a driver ran, and who called it.
  * -B sets the boot_args version the kernel checks (default 5, iOS 6's; 4
  * when the kernel is the 3GS's iPhone OS 3.1.3 7E18 one, which wants it).
  * -r works with either known kernel, each with its own memory-disk gate.
@@ -60,6 +68,7 @@
  * Copyright (c) 2026 j0shua-SYSON. MIT licensed.
  */
 #include "arm.h"
+#include "audio_capture.h"
 #include "file_block.h"
 #include "ios3_n88_kernel_patch.h"
 #include "ios6_kernel_patch.h"
@@ -118,6 +127,10 @@ static const char *sym(uint32_t addr) {
 
 static bool in_ram(uint32_t a, unsigned n) {
     return a >= N88_DRAM_BASE && (uint64_t)a + n <= (uint64_t)N88_DRAM_BASE + N88_DRAM_SIZE;
+}
+
+static uint32_t ld32le(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
 /* ------------------------------------------------- unmodelled accesses */
@@ -215,6 +228,83 @@ static void gesture_tick(void) {
     if (g->step == last) printf("  %s: lifted at %u,%u, guest time %.3f s\n", what, c.x, c.y, now);
     g->step++;
     g->next = now + MTZ2_FRAME_PERIOD_MS / 1000.0;
+}
+
+/* ----------------------------------------------------------- coverage */
+/*
+ * -C lo,hi (single-step mode; up to four): print each block in [lo,hi) the
+ * first time a branch enters it, with where it came from and r0-r3. What a
+ * driver's start ran, and where it stopped, without a breakpoint per guess.
+ */
+#define MAX_COVER 4u
+static struct {
+    uint32_t lo, hi;
+    uint8_t *seen;              /* one bit per halfword                     */
+} g_cover[MAX_COVER];
+static unsigned g_ncover;
+
+/* -X addr (single-step mode; up to four): the registers and the r7 backtrace
+ * each time a branch reaches addr, the first eight times. Who called it. */
+#define MAX_XTRACE 4u
+static uint32_t g_xtrace[MAX_XTRACE];
+static unsigned g_nxtrace, g_xtrace_hits[MAX_XTRACE];
+static void backtrace(const char *indent);
+
+static void cover_note(uint32_t from, uint32_t to) {
+    if (to == from + 2u || to == from + 4u) return;
+    for (unsigned i = 0; i < g_ncover; i++) {
+        if (to < g_cover[i].lo || to >= g_cover[i].hi) continue;
+        const uint32_t bit = (to - g_cover[i].lo) >> 1;
+        if (g_cover[i].seen[bit >> 3] & (1u << (bit & 7u))) return;
+        g_cover[i].seen[bit >> 3] |= (uint8_t)(1u << (bit & 7u));
+        printf("  cov %08x %-44s from %08x  r0 %08x r1 %08x r2 %08x r3 %08x  t %.4f\n", to,
+               sym(to), from, g_m.cpu.r[0], g_m.cpu.r[1], g_m.cpu.r[2], g_m.cpu.r[3],
+               n88_guest_seconds(&g_m));
+        return;
+    }
+}
+
+/* -------------------------------------------------------------- sound */
+/*
+ * -A out.wav: i2s0's frames as the machine plays them (n88_set_audio_sink),
+ * 16-bit stereo at the rate of the first frames. The header is written
+ * last, with the length.
+ */
+static FILE    *g_wav;
+static uint32_t g_wav_rate;
+static uint64_t g_wav_frames, g_wav_nonzero;
+static double   g_wav_heard = -1.0;     /* guest time of the last sound      */
+
+static void wav_header(FILE *f, uint32_t rate, uint64_t frames) {
+    const audio_format_t fmt = { rate, 16u, 2u };
+    const uint64_t bytes = frames * N88_AUDIO_FRAME_BYTES;
+    uint8_t h[WAV_HEADER_BYTES];
+    if (!wav_header_build(h, &fmt, bytes > UINT32_MAX - 36u ? UINT32_MAX - 36u : (uint32_t)bytes))
+        return;
+    fseek(f, 0, SEEK_SET);
+    fwrite(h, 1, sizeof h, f);
+    fseek(f, 0, SEEK_END);
+}
+
+/* Every frame i2s0 plays; the guest time a sound starts after a quarter of
+ * a second of silence is reported (with or without -A). */
+static void wav_sink(void *ctx, const uint32_t *frames, size_t count, uint32_t rate) {
+    (void)ctx;
+    if (!g_wav_rate) g_wav_rate = rate;
+    bool heard = false;
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t b[4] = { (uint8_t)frames[i], (uint8_t)(frames[i] >> 8),
+                               (uint8_t)(frames[i] >> 16), (uint8_t)(frames[i] >> 24) };
+        if (g_wav) fwrite(b, 1, 4, g_wav);
+        if (frames[i]) { g_wav_nonzero++; heard = true; }
+    }
+    g_wav_frames += count;
+    if (heard) {
+        const double now = n88_guest_seconds(&g_m);
+        if (g_wav_heard < 0.0 || now - g_wav_heard > 0.25)
+            printf("  sound: playing at guest time %.3f s (%u Hz)\n", now, rate);
+        g_wav_heard = now;
+    }
 }
 
 /* ------------------------------------------------------------ buttons */
@@ -479,6 +569,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-w")) waits = true;
         else if (!strcmp(argv[i], "-m") && i + 1 < argc) ram_out = argv[++i];
         else if (!strcmp(argv[i], "-F") && i + 1 < argc) screen_out = argv[++i];
+        else if (!strcmp(argv[i], "-A") && i + 1 < argc) {
+            g_wav = fopen(argv[++i], "wb");
+            if (!g_wav) die("-A: cannot write %s", argv[i]);
+            wav_header(g_wav, N88_AUDIO_HZ, 0u);
+        }
         else if (!strcmp(argv[i], "-r") && i + 1 < argc) root_path = argv[++i];
         else if (!strcmp(argv[i], "-P") && i + 1 < argc) pristine_path = argv[++i];
         else if (!strcmp(argv[i], "-a")) activate = false;
@@ -513,6 +608,18 @@ int main(int argc, char **argv) {
                 p->in = (n88_input_t)k;
             }
         }
+        else if (!strcmp(argv[i], "-C") && i + 1 < argc && g_ncover < MAX_COVER) {
+            unsigned long lo = 0, hi = 0;
+            if (sscanf(argv[++i], "%lx,%lx", &lo, &hi) != 2 || hi <= lo || hi - lo > 0x1000000u)
+                die("-C wants lo,hi in hex, at most 16 MiB apart");
+            g_cover[g_ncover].lo = (uint32_t)lo;
+            g_cover[g_ncover].hi = (uint32_t)hi;
+            g_cover[g_ncover].seen = calloc(1, ((hi - lo) >> 4) + 1u);
+            if (!g_cover[g_ncover].seen) die("out of memory");
+            g_ncover++;
+        }
+        else if (!strcmp(argv[i], "-X") && i + 1 < argc && g_nxtrace < MAX_XTRACE)
+            g_xtrace[g_nxtrace++] = (uint32_t)strtoul(argv[++i], NULL, 16) & ~1u;
         else if (!strcmp(argv[i], "-R") && i + 1 < argc) {
             rtc = strtoull(argv[++i], NULL, 0);
             rtc_given = true;
@@ -595,6 +702,7 @@ int main(int argc, char **argv) {
     const n88_status_t bs = n88_boot(&g_m, &req, detail, sizeof detail);
     if (bs != N88_OK) die("%s: %s", n88_strerror(bs), detail);
     n88_set_rtc(&g_m, rtc_given ? (uint32_t)rtc : (uint32_t)time(NULL));
+    n88_set_audio_sink(&g_m, wav_sink, NULL);
     if (root) {
         guest_patch_report_t pr;
         const guest_patch_status_t ps = is_ios6
@@ -683,6 +791,19 @@ int main(int argc, char **argv) {
             }
             drain_console();
             const uint32_t npc = g_m.cpu.r[15], nmode = g_m.cpu.cpsr & 0x1fu;
+            if (g_ncover) cover_note(pc, npc);
+            for (unsigned x = 0; x < g_nxtrace; x++) {
+                if (npc != g_xtrace[x] || npc == pc + 2u || npc == pc + 4u ||
+                    g_xtrace_hits[x]++ >= 8u)
+                    continue;
+                printf("  reached %08x %s from %08x, guest time %.4f s\n", npc, sym(npc), pc,
+                       n88_guest_seconds(&g_m));
+                for (int r = 0; r < 16; r += 4)
+                    printf("    r%-2d %08x  r%-2d %08x  r%-2d %08x  r%-2d %08x\n", r,
+                           g_m.cpu.r[r], r + 1, g_m.cpu.r[r + 1], r + 2, g_m.cpu.r[r + 2],
+                           r + 3, g_m.cpu.r[r + 3]);
+                backtrace("    ");
+            }
             const uint32_t vbase = (g_m.cpu.cp15.sctlr & ARM_SCTLR_V) ? 0xffff0000u : 0u;
             if (nmode != mode && npc >= vbase && npc < vbase + 0x20u) {
                 /* Interrupts are the machine working, not news; count them.
@@ -839,11 +960,13 @@ int main(int argc, char **argv) {
                    " octets out, %" PRIu64 " in\n", b ? 2u : 0u, ic->transfers, ic->naks,
                    ic->bytes_tx, ic->bytes_rx);
         }
-        for (unsigned d = 0; d < 2u; d++) {
-            const i2c_regfile_t *rf = d ? &g_m.pmu : &g_m.accel;
+        static const char *const rf_name[4] = { "accelerometer", "pmu", "mikey", "codec" };
+        for (unsigned d = 0; d < 4u; d++) {
+            const i2c_regfile_t *rf = d == 0u ? &g_m.accel : d == 1u ? &g_m.pmu
+                                    : d == 2u ? &g_m.mikey : &g_m.codec;
             if (!rf->reads && !rf->writes) continue;
             printf("  %s (0x%02x): %" PRIu64 " reads, %" PRIu64 " writes; registers",
-                   d ? "pmu" : "accelerometer", rf->addr, rf->reads, rf->writes);
+                   rf_name[d], rf->addr, rf->reads, rf->writes);
             for (unsigned r = 0; r < 256u; r++) {
                 const bool rd = (rf->read_map[r >> 3] >> (r & 7u)) & 1u;
                 const bool wr = (rf->write_map[r >> 3] >> (r & 7u)) & 1u;
@@ -855,6 +978,29 @@ int main(int argc, char **argv) {
             printf("cdma peripheral: %" PRIu64 " transfers (%" PRIu64 " octets), %" PRIu64
                    " unclaimed; sha1: %" PRIu64 " blocks\n", dm->periph_transfers,
                    dm->periph_octets, dm->periph_unclaimed, g_m.sha1.blocks);
+        printf("sound: %" PRIu64 " i2s0 frames played (%" PRIu64 " not silent), %" PRIu64
+               " with nothing to play, at %u Hz; %" PRIu64 " octets through paced channels\n",
+               g_m.audio_frames, g_wav_nonzero, g_m.audio_silent, n88_audio_rate(&g_m),
+               dm->paced_octets);
+        for (unsigned n = 1; n < CDMA_CHANNELS; n++) {
+            const uint32_t *c = dm->ch[n];
+            if (!c[0] && !c[CDMA_CAR / 4u]) continue;
+            printf("  cdma channel %u: csr %08x +4 %08x dar %08x dbr %08x car %08x err %08x\n",
+                   n, c[0], c[1], c[2], c[3], c[CDMA_CAR / 4u], c[CDMA_ERR / 4u]);
+            uint32_t desc = c[CDMA_CAR / 4u];
+            for (unsigned k = 0; k < 4u && in_ram(desc, 32u); k++) {
+                const uint8_t *q = g_m.ram + (desc - N88_DRAM_BASE);
+                printf("    desc %08x:", desc);
+                for (unsigned w = 0; w < 8u; w++) printf(" %08x", ld32le(q + 4u * w));
+                printf("\n");
+                desc = ld32le(q);
+            }
+        }
+    }
+    if (g_wav) {
+        wav_header(g_wav, g_wav_rate ? g_wav_rate : N88_AUDIO_HZ, g_wav_frames);
+        fclose(g_wav);
+        g_wav = NULL;
     }
     dump_state();
     if (!engine) {

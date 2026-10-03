@@ -5,6 +5,7 @@
 //
 #import "VMN88Engine.h"
 
+#import "VMAudioOutput.h"
 #import "VMSettings.h"
 
 #include "file_block.h"
@@ -77,7 +78,13 @@ static bool vm_n88_input_for(VMButton button, n88_input_t *out) {
 
 @interface VMN88Engine ()
 - (void)notePrepareDone:(uint64_t)done total:(uint64_t)total;
+- (void)playFrames_emulatorThread:(const uint32_t *)frames count:(size_t)count rate:(uint32_t)rate;
 @end
+
+/* i2s0's frames (n88_set_audio_sink), on the emulator thread. */
+static void vm_n88_audio_sink(void *ctx, const uint32_t *frames, size_t count, uint32_t rate) {
+    [(__bridge VMN88Engine *)ctx playFrames_emulatorThread:frames count:count rate:rate];
+}
 
 static void vm_n88_prepare_progress(void *ctx, uint64_t done, uint64_t total) {
     [(__bridge VMN88Engine *)ctx notePrepareDone:done total:total];
@@ -118,9 +125,13 @@ static void vm_n88_prepare_progress(void *ctx, uint64_t done, uint64_t total) {
     unsigned         _edgeCount;
     BOOL             _buttons[VMButtonCount];
 
+    /* The speaker: made before the thread starts, stopped after it ends. */
+    VMAudioOutput   *_audioOutput;
+
     /* The emulator thread's own. */
     double           _pressedAt[N88_INPUT_COUNT];
     BOOL             _frameBlack;
+    uint64_t         _audioPhase;      /* resampling to the speaker's rate */
 }
 
 + (BOOL)firmwarePresent {
@@ -313,8 +324,40 @@ static void vm_n88_prepare_progress(void *ctx, uint64_t done, uint64_t total) {
     pthread_mutex_unlock(&_lock);
     for (unsigned i = 0; i < N88_INPUT_COUNT; i++) _pressedAt[i] = -1e9;
     _frameBlack = NO;
+    _audioPhase = 0;
+    if (ios3) {
+        /* iPhone OS 3 plays its sounds through i2s0 (n88.h, "Sound"). */
+        VMAudioOutput *audio = [[VMAudioOutput alloc] init];
+        [audio start];
+        pthread_mutex_lock(&_lock);
+        _audioOutput = audio;
+        pthread_mutex_unlock(&_lock);
+        n88_set_audio_sink(m, vm_n88_audio_sink, (__bridge void *)self);
+    }
     [thread start];
     return YES;
+}
+
+/*
+ * The guest's frames to the speaker, which plays N88_AUDIO_HZ: at another
+ * rate each frame is repeated or dropped to match (the system sounds are all
+ * 44.1 kHz, so this is the exception). When the host is slower than the
+ * guest needs, the speaker runs dry and fills with silence; nothing waits.
+ */
+- (void)playFrames_emulatorThread:(const uint32_t *)frames count:(size_t)count rate:(uint32_t)rate {
+    VMAudioOutput *out = _audioOutput;
+    if (!out || !rate) return;
+    if (rate == N88_AUDIO_HZ) {
+        for (size_t i = 0; i < count; i++) [out pushSampleWord:frames[i]];
+        return;
+    }
+    for (size_t i = 0; i < count; i++) {
+        _audioPhase += N88_AUDIO_HZ;
+        while (_audioPhase >= rate) {
+            [out pushSampleWord:frames[i]];
+            _audioPhase -= rate;
+        }
+    }
 }
 
 /*
@@ -554,6 +597,11 @@ static void vm_n88_prepare_progress(void *ctx, uint64_t done, uint64_t total) {
     pthread_mutex_unlock(&_lock);
     n88_free(m);
     free(m);
+    pthread_mutex_lock(&_lock);
+    VMAudioOutput *audio = _audioOutput;
+    _audioOutput = nil;
+    pthread_mutex_unlock(&_lock);
+    [audio stop];
     if (root) {
         /* The guest's disk: everything it wrote reaches the file before the
          * machine is reported stopped. */
@@ -582,7 +630,10 @@ static void vm_n88_prepare_progress(void *ctx, uint64_t done, uint64_t total) {
 - (void)setPaused:(BOOL)paused {
     pthread_mutex_lock(&_lock);
     _paused = paused;
+    VMAudioOutput *out = _running ? _audioOutput : nil;
     pthread_mutex_unlock(&_lock);
+    if (paused) [out pause];
+    else [out resume];
 }
 
 - (BOOL)isPaused {
