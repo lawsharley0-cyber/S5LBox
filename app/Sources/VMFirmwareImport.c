@@ -240,6 +240,12 @@ typedef struct {
     uint8_t     sha256[VM_FW_ARTEFACT_COUNT][VM_FW_SHA256_LEN];
 } vm_fw_reference_t;
 
+/* An iPhone OS 3 build: 7A341 (3.0) through 7E18 (3.1.3), a 7 and a letter.
+ * iOS 4 and later are 8 and up. */
+bool vm_fw_build_is_iphone_os_3(const char *build) {
+    return build && build[0] == '7' && build[1] >= 'A' && build[1] <= 'Z';
+}
+
 static const vm_fw_reference_t k_references[] = {
     {
         "iPhone1,2", "7E18",
@@ -1298,11 +1304,14 @@ vm_fw_status_t vm_fw_import_run(const vm_fw_import_t *cfg,
     } else if (cancelled(&r)) {
         report->status = VM_FW_ERR_CANCELLED;
         return report->status;
-    } else if (report->machine == VM_FW_MACHINE_IPHONE_3GS) {
+    } else if (report->machine == VM_FW_MACHINE_IPHONE_3GS &&
+               !vm_fw_build_is_iphone_os_3(report->build)) {
         /* The iOS 6 preview boots its kernel to the root-device wait and
          * mounts nothing, and iOS 6's disk image is a format this unpacker
          * does not read yet -- so it is located and left in the archive
-         * rather than copied out (785 MB for 10B500) only to fail. */
+         * rather than copied out (785 MB for 10B500) only to fail. iPhone OS
+         * 3 for the 3GS (7E18) is the same encrypted disk image as the 3G's,
+         * and that machine mounts it, so it is unpacked like the 3G's. */
         vm_fw_artefact_report_t *ar = &report->artefacts[VM_FW_ROOT_FILESYSTEM];
         ar->state = VM_FW_STATE_FOUND;
         ar->member_size = entry.uncompressed_size;
@@ -1395,7 +1404,9 @@ size_t vm_fw_report_render(const vm_fw_report_t *rep, char *out, size_t cap) {
     else
         EMIT("  the manifest could not be read\n");
     if (rep->machine == VM_FW_MACHINE_IPHONE_3GS)
-        EMIT("  for the iPhone 3GS machine (the iOS 6 preview)\n");
+        EMIT(vm_fw_build_is_iphone_os_3(rep->build)
+                 ? "  for the iPhone 3GS machine (iPhone OS 3)\n"
+                 : "  for the iPhone 3GS machine (the iOS 6 preview)\n");
 
     if (rep->status != VM_FW_OK)
         EMIT("  STOPPED: %s\n", vm_fw_strerror(rep->status));

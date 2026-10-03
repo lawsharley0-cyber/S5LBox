@@ -454,16 +454,19 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 }
 
 /*
- * The iPhone 3GS preview: iBoot's framebuffer, on which the kernel paints its
- * verbose boot log the way a verbose boot does on a real phone (published by
- * VMN88Engine, presented in -tick:), and no touch or buttons yet. A refusal
- * goes to the console, because this runs before the screen is on a window
- * and an alert would be lost.
+ * The iPhone 3GS: iPhone OS 3.1.3 from this machine's own root filesystem,
+ * with touch and the buttons, or the iOS 6 preview's boot log, by the
+ * firmware imported (VMN88Engine.h); its screen is presented in -tick:. A
+ * refusal goes to the console, because this runs before the screen is on a
+ * window and an alert would be lost.
  */
 - (void)launchIPhone3GS {
     [_n88 stop];
     _n88 = nil;
-    VMN88Engine *engine = [[VMN88Engine alloc] init];
+    NSString *folder = self.instanceID.length
+        ? [[VMInstanceStore sharedStore] directoryForInstanceWithID:self.instanceID]
+        : nil;
+    VMN88Engine *engine = [[VMN88Engine alloc] initWithMachineDirectory:folder];
     NSString *why = nil;
     if (![engine startWithError:&why]) {
         [self appendConsole:[engine takePendingConsoleText]];
@@ -619,7 +622,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * state left to serialize. Leaving is still safe and must not trap the
      * user behind a save button that can never succeed. */
     if (!_engine || ![_engine isRunning]) {
-        /* The iPhone 3GS preview has nothing to save yet. */
+        /* The iPhone 3GS saves no checkpoint: stopping flushes and closes its
+         * root filesystem, as pulling a battery would leave it. */
         [_n88 stop];
         [self.navigationController popViewControllerAnimated:YES];
         return;
@@ -852,7 +856,8 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * own "stopped" line — happens on a thread whose only reader is about to
      * be dropped, so anything not collected here is lost. */
     if (_isIPhone3GS) {
-        /* Nothing on disk to protect: stop, then boot again. */
+        /* Stop (which flushes and closes this machine's root filesystem, if it
+         * has one), then boot again. */
         [self appendConsole:[_n88 takePendingConsoleText]];
         [_n88 stop];
         [self appendConsole:[_n88 takePendingConsoleText]];
@@ -1071,9 +1076,20 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
 
 #pragma mark - Phone controls
 
+/* A button for whichever machine this screen runs. */
+- (BOOL)sendButton:(VMButton)button pressed:(BOOL)pressed {
+    return _isIPhone3GS ? [_n88 setButton:button pressed:pressed]
+                        : [_engine setButton:button pressed:pressed];
+}
+
+- (BOOL)machineButtonHeld:(VMButton)button {
+    return _isIPhone3GS ? [_n88 isButtonPressed:button]
+                        : [_engine isButtonPressed:button];
+}
+
 - (void)phoneShell:(VMPhoneShellView *)shell button:(VMButton)button pressed:(BOOL)pressed {
     (void)shell;
-    [_engine setButton:button pressed:pressed];
+    [self sendButton:button pressed:pressed];
 }
 
 - (void)phoneShellShowControls:(VMPhoneShellView *)shell {
@@ -1100,8 +1116,9 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     UIAlertController *menu = [UIAlertController
         alertControllerWithTitle:@"iPhone Controls"
         message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    const BOOL machinePaused = _isIPhone3GS ? [_n88 isPaused] : [_engine isPaused];
     [menu addAction:[UIAlertAction actionWithTitle:
-        ([_engine isPaused] ? @"Resume" : @"Pause")
+        (machinePaused ? @"Resume" : @"Pause")
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             [weakSelf playPauseTapped:nil];
         }]];
@@ -1152,23 +1169,22 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
                 EmulatorViewController *vc = weakSelf;
                 if (!vc) return;
-                VMEngine *engine = vc->_engine;
                 VMButton button = (VMButton)key.unsignedIntegerValue;
-                [engine setButton:button pressed:YES];
+                [vc sendButton:button pressed:YES];
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                    dispatch_get_main_queue(), ^{ [engine setButton:button pressed:NO]; });
+                    dispatch_get_main_queue(), ^{ [weakSelf sendButton:button pressed:NO]; });
             }]];
     }
     /* The ringer is a two-position slider, not a key: it stays where it is put.
      * AppleM68Buttons only reports a change, so until it has been moved once
      * the guest has never been told which position it is in. */
-    BOOL silent = [_engine isButtonPressed:VMButtonRingerSilent];
+    BOOL silent = [self machineButtonHeld:VMButtonRingerSilent];
     [menu addAction:[UIAlertAction actionWithTitle:
         (silent ? @"Ring/Silent Switch: Silent (switch to Ring)"
                 : @"Ring/Silent Switch: Ring (switch to Silent)")
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             EmulatorViewController *vc = weakSelf;
-            if (vc) [vc->_engine setButton:VMButtonRingerSilent pressed:!silent];
+            if (vc) [vc sendButton:VMButtonRingerSilent pressed:!silent];
         }]];
     [menu addAction:[UIAlertAction actionWithTitle:@"Settings"
         style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
@@ -1637,9 +1653,12 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
     _touchX = x;
     _touchY = y;
 
-    // Returns NO today, and the status line says so. Routed through the engine
-    // anyway so there is exactly one place that will start returning YES.
-    [_engine sendTouchAtGuestX:x y:y phase:phase];
+    // The iPhone 3GS takes it from the screen to its touch controller; the
+    // S5L8900 engine queues it the same way.
+    if (_isIPhone3GS)
+        [_n88 sendTouchAtGuestX:x y:y phase:phase];
+    else
+        [_engine sendTouchAtGuestX:x y:y phase:phase];
     [self refreshStatusLine];
 }
 
@@ -1653,7 +1672,7 @@ static UIGestureRecognizer *VMContentPopGestureRecognizer(
      * to the board's five switches. A NO here means it was not even queued —
      * the machine is not running, or the queue was full of edges that must not
      * be coalesced away — and never that the guest ignored it. */
-    [_engine setButton:button pressed:pressed];
+    [self sendButton:button pressed:pressed];
     [self refreshStatusLine];
 }
 

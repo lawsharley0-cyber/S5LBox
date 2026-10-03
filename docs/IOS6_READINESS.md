@@ -961,8 +961,34 @@ again after wake, as on hardware.
 
 Not yet: the PMU's own interrupt and events, and its alarm (nothing but a
 button wakes the system); the ambient light sensor (i2c2 0x49) still does
-not answer. And the app: its 3GS engine is still the iOS 6 preview, without
-the root filesystem, touch or buttons that boot3gs drives here.
+not answer.
+
+#### In the app (#58)
+
+The app's iPhone 3GS machine (VMN88Engine) now boots iPhone OS 3.1.3 the
+way boot3gs does, from one shared recipe (`tools/n88_ios3.h`: the kernel
+check, the working root filesystem, the boot request with its un-match
+list, the memory-disk patch), so the phone runs what was measured here.
+
+- **Import.** An iPhone2,1 3.1.3 (7E18) IPSW, with the user's kernelcache,
+  device tree and root filesystem keys, now gives `rootfs.img` as well
+  (the 3G's kind of disk image; the importer used to leave every 3GS root
+  filesystem in the archive, because iOS 6's is a format it does not
+  read). The files go to the firmware-iphone3gs folder, unverified (there
+  are no reference hashes for this product).
+- **First start** makes the machine's own `rootfs-work.img` in its folder
+  (activated, fstab to md0, grown by 256 MiB: about 814 MB), on the
+  engine's thread, with the progress in the status line; later starts boot
+  straight from it, and the guest's writes persist there.
+- **Input.** Touches on the screen go to the touch controller through the
+  same queue the 3G machines use; Home, Power, the volume buttons and the
+  ring/silent switch (the phone shell, the key bar and the Controls menu)
+  go to `n88_set_input`, a release held back until its press is at least
+  0.1 s of guest time old. While the phone sleeps the screen is black, the
+  status line says "asleep", and Home or Power wakes it.
+- **Clock.** The guest's RTC starts at the phone's time.
+
+An iOS 6 kernel in the folder still boots the preview, as before.
 
 ### The CDMA engine and AES with a stand-in hardware key (#46)
 

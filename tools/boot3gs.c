@@ -65,6 +65,7 @@
 #include "ios6_kernel_patch.h"
 #include "ksyms.h"
 #include "n88.h"
+#include "n88_ios3.h"
 #include "rootfs_work.h"
 
 #include <inttypes.h>
@@ -261,37 +262,23 @@ static bool press_held(void) {
 
 /* --------------------------------------------------- the working image */
 /*
- * -P: the working image, made from the pristine one by rootfs_work_create,
- * the provisioner iPhone OS 3 machines use. Its default rewrites /etc/fstab
- * to mount / from /dev/md0 (the stock one names the NAND's disk0s1 and
- * disk0s2, which do not exist here). It also grows the volume: Apple ships
- * the root filesystem with no free blocks, because on the phone /private/var
- * is a separate partition, and without room the first file the system
- * creates fails (on 10B500, corecrypto's FIPS self-test control file, and
- * launchd reboots).
+ * -P: the working image, made from the pristine one by n88_ios3_make_work_image
+ * (tools/n88_ios3.h, the recipe the app uses too): /etc/fstab mounts / from
+ * /dev/md0 (the stock one names the NAND's disk0s1 and disk0s2, which do not
+ * exist here), and the volume grows, because Apple ships the root filesystem
+ * with no free blocks (on the phone /private/var is a separate partition), and
+ * without room the first file the system creates fails (on 10B500,
+ * corecrypto's FIPS self-test control file, and launchd reboots).
+ *
+ * `activate`: also create the lockdown activation record iPhone OS 3's
+ * lockdownd reads, so SpringBoard goes past its iTunes activation screen. In
+ * the work copy only; for the 7E18 kernel.
  */
-#define WORK_GROWTH_BYTES (UINT64_C(256) << 20)
-
-/* `activate`: also create the lockdown activation record iPhone OS 3's
- * lockdownd reads (rootfs_work_activation_entries, the same plan bootkernel's
- * --activate writes for the S5L8900 machine), so SpringBoard goes past its
- * iTunes activation screen. In the work copy only; for the 7E18 kernel. */
 static void make_work_image(const char *pristine, const char *work, bool activate) {
-    rootfs_work_options_t ro;
     rootfs_work_result_t rr;
-    rootfs_work_entry_t entries[8];
-    memset(&ro, 0, sizeof ro);
-    memset(&rr, 0, sizeof rr);
-    ro.growth_bytes = WORK_GROWTH_BYTES;
-    if (activate) {
-        const size_t n = rootfs_work_standard_entries(true, false, entries,
-                                                      sizeof entries / sizeof entries[0]);
-        if (!n || n > sizeof entries / sizeof entries[0]) die("rootfs_work: no activation plan");
-        ro.entries = entries;
-        ro.entry_count = n;
-    }
     printf("making %s from %s%s\n", work, pristine, activate ? ", activated" : "");
-    const rootfs_work_status_t rs = rootfs_work_create(pristine, work, &ro, &rr);
+    const rootfs_work_status_t rs =
+        n88_ios3_make_work_image(pristine, work, activate, NULL, NULL, &rr);
     if (rs != ROOTFS_WORK_OK)
         die("rootfs_work: %s at %s (%s)", rootfs_work_status_name(rs),
             rootfs_work_stage_name(rr.stage), rr.detail);
@@ -554,26 +541,14 @@ int main(int argc, char **argv) {
     /* The two kernels this machine knows, by LC_UUID: each has its own
      * memory-disk gate, and 3.1.3 its own boot epoch. */
     const bool is_ios6 = ios6_kernel_patch_identify(kernel, klen);
-    const bool is_ios3 = !is_ios6 && ios3_n88_kernel_patch_identify(kernel, klen);
+    const bool is_ios3 = !is_ios6 && n88_ios3_identify(kernel, klen);
     if (is_ios3 && !epoch) epoch = IOS3_N88_KERNEL_BOOT_ARGS_VERSION;
     printf("kernel: %s\n", is_ios6 ? "iOS 6.1.6 10B500" : is_ios3 ? "iPhone OS 3.1.3 7E18" : "unrecognised");
-    /* 3.1.3's devices that are worse declared and silent than absent, each
-     * the cause of a hang or panic before its removal (docs/IOS6_READINESS.md,
-     * #55). Without them SpringBoard draws its activation screen. Any -u
-     * replaces the whole list. */
-    static const char *const ios3_unmatch[] = {
-        "arm-io/iop",               /* the IOP firmware is not modelled           */
-        "baseband",                 /* no modem: CommCenter would retry forever   */
-        "arm-io/spi2",              /* the modem's SPI bus                        */
-        "arm-io/sgx",               /* QuartzCore draws in software instead       */
-        "arm-io/usb-otg",           /* findMaxEndpoints panics on its registers   */
-        "arm-io/isp",               /* the camera's ISP never answers its mailbox */
-        "arm-io/amc",               /* the hardware audio decoder is not modelled */
-        "arm-io/tv-out",            /* closing its framebuffer hangs SpringBoard  */
-    };
+    /* 3.1.3's devices that are worse declared and silent than absent
+     * (n88_ios3_unmatch). Any -u replaces the whole list. */
     if (is_ios3 && !nunmatch)
-        for (; nunmatch < sizeof ios3_unmatch / sizeof ios3_unmatch[0]; nunmatch++)
-            unmatch[nunmatch] = ios3_unmatch[nunmatch];
+        for (; nunmatch < N88_IOS3_UNMATCH_COUNT; nunmatch++)
+            unmatch[nunmatch] = n88_ios3_unmatch[nunmatch];
 
     file_block_t *root_file = NULL;
     const vm_block_t *root = NULL;
@@ -624,7 +599,7 @@ int main(int argc, char **argv) {
         guest_patch_report_t pr;
         const guest_patch_status_t ps = is_ios6
             ? ios6_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr)
-            : ios3_n88_kernel_patch_apply(g_m.ram, N88_DRAM_SIZE, &pr);
+            : n88_ios3_patch(&g_m, &pr);
         if (ps != GUEST_PATCH_STATUS_OK)
             die("the kernel patch was refused: %s (entry %u, va %08llx)",
                 guest_patch_status_string(ps), pr.entry_index,

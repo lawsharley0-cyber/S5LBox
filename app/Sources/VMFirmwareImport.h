@@ -297,6 +297,14 @@ typedef enum {
     VM_FW_MACHINE_IPHONE_3GS
 } vm_fw_machine_t;
 
+/*
+ * True for an iPhone OS 3 build string ("7E18"). For the iPhone 3GS that
+ * decides whether the root filesystem is unpacked: iPhone OS 3.1.3's is the
+ * same encrypted disk image as the 3G's, and the 3GS machine mounts it;
+ * iOS 6's is neither, and is left in the archive.
+ */
+bool vm_fw_build_is_iphone_os_3(const char *build);
+
 typedef struct {
     vm_fw_status_t status;
 

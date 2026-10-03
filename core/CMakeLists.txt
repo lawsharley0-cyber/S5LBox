@@ -1226,6 +1226,27 @@ add_executable(test_ios3_n88_kernel_patch tests/test_ios3_n88_kernel_patch.c)
 target_link_libraries(test_ios3_n88_kernel_patch PRIVATE host_ios3_n88_kernel_patch emucore)
 add_test(NAME ios3_n88_kernel_patch COMMAND test_ios3_n88_kernel_patch)
 
+# iPhone OS 3.1.3 on the iPhone 3GS machine: the boot recipe boot3gs measured,
+# shared with the app (tools/n88_ios3.h).
+add_library(host_n88_ios3 STATIC ../tools/n88_ios3.c)
+target_include_directories(host_n88_ios3 PUBLIC ../tools include)
+target_link_libraries(host_n88_ios3
+    PUBLIC host_ios3_n88_kernel_patch host_rootfs_work
+    PRIVATE emucore)
+set_target_properties(host_n88_ios3 PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+    C_EXTENSIONS NO)
+if(MSVC)
+    target_compile_options(host_n88_ios3 PRIVATE /W4 /WX)
+else()
+    target_compile_options(host_n88_ios3 PRIVATE
+        -Wall -Wextra -Werror -pedantic)
+endif()
+add_executable(test_n88_ios3 tests/test_n88_ios3.c)
+target_link_libraries(test_n88_ios3 PRIVATE host_n88_ios3 emucore)
+add_test(NAME n88_ios3 COMMAND test_n88_ios3 ${CMAKE_CURRENT_BINARY_DIR})
+
 # The gate as a bring-up hook: one adapter, shared by the desktop test below
 # and by the iOS app, so a kernel is authorized by the same code in both.
 add_library(host_ios3_bringup_gate STATIC ../tools/ios3_bringup_gate.c)
@@ -1585,4 +1606,4 @@ target_link_libraries(arm_diff_probe PRIVATE emucore)
 # a bare Cortex-A8 machine and logs every device access (tools/boot3gs.c).
 add_executable(boot3gs ../tools/boot3gs.c)
 target_link_libraries(boot3gs PRIVATE emucore host_ios6_kernel_patch host_ios3_n88_kernel_patch host_file_block
-    host_rootfs_work)
+    host_rootfs_work host_n88_ios3)

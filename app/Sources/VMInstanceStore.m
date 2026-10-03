@@ -552,7 +552,7 @@ static NSString *VMGraphicsRecordText(BOOL mbxEnabled,
 
 - (NSString *)graphicsSummaryForInstanceWithID:(NSString *)identifier {
     if ([self isIPhone3GSInstanceWithID:identifier])
-        return @"iPhone 3GS \u00b7 iOS 6 preview";
+        return @"iPhone 3GS";
     BOOL mbxEnabled = NO, softwareRendererEnabled = NO;
     if (!identifier.length ||
         ![self recordedGraphicsForInstanceWithID:identifier

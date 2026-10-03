@@ -1049,6 +1049,62 @@ void vmfw_test_import(vmfw_test_t *t) {
         vm_fw_keys_clear(&keys);
     }
 
+    /* ---------------- the iPhone 3GS with iPhone OS 3 ------------------ */
+    /*
+     * 7E18 for the 3GS: its root filesystem is the 3G's kind of disk image,
+     * and the 3GS machine mounts it, so it is unpacked like the 3G's -- and,
+     * with no reference for this product, comes out unverified.
+     */
+    VMFW_T_SECTION(t, "import/iphone 3gs iphone os 3");
+    {
+        VMFW_T_CHECK(t, vm_fw_build_is_iphone_os_3("7E18") &&
+                        vm_fw_build_is_iphone_os_3("7A341") &&
+                        !vm_fw_build_is_iphone_os_3("10B500") &&
+                        !vm_fw_build_is_iphone_os_3("8C148") &&
+                        !vm_fw_build_is_iphone_os_3("7") &&
+                        !vm_fw_build_is_iphone_os_3(NULL),
+                     "iPhone OS 3 builds are a 7 and a letter");
+        static ipsw_t gs3;
+        ipsw_spec_t spec = k_reference_spec;
+        spec.product_type = "iPhone2,1";
+        spec.platform = "s5l8920x";
+        spec.board = "n88ap";
+        spec.build = "7E18";
+        VMFW_T_CHECK(t, build_ipsw(&gs3, &spec), "built");
+
+        vm_fw_keys_t keys;
+        vm_fw_keys_clear(&keys);
+        vm_fw_keys_set_img3(&keys, VM_FW_KERNEL, k_kernel_key_hex, k_kernel_iv_hex);
+        vm_fw_keys_set_img3(&keys, VM_FW_DEVICE_TREE, k_dtree_key_hex, k_dtree_iv_hex);
+        vm_fw_keys_set_root(&keys, k_root_key_hex);
+
+        memset(&fs, 0, sizeof fs);
+        vm_fw_files_t files = { mem_open, mem_write, mem_pread, mem_close, &fs };
+        static fx_blob_t blob;
+        blob.data = gs3.archive; blob.len = gs3.len; blob.fail_next = false;
+        vm_fw_import_t imp;
+        memset(&imp, 0, sizeof imp);
+        imp.pread = fx_blob_pread;
+        imp.pread_ctx = &blob;
+        imp.size = gs3.len;
+        imp.files = &files;
+        imp.keys = &keys;
+        imp.accept_iphone_3gs = true;
+
+        vm_fw_report_t rep;
+        VMFW_T_EQ_U(t, vm_fw_import_run(&imp, &rep), VM_FW_OK, "accepted");
+        VMFW_T_EQ_U(t, rep.machine, VM_FW_MACHINE_IPHONE_3GS, "for the 3GS");
+        VMFW_T_EQ_U(t, rep.artefacts[VM_FW_ROOT_FILESYSTEM].state, VM_FW_STATE_EXTRACTED,
+                    "the root filesystem is unpacked, unverified");
+        VMFW_T_CHECK(t, mem_find(&fs, "rootfs.img") != NULL &&
+                        mem_find(&fs, "kernel.macho") && mem_find(&fs, "devicetree.bin"),
+                     "all three files kept");
+        char text[4096];
+        vm_fw_report_render(&rep, text, sizeof text);
+        VMFW_T_CHECK(t, strstr(text, "iPhone OS 3") != NULL, "the rendering says iPhone OS 3");
+        vm_fw_keys_clear(&keys);
+    }
+
     /* ---------------- archives that are not IPSWs ---------------------- */
     VMFW_T_SECTION(t, "import/not an ipsw");
     {

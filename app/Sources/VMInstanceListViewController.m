@@ -169,15 +169,16 @@ static NSString *const kAutomationMachinePrefix = @"s5lbox.machine.";
     choose(@"CPU graphics (stable)", @"iPhone OS 3.1.3", NO, YES);
     choose(@"GPU for apps and games (experimental)", @"iPhone OS 3.1.3 GPU apps", YES, YES);
     choose(@"Full GPU (experimental)", @"iPhone OS 3.1.3 GPU", YES, NO);
-    /* A different machine, not a renderer choice: the iPhone 3GS running the
-     * iOS 6 kernel. Preview: it prints the kernel's console and stops where
-     * the kernel waits for a root filesystem. */
-    [sheet addAction:[UIAlertAction actionWithTitle:@"iPhone 3GS \u00b7 iOS 6 (preview)"
+    /* A different machine, not a renderer choice: the iPhone 3GS. What it
+     * runs is the firmware imported for it: iPhone OS 3.1.3, or the iOS 6
+     * preview, which prints the kernel's console and stops where the kernel
+     * waits for a root filesystem. */
+    [sheet addAction:[UIAlertAction actionWithTitle:@"iPhone 3GS (iPhone OS 3.1.3 or iOS 6 preview)"
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         VMInstanceListViewController *self_ = weakSelf;
-        [self_ promptWithTitle:@"iPhone 3GS \u00b7 iOS 6 (preview)"
-                          text:@"iOS 6.1.6 (preview)"
+        [self_ promptWithTitle:@"iPhone 3GS"
+                          text:@"iPhone 3GS"
                         accept:@"Create"
                        handler:^(NSString *name) {
             NSError *err = nil;
